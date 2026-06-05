@@ -1,10 +1,8 @@
-
-
 # Networking
 
 QEMU creates:
 1. one virtual NIC with the name vnet0. also called TAP in linux.
-2.  one virtual [bridge](Linux#Bridge) named virbr0.
+2.  one virtual [bridge](Linux.md#Bridge) named virbr0.
 
 ## NAT
 in NAT, guest kernel sends its packets to the vnet0 like a good boy. from there, virbr0 carries it. 

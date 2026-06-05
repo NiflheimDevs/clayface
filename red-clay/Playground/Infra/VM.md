@@ -178,46 +178,6 @@ Features:
 * copy-on-write
 
 ---
-
-# 8. Networking in VMs
-
-VMs use virtual switches and adapters.
-Common modes:
-## NAT
-
-VM accesses internet through host.
-
-```text
-VM → Host → Internet
-```
-
-Most beginner setups use this.
-
-## Bridged Networking
-
-VM appears as a real machine on LAN.
-
-```text
-Router
-├── Host PC
-└── VM
-```
-
-Critical for:
-* server testing
-* pentesting labs
-* **AD environments**
-
-## Host-only
-
-Private network between host and VMs.
-
-Used for:
-* isolated labs
-* malware analysis
-
----
-
 # Snapshots
 
 Snapshots save VM state:
@@ -390,4 +350,3 @@ Disk/network:
 GPU:
 * harder unless passthrough
 
----

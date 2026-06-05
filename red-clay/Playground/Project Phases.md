@@ -81,25 +81,3 @@ These matter professionally:
 * nested virtualization
 
 ---
-
-# 20. Recommended Technologies To Explore
-
-## Linux/KVM Ecosystem
-
-* QEMU
-* KVM
-* virt-manager
-* libvirt
-* Proxmox VE
-
-## Enterprise
-
-* VMware vSphere
-* VMware ESXi
-* Microsoft Hyper-V
-
-## Cloud
-
-* Amazon Web Services EC2
-* Google Cloud Compute Engine
-* Microsoft Azure Virtual Machines
