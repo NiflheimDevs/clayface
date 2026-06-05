@@ -33,6 +33,11 @@ The main objectives of this project are:
 - To evaluate how **Active Directory-based environments** are targeted
 - To simulate **data access and exfiltration scenarios**
 
+The side Objectives of this project are:
+
+- To learn IaC 
+- To create an automated virtual deployment of envirnoments
+
 ---
 
 ### 4. Simulated Corporate Environment
@@ -154,17 +159,6 @@ By completing this project, the student will gain:
 - Ability to analyze and explain **security failures**
 - Skills in **technical reporting and professional documentation**
 
----
-
-### 9. Estimated Timeline
-
-| Phase | Duration |
-|-----|---------|
-| Planning and environment design | 2 weeks |
-| Infrastructure deployment | 3–4 weeks |
-| Reconnaissance and analysis | 2 weeks |
-| Exploitation and lateral movement | 4-5 weeks |
-| Final review and presentation | 1-2 weeks |
-
-**Total Estimated Duration:** 12–15 weeks
+- Deploy highly customizable VMs across multiple machine by **IaC**
+- How corporate networks are desighned
 
