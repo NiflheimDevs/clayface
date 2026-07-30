@@ -15,6 +15,10 @@ The **libvirt provider** is a Terraform plugin that talks to libvirt (the KVM ma
 
 Configuration management tool. Where Terraform creates the infrastructure, Ansible configures what's running on it. You write **playbooks** (YAML files) that describe the desired state of a machine — install this software, create this AD user, set this registry key. Ansible connects over SSH (Linux) or WinRM (Windows) and executes the steps.
 
-### Proxmox
+###  [[Proxmox]]
 
 A free, open-source hypervisor platform that runs on bare metal and provides a management layer over KVM and LXC. It gives you a web UI, a REST API, clustering support, and Terraform provider support. It essentially wraps libvirt/KVM in a manageable platform. Much easier for your use case than managing raw libvirt across multiple hosts.
+
+### [[OPNSense]]
+
+opensource project that enhances PfSense with better UI. This app is a firewall with a lot of features in configuring networks.
