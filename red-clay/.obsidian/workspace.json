@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "Report/Journal.md",
+                "file": "Playground/Tools/Terrfafrom/course/Lesson-21-Capstone-Project.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Journal"
+              "title": "Lesson-21-Capstone-Project"
             }
           }
         ]
@@ -80,7 +80,7 @@
       }
     ],
     "direction": "horizontal",
-    "width": 300
+    "width": 348.73828125
   },
   "right": {
     "id": "f50c64f87ddd4a0f",
@@ -188,36 +188,39 @@
   },
   "active": "7c1ab5dc3c879327",
   "lastOpenFiles": [
+    "Playground/Tools/Terrfafrom/course/Lesson-20-Ansible-Integration.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-19-Building-a-Multi-Host-Lab.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-18-Virtualization-Providers-and-Lab-Concepts.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-17-Project-Design-and-Best-Practices.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-16-Provisioners-and-Bootstrapping.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-15-Remote-State-and-Backends.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-14-Modules.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-21-Capstone-Project.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-13-Lifecycle-and-Change-Safety.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-12-Dependency-Graph.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-11-Functions-and-Console.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-10-Expressions-and-Iteration.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-09-Locals.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-08-Outputs.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-07-Input-Variables.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-06-State.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-05-Resources.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-04-Providers.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-03-HCL-Basics.md",
+    "Playground/Tools/Terrfafrom/course/README.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-02-Terraform-Architecture.md",
+    "Playground/Tools/Terrfafrom/course/Lesson-01-What-Is-Terraform.md",
+    "Report/Journal.md",
     "Report/Actions/OPNSense.md",
     "Report/Actions/Bare Metal VM.md",
     "Playground/Knowledge Base.md",
-    "Playground/Project Phases.md",
-    "Playground/Tools/OPNSense.md",
-    "Overview.md",
-    "Playground/Tools.md",
-    "Report/Journal.md",
-    "Playground/Infra/Virt Manager.md",
-    "Playground/Infra/Linux.md",
-    "Playground/Infra/KVM-QEMU.md",
     "Report/Actions",
-    "Playground/Infra/QEMU.md",
-    "todo.md",
-    "Playground/Tools/Proxmox.md",
-    "Attacker/RedTeam.md",
-    "Attacker/Active Directory.md",
-    "Attacker/Techniques.md",
-    "2026-07-23.md",
     "Attacker/Untitled.base",
     "Untitled.base",
     "Report/Untitled.base",
     "Report",
-    "Report.md",
-    "Playground/Infra/VM.md",
-    "asd.md",
-    "Playground/Infra/VM vs Container.md",
     "Playground/Tools",
     "Playground/Infra",
-    "Welcome.md",
     "Playground",
     "Attacker"
   ]
