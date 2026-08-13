@@ -10,7 +10,7 @@ one good thing about opnsense is that it has gui. for accessing the gui, you nee
 At first, I didn't configure the OPNsense with dhcp and connected everything with static ip and no dns.
 
 the two alpine machines set their own ip address and put the opnsense ip address as their gateway and default route
-and WALLAH! everyworks super simply
+and WALLAH! everything works super simply
 
 the next step is configuring DHCP server and DNS for machines receiving ip from DHCP server.
 

@@ -1,10 +1,10 @@
-I deployed two alphine VMs on two different machines on the same subnet
+I deployed two alpine VMs on two different machines on the same subnet
 I used QEMU and KVM
 Configured host kernels to use VXLAN for the networking of these VMs
 
 now an app in one VM can talk to an app on another VM like they are on the same subnet even if they really weren't.
 
-I used libvert to manage the VMs for now.
+I used libvirt to manage the VMs for now.
 
 first create 
 ```bash
