@@ -27,4 +27,4 @@ Now that our challenges are clear, we need to choose the best fitting tools to t
 Actions:
 1. [[Bare Metal VM]]
 2. [[Report/Actions/OPNSense|OPNSense]]
-3. 
+3. [[Terraform]]

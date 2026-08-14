@@ -5,7 +5,7 @@ the OPNSense VM will need atleast two V NICs to function. 1 act as a LAN and 2nd
 
 we set the LAN interface to vm-br0 and the WAN interface as a NAT interface managed by virtio. this way WAN can connect to internet and the devices on the LAN can do so as well.
 
-one good thing about opnsense is that it has gui. for accessing the gui, you need to give and ip address to the vm-br0 interface.
+one good thing about opnsense is that it has gui. for accessing the gui, you need to give an ip address to the vm-br0 interface.
 
 At first, I didn't configure the OPNsense with dhcp and connected everything with static ip and no dns.
 

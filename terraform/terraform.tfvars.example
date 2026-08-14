@@ -1,0 +1,11 @@
+libvirt_hosts = {
+  host_a = {
+    address = "localhost"
+    user    = "kiasoh"
+  }
+
+  host_b = {
+    address = "192.168.1.134"
+    user    = "kiasoh"
+  }
+}

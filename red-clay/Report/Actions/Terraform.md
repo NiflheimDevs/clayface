@@ -12,3 +12,27 @@ The only thing that i validated from this little experiment was the fact that th
 
 the next step is to do the same on multiple machine + opnsense
 
+first we need to do some ssh authentications between hosts.
+If you don't have a public key, create it with 
+```bash
+ssh-keygen -t ed25519
+```
+
+then copy the pub key to the other party
+```ssh
+ssh-copy-id user@192.168.1.50
+```
+Now we are set to go.
+
+I created the alpine vm and opnsense on multiple machines
+I realized something is missing and that is **image** management.
+i had to copy the files all by myself into the hosts manually.
+to make an identical independent qcow2 copy this is the command:
+```bash
+qemu-img convert -O qcow2 alpinelinux3.23 alpinelinux3.23-copy.qcow2
+```
+qcow2 supports extensions: you can have a base qcow2 and others are from that. not quite sure how that works. maybe i will come back to that later.
+
+for now everything works and vm's are declared correctly on multiple machines
+
+let's move on to ansible
