@@ -11,6 +11,11 @@ resource "libvirt_domain" "alpine" {
     type_machine = "q35"
   }
 
+  features = {
+    acpi = true
+    apic = {}
+  }
+
   devices = {
     disks = [
       {

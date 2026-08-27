@@ -12,6 +12,11 @@ resource "libvirt_domain" "opnsense" {
     type_machine = "q35"
   }
 
+  features = {
+    acpi = true
+    apic = {}
+  }
+
   devices = {
     disks = [
       {
