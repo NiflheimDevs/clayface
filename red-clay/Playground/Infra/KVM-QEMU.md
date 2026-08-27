@@ -25,3 +25,6 @@ QEMU + KVM together:
 * KVM provides near-native execution
 
 ---
+
+
+*IMPORTANT*: KVM is a type 1 hypervisor even though it is within linux kernel(a host guest exists). It uses kernel features and hardware features to behave exactly like a type 1 hypervisor.
