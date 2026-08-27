@@ -1,0 +1,27 @@
+---
+- name: Configure Edge
+  hosts: edge
+  become: true
+  tasks:
+    - name: Check whether wan bridge exists
+      ansible.builtin.command:
+        cmd: ip link show "{{ wan_name }}"
+      register: bridge_check
+      changed_when: false
+      failed_when: false
+
+    - name: Create wan bridge
+      ansible.builtin.command:
+        cmd: ip link add name "{{ wan_name }}" type bridge
+      when: bridge_check.rc != 0
+
+    - name: Check wan bridge state
+      ansible.builtin.command:
+        cmd: ip link show "{{ wan_name }}"
+      register: wan_bridge_state
+      changed_when: false
+
+    - name: Bring wan bridge up
+      ansible.builtin.command:
+        cmd: ip link set dev "{{ wan_name }}" up
+      when: "'state DOWN' in wan_bridge_state.stdout"

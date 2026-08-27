@@ -1,0 +1,17 @@
+all:
+  children:
+    edge:
+      hosts:
+        edge_host:
+          ansible_host: 192.168.1.161
+
+      vars:
+        ansible_user: kiasoh
+
+        wan_name: vm-wan0
+
+        bridge_name: vm-br0
+        vxlan_name: vxlan100
+        vxlan_id: 100
+        vxlan_port: 4789
+        vxlan_parent_interface: wlan0
