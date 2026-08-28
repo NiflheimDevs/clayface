@@ -1,0 +1,151 @@
+---
+# Starts the VMs created by Terraform. VM names and hypervisor placement
+# come from the terraform `vms` output, read by the dynamic inventory
+# (inventory/terraform_vms.py). Run it with both inventories:
+#
+#   ansible-playbook \
+#       -i inventory/hosts.yml \
+#       -i inventory/terraform_vms.py \
+#       playbooks/start_vms.yml
+
+# ------------------------------------------------------------
+# Edge first: OPNsense provides DHCP/DNS for the whole lab
+# ------------------------------------------------------------
+- name: Start edge VMs (they provide DHCP/DNS for the lab)
+  hosts: vms_gateway
+  gather_facts: false
+
+  vars:
+    libvirt_uri: qemu:///system
+    vm_bridge_name: vm-br0
+    lab_dns_ip: 10.0.0.1
+    lab_dns_port: 53
+    gateway_wait_timeout: 600
+
+  pre_tasks:
+    - name: Verify the VM bridge exists on the hypervisor
+      ansible.builtin.command:
+        cmd: "ip link show {{ vm_bridge_name }}"
+      delegate_to: "{{ libvirt_hypervisor }}"
+      register: bridge_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail with a hint if the bridge is missing
+      ansible.builtin.fail:
+        msg: >-
+          Bridge '{{ vm_bridge_name }}' does not exist on {{ libvirt_hypervisor }}.
+          Run 'ansible-playbook -i inventory/hosts.yml playbooks/hosts.yml' first
+          (it creates vm-br0 and the VXLAN), or use ./deploy.sh which runs
+          everything in the right order.
+      when: bridge_check.rc != 0
+
+  tasks:
+    - name: Get current domain state
+      ansible.builtin.command:
+        cmd: "virsh -c {{ libvirt_uri }} domstate {{ inventory_hostname }}"
+      delegate_to: "{{ libvirt_hypervisor }}"
+      register: domain_state
+      changed_when: false
+
+    - name: Start VM
+      ansible.builtin.command:
+        cmd: "virsh -c {{ libvirt_uri }} start {{ inventory_hostname }}"
+      delegate_to: "{{ libvirt_hypervisor }}"
+      register: vm_start
+      when: domain_state.stdout | trim | lower != 'running'
+
+    - name: Report VM status
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} on {{ libvirt_hypervisor }}:
+          {{ 'started' if vm_start is changed else 'already running' }}
+
+    - name: Wait for the lab DNS to answer (DHCP/DNS ready)
+      block:
+        - name: Wait for DNS to listen
+          ansible.builtin.wait_for:
+            host: "{{ lab_dns_ip }}"
+            port: "{{ lab_dns_port }}"
+            timeout: "{{ gateway_wait_timeout }}"
+          delegate_to: localhost
+          run_once: true
+      rescue:
+        - name: Warn if DNS did not come up
+          ansible.builtin.debug:
+            msg: >-
+              WARNING: DNS at {{ lab_dns_ip }}:{{ lab_dns_port }} was not reachable
+              within {{ gateway_wait_timeout }}s. Continuing anyway - VMs will still
+              boot and pick up DHCP leases later.
+
+# ------------------------------------------------------------
+# Then the rest of the lab
+# ------------------------------------------------------------
+- name: Start remaining VMs
+  hosts: vms_linux
+  gather_facts: false
+
+  vars:
+    libvirt_uri: qemu:///system
+    vm_bridge_name: vm-br0
+
+  pre_tasks:
+    - name: Verify the VM bridge exists on the hypervisor
+      ansible.builtin.command:
+        cmd: "ip link show {{ vm_bridge_name }}"
+      delegate_to: "{{ libvirt_hypervisor }}"
+      register: bridge_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail with a hint if the bridge is missing
+      ansible.builtin.fail:
+        msg: >-
+          Bridge '{{ vm_bridge_name }}' does not exist on {{ libvirt_hypervisor }}.
+          Run 'ansible-playbook -i inventory/hosts.yml playbooks/hosts.yml' first
+          (it creates vm-br0 and the VXLAN), or use ./deploy.sh which runs
+          everything in the right order.
+      when: bridge_check.rc != 0
+
+  tasks:
+    - name: Get current domain state
+      ansible.builtin.command:
+        cmd: "virsh -c {{ libvirt_uri }} domstate {{ inventory_hostname }}"
+      delegate_to: "{{ libvirt_hypervisor }}"
+      register: domain_state
+      changed_when: false
+
+    - name: Start VM
+      ansible.builtin.command:
+        cmd: "virsh -c {{ libvirt_uri }} start {{ inventory_hostname }}"
+      delegate_to: "{{ libvirt_hypervisor }}"
+      register: vm_start
+      when: domain_state.stdout | trim | lower != 'running'
+
+    - name: Report VM status
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} on {{ libvirt_hypervisor }}:
+          {{ 'started' if vm_start is changed else 'already running' }}
+
+# ------------------------------------------------------------
+# Final report
+# ------------------------------------------------------------
+- name: Report final VM states
+  hosts: terraform_vms
+  gather_facts: false
+
+  vars:
+    libvirt_uri: qemu:///system
+
+  tasks:
+    - name: Get domain state
+      ansible.builtin.command:
+        cmd: "virsh -c {{ libvirt_uri }} domstate {{ inventory_hostname }}"
+      delegate_to: "{{ libvirt_hypervisor }}"
+      register: final_state
+      changed_when: false
+
+    - name: Show domain state
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} on {{ libvirt_hypervisor }} is {{ final_state.stdout | trim }}"
