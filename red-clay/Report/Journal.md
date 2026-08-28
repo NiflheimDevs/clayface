@@ -24,7 +24,37 @@ For example we need to allow the deploy-er to be able to choose the MangoDB vers
 Now that our challenges are clear, we need to choose the best fitting tools to tackle 'em.
 [[Tools]]
 
-Actions:
+### Actions:
 1. [[Bare Metal VM]]
 2. [[Report/Actions/OPNSense|OPNSense]]
 3. [[Terraform]]
+4. [[Ansible]]
+
+Now that we have done basic Ansible playbooks, we come into an important dilemma.
+### What to do with shared knowledge between terraform and ansible?
+
+Creating a single source of truth is proving to be very right now difficult right now.
+Actually more ugly than difficult.
+
+**Hypervisor's ip addresses are considered FACTS**. they don't belong to either terraform or ansible. a general yaml could possibly hold the values for us.
+
+VM creation is the job of terraform. terraform needs to know **where to create the VM** (what host). **Host Addresses** and **Map of VM To Host**.
+There is an idea of having a *scipt deciding where each vm should go using the spec of every available host/hypervisor*. This will require the script to know **Each Host Specs** and **Each VM Required Specs**. we will out scope this for now.
+
+Creating network configuration on each host is the job of Ansible. For that, it needs to know **Host Addresses**, **Which Host is Holding OPNSense (Who is Edge) OR Map of VM to Host**
+
+Starting VM's is the job of Ansible. For that it will need to know **Host Addresses**, **Map of VM To Host**
+
+### Another problem: More than two hosts?
+
+More than two hosts will create a need to L2 forwarding network. it doesn't look that hard but im scared.
+
+
+For the first problem, we could use a source of knowledge that terraform and ansible read from. (or asible reads from terrafrom while terraform reads from that).
+
+currently implemented. 
+the implementation raised an important issue and that was akward configurations that looked bad. 
+for those to get fixed, we may need to generate some terraform configs with a script!
+
+For the second problem, We can have a mesh or L2 forwarding on one of the hosts and that being connected to everyone (like a brain)
+

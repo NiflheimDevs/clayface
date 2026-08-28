@@ -9,7 +9,8 @@ How i will approach this should be like this:
 
 but for now, i will not have the script to use terraform output to create inventory for now.
 
-and i need to somehow think of a way to handle static ip's of my hosts that is being written in many files as hardcoded values
+and i need to somehow think of a way to handle static ip's of my hosts that is being written in many files as hardcoded values.
 
+I wrote a playbook (vibe coded actually) that turns on the VMs deployed on hosts by reading terraform outputs.
 
-for now i have completed the phase for configuring hosts
+### Update
