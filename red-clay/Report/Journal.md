@@ -54,7 +54,7 @@ For the first problem, we could use a source of knowledge that terraform and ans
 
 currently implemented. 
 the implementation raised an important issue and that was akward configurations that looked bad. 
-for those to get fixed, we may need to generate some terraform configs with a script!
+for those to get fixed, we may need to generate some terraform configs with a script! (**TODO**)
 
 For the second problem, We can have a mesh or L2 forwarding on one of the hosts and that being connected to everyone (like a brain)
 
