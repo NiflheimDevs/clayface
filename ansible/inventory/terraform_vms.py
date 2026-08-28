@@ -5,23 +5,29 @@ Reads the `vms` output from the terraform/ directory and builds inventory
 groups so playbooks can target the VMs created by Terraform:
 
     terraform_vms : every VM
-    vms_gateway   : edge VMs (started first, they provide DHCP/DNS)
+    vms_gateway   : edge VMs, role "gateway" (started first, they provide DHCP/DNS)
     vms_linux     : every other VM
 
 Each VM host exposes:
-    libvirt_hypervisor : hypervisor alias (matches a host in hosts.yml)
-    ansible_host       : <name>.lab.local (resolved via OPNsense DNS)
+    libvirt_hypervisor : hypervisor alias (matches a host in lab_inventory.py)
+    ansible_host       : <name>.<domain> (resolved via OPNsense DNS)
 
-Usage together with the static hypervisor inventory:
+The VM placement itself comes from lab.yaml (via terraform locals); this
+script only reads back what terraform derived from it.
+
+The DNS domain is NOT read from terraform/lab.yaml — it is configured in
+the OPNsense image, so it is a mirrored constant here. If you change it,
+change the OPNsense DNS config too.
+
+Usage together with the lab.yaml host inventory:
 
     ansible-playbook \
-        -i ansible/inventory/hosts.yml \
+        -i ansible/inventory/lab_inventory.py \
         -i ansible/inventory/terraform_vms.py \
         ansible/playbooks/start_vms.yml
 
 Environment overrides:
-    LAB_DOMAIN          DNS domain of the lab        (default: clayface)
-    LAB_GATEWAY_PREFIX  name prefix of gateway VMs   (default: opnsense)
+    LAB_DOMAIN  DNS domain of the lab (default: clayface)
 """
 
 import json
@@ -30,34 +36,38 @@ import subprocess
 import sys
 
 LAB_DOMAIN = os.environ.get("LAB_DOMAIN", "clayface")
-GATEWAY_PREFIX = os.environ.get("LAB_GATEWAY_PREFIX", "opnsense")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TERRAFORM_DIR = os.path.join(BASE_DIR, "..", "..", "terraform")
 
 
-def read_terraform_vms():
-    """Return the terraform `vms` output: {name: {hypervisor: alias}}."""
-    cmd = ["terraform", "-chdir=" + TERRAFORM_DIR, "output", "-json", "vms"]
+def terraform_output(name):
+    """Return a terraform output value, or None on any failure."""
+    cmd = ["terraform", "-chdir=" + TERRAFORM_DIR, "output", "-json", name]
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, check=True)
         data = json.loads(result.stdout)
-        # `terraform output -json vms` returns the value directly; the
+        # `terraform output -json <name>` returns the value directly; the
         # {"value": ..., "type": ...} wrapper only appears when dumping
         # all outputs. Handle both shapes.
         if isinstance(data, dict) and "value" in data and "type" in data:
-            return data.get("value", {}) or {}
-        return data or {}
+            return data.get("value")
+        return data
     except FileNotFoundError:
         print("WARNING: terraform binary not found", file=sys.stderr)
     except subprocess.CalledProcessError as exc:
         msg = exc.stderr.strip() if exc.stderr else exc
         print(f"WARNING: terraform output failed: {msg}", file=sys.stderr)
     except json.JSONDecodeError as exc:
-        print(f"WARNING: could not parse terraform output: {
-              exc}", file=sys.stderr)
-    return {}
+        print(f"WARNING: could not parse terraform output: {exc}", file=sys.stderr)
+    return None
+
+
+def read_terraform_vms():
+    """Return the terraform `vms` output: {name: {hypervisor, role}}."""
+    vms = terraform_output("vms")
+    return vms or {}
 
 
 def build_inventory():
@@ -73,14 +83,14 @@ def build_inventory():
 
     for name, attrs in sorted(vms.items()):
         hypervisor = (attrs or {}).get("hypervisor", "")
+        role = (attrs or {}).get("role", "linux")
         if not hypervisor:
-            print(f"WARNING: VM '{
-                  name}' has no hypervisor attribute, skipping", file=sys.stderr)
+            print(f"WARNING: VM '{name}' has no hypervisor attribute, skipping",
+                  file=sys.stderr)
             continue
 
         inventory["terraform_vms"]["hosts"].append(name)
-        group = "vms_gateway" if name.startswith(
-            GATEWAY_PREFIX) else "vms_linux"
+        group = "vms_gateway" if role == "gateway" else "vms_linux"
         inventory[group]["hosts"].append(name)
 
         inventory["_meta"]["hostvars"][name] = {

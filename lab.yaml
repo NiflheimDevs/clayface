@@ -1,0 +1,45 @@
+# lab.yaml — single source of truth for the lab.
+#
+# Static facts about the physical world live HERE, not in terraform
+# variables, not in ansible inventories. Both tools read this file:
+#
+#   - terraform:  locals (see terraform/locals.tf) via yamldecode()
+#   - ansible:   inventory/lab_inventory.py (dynamic inventory)
+#
+# What belongs here: hypervisor addresses/users, the single edge host,
+# shared network settings, and the VM placement map (which VM runs on which
+# host, built from which terraform module).
+hosts:
+  host_a:
+    address: 192.168.1.161
+    user: kiasoh
+
+  host_b:
+    address: 192.168.1.134
+    user: kiasoh
+
+edge:
+  host: host_a
+
+network:
+  bridge_name: vm-br0
+  wan_name: vm-wan0
+  vxlan_name: vxlan100
+  vxlan_id: 100
+  vxlan_port: 4789
+  vxlan_parent_interface: wlan0
+
+# deployed on edge
+edge_vm:
+  name: opnsense01
+
+# VM placement map for everything except the gateway: vm name ->
+# { module: terraform module under terraform/modules/, host: hypervisor
+# alias from `hosts` above }. Adding a VM = adding one entry here.
+vm_placements:
+  alpine01:
+    module: alpine
+    host: host_a
+  alpine02:
+    module: alpine
+    host: host_b

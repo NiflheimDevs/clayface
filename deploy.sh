@@ -72,14 +72,14 @@ if [ "$SKIP_ANSIBLE" = true ]; then
 fi
 
 step "Ansible: configure hypervisors (hosts.yml)"
-ansible-playbook -i "$ANSIBLE_DIR/inventory/hosts.yml" "$ANSIBLE_DIR/playbooks/hosts.yml" --ask-become-pass
+ansible-playbook -i "$ANSIBLE_DIR/inventory/lab_inventory.py" "$ANSIBLE_DIR/playbooks/hosts.yml" --ask-become-pass
 
 step "Ansible: configure edge (edge.yml)"
-ansible-playbook -i "$ANSIBLE_DIR/inventory/edge.yml" "$ANSIBLE_DIR/playbooks/edge.yml" --ask-become-pass
+ansible-playbook -i "$ANSIBLE_DIR/inventory/lab_inventory.py" "$ANSIBLE_DIR/playbooks/edge.yml" --ask-become-pass
 
 step "Ansible: start VMs created by terraform (start_vms.yml)"
 ansible-playbook \
-    -i "$ANSIBLE_DIR/inventory/hosts.yml" \
+    -i "$ANSIBLE_DIR/inventory/lab_inventory.py" \
     -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
     "$ANSIBLE_DIR/playbooks/start_vms.yml" 
 

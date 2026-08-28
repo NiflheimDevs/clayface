@@ -4,7 +4,7 @@
 # (inventory/terraform_vms.py). Run it with both inventories:
 #
 #   ansible-playbook \
-#       -i inventory/hosts.yml \
+#       -i inventory/lab_inventory.py \
 #       -i inventory/terraform_vms.py \
 #       playbooks/start_vms.yml
 
@@ -35,7 +35,7 @@
       ansible.builtin.fail:
         msg: >-
           Bridge '{{ vm_bridge_name }}' does not exist on {{ libvirt_hypervisor }}.
-          Run 'ansible-playbook -i inventory/hosts.yml playbooks/hosts.yml' first
+          Run 'ansible-playbook -i inventory/lab_inventory.py playbooks/hosts.yml' first
           (it creates vm-br0 and the VXLAN), or use ./deploy.sh which runs
           everything in the right order.
       when: bridge_check.rc != 0
@@ -102,7 +102,7 @@
       ansible.builtin.fail:
         msg: >-
           Bridge '{{ vm_bridge_name }}' does not exist on {{ libvirt_hypervisor }}.
-          Run 'ansible-playbook -i inventory/hosts.yml playbooks/hosts.yml' first
+          Run 'ansible-playbook -i inventory/lab_inventory.py playbooks/hosts.yml' first
           (it creates vm-br0 and the VXLAN), or use ./deploy.sh which runs
           everything in the right order.
       when: bridge_check.rc != 0
