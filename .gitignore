@@ -8,3 +8,9 @@ terraform/terraform.tfvars
 
 #ansible
 ansible/inventory/__pycache__
+
+# obsidian vault — volatile app state, not project content
+red-clay/.obsidian/workspace.json
+red-clay/.obsidian/workspaces.json
+red-clay/.obsidian/graph.json
+red-clay/.obsidian/plugins/
