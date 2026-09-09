@@ -1,0 +1,5 @@
+Copy IEEE.xsl file into the following folder:
+
+C:\Program Files\Microsoft Office\Office12\Bibliography\Style
+
+Enjoy.
