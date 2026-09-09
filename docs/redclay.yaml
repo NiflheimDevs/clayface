@@ -1,0 +1,957 @@
+# ============================================================
+# Clayface - Project Knowledge Base
+# ============================================================
+#
+# Purpose:
+#   Durable, agent-readable context for the Clayface project.
+#
+# Clayface is an Enterprise Digital Twin / red-team simulation
+# playground focused on realistic but lightweight infrastructure.
+#
+# NOTE ON SOURCES OF TRUTH:
+#   This file describes project INTENT: goals, architecture,
+#   decisions, and agent guidance. Machine-consumed FACTS
+#   (hypervisor addresses, network settings, VM placements)
+#   live in lab.yaml at the repo root — terraform and ansible
+#   read lab.yaml directly. Do not duplicate lab.yaml facts
+#   here; if this file contradicts lab.yaml or the code,
+#   lab.yaml and the code win.
+#
+# ============================================================
+
+project:
+  name: Clayface
+  type: enterprise_digital_twin
+
+  description: >
+    A lightweight, reproducible, programmable enterprise infrastructure
+    and red-team simulation playground. It models realistic corporate
+    networking, identity, applications, databases, and security attack
+    paths while keeping the base deployment small and configurable.
+
+  goals:
+    - realistic enterprise infrastructure
+    - broad ethical-security and offensive-security technique coverage
+    - lightweight base deployment
+    - reproducible infrastructure
+    - infrastructure-as-code
+    - automated provisioning and configuration
+    - configurable software versions
+    - configurable security states
+    - cross-platform attack paths
+    - eventual programmable security/attack graph
+
+  current_phase: active_directory
+
+# ============================================================
+# ARCHITECTURE PRINCIPLES
+# ============================================================
+
+design_principles:
+  - Keep the core lab lightweight.
+
+  - Use optional modules when additional attack surfaces are required.
+
+  - Prefer containers for application/database/service deployment
+    instead of creating a VM for every individual service.
+
+  - Keep infrastructure definition conceptually separate from
+    security state.
+
+  - Make software versions and configuration controllable so
+    vulnerable versions and CVEs can be deliberately reproduced.
+
+  - Prefer reusable infrastructure and security components over
+    hardcoded labs.
+
+  - Support custom security experiments eventually.
+
+  - Do not prematurely implement a complex scenario engine.
+
+  - Do not attempt to put every possible offensive-security technique
+    into the core topology.
+
+  - Use a core + optional modules architecture.
+
+# ============================================================
+# CORE TOPOLOGY
+# ============================================================
+
+core:
+  nodes:
+    - name: OPNsense
+      type: firewall_router
+      status: core
+
+      responsibilities:
+        - firewall
+        - routing
+        - NAT
+        - DHCP
+        - DNS
+        - VPN
+        - network_boundary
+
+    - name: DC01
+      type: windows_server
+      status: core
+
+      os:
+        family: Windows Server
+
+      responsibilities:
+        - Active Directory Domain Services
+        - enterprise_identity
+        - Kerberos
+        - LDAP
+        - DNS
+        - Windows_domain_authentication
+        - users
+        - groups
+        - authorization
+        - domain_policy
+
+    - name: CLIENT01
+      type: windows_workstation
+      status: core
+
+      responsibilities:
+        - domain_joined_employee_workstation
+        - employee_endpoint
+        - Windows_initial_access_target
+        - Windows_privilege_escalation_target
+        - lateral_movement_target
+
+    - name: APP01
+      type: linux_server
+      status: core
+
+      os:
+        distribution: Ubuntu
+        release_policy: LTS
+
+      responsibilities:
+        - application_host
+        - Docker_host
+        - web_services
+        - API_services
+        - database_services
+        - internal_services
+
+    - name: IDP01
+      type: identity_provider
+      status: core
+
+      responsibilities:
+        - modern_application_identity
+        - OIDC
+        - OAuth2
+        - SAML
+        - SSO
+        - future_MFA
+
+# ============================================================
+# APP01 SERVICE MODEL
+# ============================================================
+
+app01:
+  deployment_model: containers
+
+  runtime:
+    - Docker
+    - Docker_Compose
+
+  principle: >
+    Multiple logical applications and services should normally run as
+    containers on APP01 instead of requiring separate VMs.
+
+  example_services:
+    - name: public_portal
+      type: web_application
+
+    - name: API
+      type: API_service
+
+    - name: internal_admin
+      type: web_application
+
+    - name: PostgreSQL
+      type: database
+
+    - name: Redis
+      type: cache_or_service
+
+    - name: other_services
+      type: configurable
+
+  services_should_support_configuration:
+    - software
+    - version
+    - container_image
+    - configuration
+    - exposed_ports
+    - network_access
+    - credentials
+    - authentication
+    - authorization
+    - dependencies
+    - vulnerability_state
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+database:
+  default:
+    engine: PostgreSQL
+
+    deployment:
+      type: container
+      host: APP01
+
+    dedicated_database_VM: false
+
+  rationale: >
+    A dedicated DB VM adds infrastructure weight without being necessary.
+    PostgreSQL as a container makes versions, configuration, and vulnerable
+    deployments easier to control.
+
+  future_optional_engines:
+    - SQL_Server
+    - other_database_engines
+
+  future_reason_for_SQL_Server: >
+    SQL Server can provide Windows-integrated authentication and
+    Active Directory-related attack paths that PostgreSQL does not
+    naturally reproduce.
+
+# ============================================================
+# IDENTITY ARCHITECTURE
+# ============================================================
+
+identity:
+  traditional_enterprise_identity:
+    provider: DC01
+
+    technologies:
+      - Active_Directory
+      - Kerberos
+      - LDAP
+      - Windows_domain_authentication
+
+  modern_application_identity:
+    provider: IDP01
+
+    technologies:
+      - OIDC
+      - OAuth2
+      - SAML
+      - SSO
+      - MFA_future
+
+  conceptual_relationships:
+    - AD_provides_traditional_enterprise_identity
+
+    - Windows_clients_authenticate_against_AD
+
+    - Linux_services_can_integrate_with_AD_when_useful
+
+    - IDP01_provides_modern_application_identity
+
+    - web_applications_can_authenticate_through_IDP01
+
+    - IDP01_can_integrate_with_AD
+
+  conceptual_flow:
+    - AD
+    - IDP
+    - web_applications
+
+# ============================================================
+# OPTIONAL MODULES
+# ============================================================
+
+optional_modules:
+  - name: CLIENT02
+
+    purpose:
+      - second_workstation
+      - workstation_to_workstation_lateral_movement
+      - credential_reuse
+      - RDP
+      - WinRM
+      - SMB
+      - pivoting
+
+  - name: FILE01
+
+    purpose:
+      - Windows_file_server
+      - SMB
+      - file_shares
+      - NTLM
+      - ACLs
+      - file_discovery
+      - lateral_movement
+      - relay_related_attack_paths
+
+  - name: CA01
+
+    purpose:
+      - Active_Directory_Certificate_Services
+      - certificate_authentication
+      - AD_CS_attack_paths
+      - certificate_template_misconfiguration
+
+    core: false
+
+  - name: DC02
+
+    purpose:
+      - second_domain_controller
+      - multi_DC_environment
+      - AD_replication
+      - multi_DC_attack_paths
+
+  - name: MAIL01
+
+    purpose:
+      - email_infrastructure
+      - phishing
+      - credential_harvesting
+      - malicious_links
+      - malicious_attachments
+      - mailbox_compromise
+      - BEC_related_attack_paths
+
+  - name: CONTAINER01
+
+    purpose:
+      - separate_container_host
+      - Docker_attack_surface
+      - container_misconfiguration
+      - container_escape_related_attack_paths
+
+    note: >
+      APP01 already runs Docker. CONTAINER01 exists for scenarios
+      where a separate container host is useful.
+
+  - name: K8S
+
+    purpose:
+      - Kubernetes
+      - container_orchestration
+      - cluster_identity
+      - cluster_permissions
+      - Kubernetes_misconfiguration
+      - Kubernetes_attack_paths
+
+module_policy:
+  core:
+    - OPNsense
+    - DC01
+    - CLIENT01
+    - APP01
+    - IDP01
+
+  optional:
+    - CLIENT02
+    - FILE01
+    - CA01
+    - DC02
+    - MAIL01
+    - CONTAINER01
+    - K8S
+
+  rule: >
+    Optional modules should only be instantiated when the desired
+    attack path or technique requires them.
+
+# ============================================================
+# NETWORKING
+# ============================================================
+
+networking:
+  virtualization:
+    host_os: Arch_Linux
+
+    technology:
+      - KVM
+      - QEMU
+      - libvirt
+
+    distributed:
+      enabled: true
+      physical_hosts: multiple
+
+  inter_host_network:
+    technology: VXLAN
+
+    purpose:
+      - Layer_2_connectivity_between_physical_hosts
+      - logical_single_network_across_hosts
+      - VM_to_VM_connectivity_across_hosts
+
+  virtual_network:
+    architecture:
+      - Linux_bridge
+      - VXLAN
+      - VM_interfaces
+
+    router:
+      - OPNsense
+
+  opnsense:
+    responsibilities:
+      - gateway
+      - DHCP
+      - DNS
+      - NAT
+      - firewall
+      - VPN
+
+    current_DHCP_provider: OPNsense
+    current_DNS_provider: OPNsense
+
+    WAN:
+      model: NAT
+
+  conceptual_zones:
+    - external
+    - DMZ_or_application
+    - internal
+
+# ============================================================
+# AUTOMATION
+# ============================================================
+
+automation:
+  terraform:
+    role:
+      - infrastructure_as_code
+      - VM_creation
+      - VM_distribution
+      - infrastructure_declaration
+
+    provider:
+      name: dmacvicar/terraform-provider-libvirt
+      version_previously_used: "0.9.8"
+
+    status: working
+
+  ansible:
+    role:
+      - host_configuration
+      - network_configuration
+      - libvirt_configuration
+      - VM_startup
+      - post_provisioning_configuration
+
+    status: working
+
+  orchestration:
+    current_flow:
+      - Terraform_provisions_VMs
+      - Ansible_configures_hosts
+      - Ansible_starts_VMs
+      - Ansible_performs_post_configuration
+      - OPNsense_provides_DHCP
+      - OPNsense_provides_DNS
+
+    wrapper_script:
+      exists: true
+      purpose: >
+        Automates the Terraform + Ansible provisioning workflow.
+
+# ============================================================
+# CONFIGURATION MODEL
+# ============================================================
+
+configuration:
+  human_source_of_truth:
+    format: YAML
+
+  generated_formats:
+    - JSON
+
+  generated_visualizations:
+    - Graphviz_DOT
+    - SVG
+
+  conceptual_layers:
+    infrastructure:
+      question: "What exists?"
+
+      includes:
+        - physical_hosts
+        - VMs
+        - networks
+        - bridges
+        - containers
+        - services
+        - ports
+        - software
+        - software_versions
+
+    security_state:
+      question: "How is it configured from a security perspective?"
+
+      includes:
+        - users
+        - groups
+        - credentials
+        - permissions
+        - ACLs
+        - authentication
+        - authorization
+        - trust_relationships
+        - intentional_misconfigurations
+        - vulnerable_versions
+        - CVE_related_states
+
+    relationships:
+      includes:
+        - network_relationships
+        - authentication_relationships
+        - authorization_relationships
+        - service_dependencies
+        - trust_relationships
+        - attack_paths
+
+  important_rule: >
+    Infrastructure and security state should be conceptually separate.
+    The same infrastructure should be able to run with different
+    security configurations.
+
+# ============================================================
+# SCENARIO SYSTEM
+# ============================================================
+
+scenarios:
+  status: conceptual_only
+
+  implementation: deferred
+
+  definition: >
+    A scenario is a reproducible security situation or attack experiment
+    that creates an intended attack path.
+
+  it_is_not: >
+    Merely a collection of boolean vulnerability or misconfiguration flags.
+
+  future_requirements:
+    - built_in_scenarios
+    - custom_user_defined_scenarios
+    - reusable_security_conditions
+    - configurable_software_versions
+    - configurable_credentials
+    - configurable_permissions
+    - configurable_service_exposure
+    - configurable_authentication
+    - configurable_authorization
+
+  conceptual_examples:
+    - SQL_injection_to_database
+    - credential_compromise_to_VPN_to_CLIENT01
+    - public_web_compromise_to_APP01
+    - Kerberoasting
+    - AD_CS_attack_path
+    - credential_reuse
+    - container_misconfiguration
+
+  current_rule: >
+    Do not implement the detailed scenario schema or scenario execution
+    engine yet. Keep the concept available for future architecture.
+
+# ============================================================
+# ATTACK SURFACE
+# ============================================================
+
+attack_surface:
+  primary_entry_points:
+    - name: compromised_employee_credentials
+
+      conceptual_path:
+        - attacker
+        - employee_credentials
+        - VPN
+        - internal_network
+        - CLIENT01
+        - Active_Directory
+
+    - name: public_web_service
+
+      conceptual_path:
+        - internet
+        - OPNsense
+        - HTTPS
+        - APP01
+        - vulnerable_web_or_API_container
+        - database_or_host_or_identity
+
+  important_attack_paths:
+    - credential_compromise_to_VPN_to_CLIENT01_to_AD
+
+    - public_web_vulnerability_to_APP01
+
+    - APP01_to_PostgreSQL
+
+    - APP01_to_AD_using_service_identity
+
+    - CLIENT01_to_AD_enumeration
+
+    - CLIENT01_to_AD_privilege_escalation
+
+    - cross_platform_APP01_to_database_to_credentials_to_AD
+
+    - future_web_to_IDP_to_AD
+
+    - future_container_misconfiguration_to_APP01_host
+
+    - future_AD_CS_certificate_authentication
+
+    - future_SMB_NTLM_RDP_WinRM_lateral_movement
+
+# ============================================================
+# TECHNIQUE COVERAGE
+# ============================================================
+
+technique_coverage:
+  core_supports_well:
+    - network_scanning
+    - VPN_initial_access
+    - web_exploitation
+    - API_attacks
+    - SQL_injection
+    - database_attacks
+    - Linux_privilege_escalation
+    - Windows_privilege_escalation
+    - Active_Directory_enumeration
+    - Kerberos_attacks
+    - LDAP_enumeration
+    - credential_attacks
+    - password_spraying
+    - Kerberoasting
+    - AS_REP_roasting
+    - OIDC
+    - OAuth2
+    - SSO_related_attacks
+
+  optional_modules_expand:
+    SMB_NTLM_relay:
+      module: FILE01
+
+    file_share_attacks:
+      module: FILE01
+
+    workstation_lateral_movement:
+      module: CLIENT02
+
+    AD_CS_attacks:
+      module: CA01
+
+    multi_DC_attacks:
+      module: DC02
+
+    phishing:
+      module: MAIL01
+
+    mailbox_compromise:
+      module: MAIL01
+
+    container_escape:
+      module: CONTAINER01
+
+    Kubernetes_attacks:
+      module: K8S
+
+  outside_core_domain:
+    - cloud_specific_attacks
+    - wireless_specific_attacks
+    - some_enterprise_monitoring_scenarios
+    - specialized_physical_infrastructure
+
+  important_note: >
+    "All attack techniques" is not treated as a literal requirement for
+    one topology. The architecture instead aims for broad coverage
+    through a lightweight core and modular extensions.
+
+# ============================================================
+# GRAPH MODEL
+# ============================================================
+
+graphs:
+  principle: >
+    Network topology, authentication relationships, authorization
+    relationships, and attack paths are different graphs and should
+    not be conflated into one diagram.
+
+  network_graph:
+    represents:
+      - hosts
+      - networks
+      - interfaces
+      - routes
+      - exposed_services
+      - network_boundaries
+
+  authentication_graph:
+    represents:
+      - users
+      - identity_providers
+      - authentication_protocols
+      - trust_relationships
+
+  authorization_graph:
+    represents:
+      - users
+      - groups
+      - service_accounts
+      - resources
+      - permissions
+      - ACLs
+
+  attack_graph:
+    represents:
+      - initial_access
+      - vulnerabilities
+      - credentials
+      - trust_edges
+      - privilege_edges
+      - lateral_movement
+      - reachable_targets
+
+# ============================================================
+# INTENDED PROJECT STRUCTURE
+# ============================================================
+
+project_structure:
+  intended_layout:
+    lab.yaml:
+      purpose: >
+        Human-editable infrastructure/topology source of truth.
+        Already exists at the repo root and is read by terraform
+        and ansible.
+
+    scenarios/:
+      purpose: >
+        Future reproducible security experiments.
+
+    modules/:
+      purpose: >
+        Optional infrastructure modules.
+
+    services/:
+      purpose: >
+        Reusable application/service definitions.
+
+    terraform/:
+      purpose: >
+        Infrastructure provisioning.
+
+    ansible/:
+      purpose: >
+        Host and VM configuration.
+
+  example:
+    modules:
+      - client02
+      - file01
+      - ca01
+      - dc02
+      - mail01
+      - container01
+      - k8s
+
+    services:
+      - portal
+      - api
+      - admin
+
+# ============================================================
+# CURRENT PROJECT STATE
+# ============================================================
+
+current_state:
+  completed:
+    - KVM_setup
+    - QEMU_setup
+    - libvirt_setup
+    - distributed_virtualization
+    - multi_host_VM_deployment
+    - VXLAN_connectivity
+    - Layer_2_VM_connectivity
+    - OPNsense_deployment
+    - OPNsense_DHCP
+    - OPNsense_DNS
+    - OPNsense_routing
+    - Terraform_VM_provisioning
+    - Ansible_host_configuration
+    - automated_VM_startup
+    - Terraform_plus_Ansible_automation
+
+  next_major_work:
+    - Active_Directory_installation
+    - AD_domain_configuration
+    - DC01_configuration
+    - CLIENT01_domain_join
+    - AD_users
+    - AD_groups
+    - AD_permissions
+    - AD_authorization
+    - Kerberos_integration
+    - LDAP_integration
+    - Linux_AD_integration_where_useful
+    - application_identity_integration
+    - PostgreSQL_configuration
+    - IDP01_deployment
+    - initial_attack_path_implementation
+
+# ============================================================
+# IMPORTANT ARCHITECTURAL DECISIONS
+# ============================================================
+
+decisions:
+  - id: AD_is_core
+
+    decision: >
+      Active Directory is a core component of Clayface.
+
+    reason: >
+      AD provides realistic enterprise identity, Kerberos, LDAP,
+      Windows authentication, authorization, and many lateral
+      movement and privilege-escalation attack paths.
+
+  - id: AD_CS_is_optional
+
+    decision: >
+      Active Directory Certificate Services is not part of the core.
+
+    reason: >
+      AD CS enables valuable certificate-based attack paths but
+      adds significant complexity and is only required for certain
+      attack scenarios.
+
+  - id: PostgreSQL_is_containerized
+
+    decision: >
+      PostgreSQL runs as a container on APP01 instead of having
+      a dedicated database VM.
+
+    reason: >
+      This reduces infrastructure weight while making database
+      versions and configurations easier to reproduce.
+
+  - id: applications_are_containerized
+
+    decision: >
+      Multiple logical applications should normally run as containers
+      on APP01 instead of separate VMs.
+
+    reason: >
+      This provides service isolation and configurable software
+      versions without multiplying VM count.
+
+  - id: IDP01_is_core
+
+    decision: >
+      A modern identity provider is part of the core architecture.
+
+    reason: >
+      AD alone models traditional Windows enterprise identity.
+      IDP01 adds modern application identity such as OIDC, OAuth2,
+      SAML, SSO, and eventually MFA.
+
+  - id: optional_modules_provide_breadth
+
+    decision: >
+      Specialized infrastructure is implemented as optional modules.
+
+    reason: >
+      A single topology cannot realistically cover every offensive
+      security technique without becoming unnecessarily heavy.
+
+  - id: YAML_is_source_of_truth
+
+    decision: >
+      YAML is the primary human-editable project definition.
+
+    reason: >
+      YAML is readable by humans and agents while remaining suitable
+      for automation.
+
+  - id: scenario_engine_is_deferred
+
+    decision: >
+      The scenario system is currently conceptual only.
+
+    reason: >
+      Core infrastructure and AD should be stabilized before designing
+      a detailed scenario schema and execution engine.
+
+# ============================================================
+# NON-GOALS / CONSTRAINTS
+# ============================================================
+
+constraints:
+  - Do_not_make_every_service_a_VM
+
+  - Do_not_make_every_attack_technique_part_of_core
+
+  - Do_not_build_the_detailed_scenario_engine_yet
+
+  - Do_not_overcomplicate_the_base_lab
+
+  - Do_not_hardcode_software_versions_when_they_should_be_configurable
+
+  - Do_not_treat_AD_as_only_a_login_server
+
+  - Do_not_conflate_network_topology_with_authentication_graph
+
+  - Do_not_conflate_authentication_with_authorization
+
+  - Do_not_conflate_authorization_with_attack_paths
+
+# ============================================================
+# AGENT GUIDANCE
+# ============================================================
+
+agent_guidance:
+  big_picture: >
+    Clayface is a programmable enterprise security laboratory.
+    The VM/container substrate provides infrastructure. AD and IDP
+    provide identity. Applications and databases provide realistic
+    services. Optional modules add specialized attack surfaces.
+    The eventual goal is to model relationships and attack paths
+    as a programmable security graph.
+
+  when_modifying_architecture:
+    - preserve_lightweight_core
+
+    - prefer_reusable_modules
+
+    - prefer_containers_for_application_services
+
+    - keep_software_versions_configurable
+
+    - keep_security_state_separate_from_base_infrastructure
+
+    - avoid_premature_scenario_engine_complexity
+
+    - preserve_AD_as_core_identity_infrastructure
+
+    - preserve_IDP01_as_modern_application_identity
+
+  current_priority:
+    - Active_Directory
+    - DC01
+    - CLIENT01
+    - AD_users_and_groups
+    - AD_permissions
+    - AD_authentication
+    - Kerberos
+    - LDAP
+    - Linux_AD_integration
+    - PostgreSQL
+    - IDP01
+    - initial_attack_paths
