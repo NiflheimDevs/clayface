@@ -58,3 +58,20 @@ for those to get fixed, we may need to generate some terraform configs with a sc
 
 For the second problem, We can have a mesh or L2 forwarding on one of the hosts and that being connected to everyone (like a brain)
 
+### Update: project knowledge base + naming
+
+The knowledge kept growing but had no home. We now separate two kinds of knowledge:
+
+1. **Facts** — hypervisor IPs, VM placements, network settings. these live in `lab.yaml` and terraform/ansible read it directly. unchanged.
+2. **Intent** — what the project is, the target topology, architecture decisions and their reasons. this now lives in a knowledge base: `docs/redclay.yaml`. nothing reads it automatically; it is for humans and agents. if it disagrees with `lab.yaml` or the code, lab.yaml/code wins.
+
+Writing it down forced some floating decisions to become real:
+
+- the "MangoDB version" idea from the dynamic-environment section → resolved as [[PostgreSQL]] in a container on APP01, with versions and configuration controllable. SQL Server stays optional for later (windows-integrated auth attack paths that postgres doesn't reproduce naturally).
+- applications run as containers on APP01, not one VM per service.
+- a modern identity provider (IDP01: OIDC/OAuth2/SAML/SSO) is part of the core, next to AD.
+- the scenario / programmable attack graph idea is explicitly **deferred**. core infrastructure and AD first, scenario engine later.
+
+Naming: the project is now called **[[Clayface]]**. the knowledge base originally called it RedClay; it has been renamed to match.
+
+Current phase: [[Active Directory]] — DC01, CLIENT01, users/groups/permissions, Kerberos and LDAP, then Linux AD integration, IDP01, and the first attack paths.
