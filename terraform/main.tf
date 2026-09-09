@@ -51,3 +51,31 @@ module "alpine_host_b" {
 
   name = each.key
 }
+
+module "dc_host_a" {
+  source = "./modules/domaincontroller"
+  providers = {
+    libvirt = libvirt.host_a
+  }
+  for_each = {
+    for name, p in local.vm_placements :
+    name => p if p["host"] == "host_a" && p["module"] == "dc"
+  }
+
+  name = each.key
+}
+
+module "dc_host_b" {
+  source = "./modules/domaincontroller"
+
+  providers = {
+    libvirt = libvirt.host_b
+  }
+
+  for_each = {
+    for name, p in local.vm_placements :
+    name => p if p["host"] == "host_b" && p["module"] == "dc"
+  }
+
+  name = each.key
+}
