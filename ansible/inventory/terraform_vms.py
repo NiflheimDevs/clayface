@@ -6,11 +6,19 @@ groups so playbooks can target the VMs created by Terraform:
 
     terraform_vms : every VM
     vms_gateway   : edge VMs, role "gateway" (started first, they provide DHCP/DNS)
+    vms_dc        : Windows domain controllers, role "dc" (WinRM connection vars)
     vms_linux     : every other VM
+
+vms_dc hosts are ALSO members of vms_linux, so start_vms.yml still starts
+them — only the playbooks that talk to the VM over the network differ
+(WinRM for Windows, SSH for Linux).
 
 Each VM host exposes:
     libvirt_hypervisor : hypervisor alias (matches a host in lab_inventory.py)
     ansible_host       : <name>.<domain> (resolved via OPNsense DNS)
+
+Windows (role "dc") hosts additionally expose WinRM connection variables:
+    ansible_connection/port/user/password
 
 The VM placement itself comes from lab.yaml (via terraform locals); this
 script only reads back what terraform derived from it.
@@ -27,7 +35,9 @@ Usage together with the lab.yaml host inventory:
         ansible/playbooks/start_vms.yml
 
 Environment overrides:
-    LAB_DOMAIN  DNS domain of the lab (default: clayface)
+    LAB_DOMAIN           DNS domain of the lab (default: clayface)
+    LAB_WIN_ADMIN_PASS   Windows Administrator password for dc-role VMs
+                         (default: Admin@123 — lab-only, deliberately weak)
 """
 
 import json
@@ -36,6 +46,7 @@ import subprocess
 import sys
 
 LAB_DOMAIN = os.environ.get("LAB_DOMAIN", "clayface")
+LAB_WIN_ADMIN_PASS = os.environ.get("LAB_WIN_ADMIN_PASS", "Admin@123")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TERRAFORM_DIR = os.path.join(BASE_DIR, "..", "..", "terraform")
@@ -60,7 +71,8 @@ def terraform_output(name):
         msg = exc.stderr.strip() if exc.stderr else exc
         print(f"WARNING: terraform output failed: {msg}", file=sys.stderr)
     except json.JSONDecodeError as exc:
-        print(f"WARNING: could not parse terraform output: {exc}", file=sys.stderr)
+        print(f"WARNING: could not parse terraform output: {
+              exc}", file=sys.stderr)
     return None
 
 
@@ -76,9 +88,13 @@ def build_inventory():
     inventory = {
         "_meta": {"hostvars": {}},
         "all": {"children": ["terraform_vms"]},
-        "terraform_vms": {"children": ["vms_gateway", "vms_linux"], "hosts": []},
+        "terraform_vms": {
+            "children": ["vms_gateway", "vms_linux"],
+            "hosts": [],
+        },
         "vms_gateway": {"hosts": []},
         "vms_linux": {"hosts": []},
+        "vms_dc": {"hosts": []},
     }
 
     for name, attrs in sorted(vms.items()):
@@ -93,10 +109,27 @@ def build_inventory():
         group = "vms_gateway" if role == "gateway" else "vms_linux"
         inventory[group]["hosts"].append(name)
 
-        inventory["_meta"]["hostvars"][name] = {
+        hostvars = {
             "libvirt_hypervisor": hypervisor,
             "ansible_host": f"{name}.{LAB_DOMAIN}",
         }
+        # Pinned MAC (dc VMs) — lets playbooks/OPNsense tie name -> MAC ->
+        # DHCP lease without hardcoding IPs.
+        if (attrs or {}).get("mac"):
+            hostvars["libvirt_mac"] = attrs["mac"]
+
+        if role == "dc":
+            inventory["vms_dc"]["hosts"].append(name)
+            hostvars.update({
+                "ansible_connection": "winrm",
+                "ansible_port": 5985,
+                "ansible_user": "Administrator",
+                "ansible_password": LAB_WIN_ADMIN_PASS,
+                "ansible_winrm_transport": "ntlm",
+                "ansible_winrm_scheme": "http",
+            })
+
+        inventory["_meta"]["hostvars"][name] = hostvars
 
     return inventory
 

@@ -1,5 +1,19 @@
+locals {
+  # Deterministic MAC derived from the VM name: stable across applies,
+  # unique per VM, and known to terraform BEFORE the VM exists — which is
+  # what makes DHCP static mappings (and therefore DNS bootstrap for
+  # Ansible) possible without hardcoding IPs anywhere.
+  # 52:54:00 is the KVM/QEMU vendor OUI.
+  mac_seed = sha256(var.name)
+  dc_mac = format("52:54:00:%s:%s:%s",
+    substr(local.mac_seed, 0, 2),
+    substr(local.mac_seed, 2, 2),
+    substr(local.mac_seed, 4, 2),
+  )
+}
+
 resource "libvirt_volume" "dc01" {
-  name     = "DC01.qcow2"
+  name     = "${upper(var.name)}.qcow2"
   pool     = "default"
   capacity = 25 * 1024 * 1024 * 1024 # 25 GiB
 
@@ -10,7 +24,7 @@ resource "libvirt_volume" "dc01" {
   }
 
   backing_store = {
-    path = "/var/lib/libvirt/images/ws-ad-base.qcow2"
+    path = var.base_image_path
 
     format = {
       type = "qcow2"
@@ -36,6 +50,10 @@ resource "libvirt_domain" "dc" {
     apic = {}
   }
 
+  cpu = {
+    mode = "host-model"
+  }
+
   devices = {
     disks = [
       {
@@ -57,10 +75,6 @@ resource "libvirt_domain" "dc" {
       }
     ]
 
-    cpu = {
-      mode = "host-model"
-    }
-
     interfaces = [
       {
         type = "bridge"
@@ -73,6 +87,10 @@ resource "libvirt_domain" "dc" {
           bridge = {
             bridge = "vm-br0"
           }
+        }
+
+        mac = {
+          address = local.dc_mac
         }
       }
     ]

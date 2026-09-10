@@ -1,0 +1,396 @@
+---
+# What it does (idempotent):
+#   1. detects the API scheme (https, falling back to http)
+#   2. enables "Register DHCP leases" / "Register DHCP static mappings"
+#   3. creates/updates one static DHCP binding per vms_dc VM:
+#        inventory name (from lab.yaml) + pinned MAC (terraform)
+#        -> stable IP (pool base + group index), so <name>.clayface
+#           resolves from boot #0
+#   4. reconfigures dnsmasq and verifies the name resolves
+#   5. OPTIONALLY hands out a DC as the lab's DNS server (DHCP option 6) —
+#      off unless LAB_DHCP_DNS_SERVER is set, see the env overrides
+#
+# Run (same inventories as every other playbook):
+#   OPNSENSE_API_KEY=... OPNSENSE_API_SECRET=... \
+#   ansible-playbook -i inventory/lab_inventory.py \
+#                    -i inventory/terraform_vms.py playbooks/opnsense.yml
+#
+# Env overrides:
+#   LAB_DNS_URL      full API base, e.g. https://10.0.0.1 (optional —
+#                    otherwise the scheme is auto-detected on 10.0.0.1)
+#   LAB_DOMAIN       lab DNS domain (default clayface)
+#   LAB_DC_IP_BASE   first IP of the dc pool (default 10.0.0.10)
+#   LAB_DHCP_DNS_SERVER
+#                    DNS server to hand to DHCP clients (option 6). UNSET by
+#                    default. Enable it only AFTER a DC answers DNS: every
+#                    lab VM would otherwise be pointed at a dead resolver.
+#                    Recommended order: full deploy (dc.yml included, which
+#                    sets the DC up as a resolver) -> confirm the DC's DNS
+#                    verification passes -> re-run this play with the
+#                    variable set. Recovery is deleting the option row and
+#                    reconfiguring; IP connectivity is never lost.
+
+- name: Pin domain controller VMs in OPNsense DHCP/DNS
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    opnsense_url_env: "{{ lookup('env', 'LAB_DNS_URL') }}"
+    opnsense_host: "10.0.0.1"
+    opnsense_url: "{{ (opnsense_url_env if opnsense_url_env | length > 0 else detected_scheme ~ '://' ~ opnsense_host) }}"
+    opnsense_api_key: "{{ lookup('env', 'OPNSENSE_API_KEY') }}"
+    opnsense_api_secret: "{{ lookup('env', 'OPNSENSE_API_SECRET') }}"
+    lab_domain: "{{ lookup('env', 'LAB_DOMAIN') | default('clayface', true) }}"
+    # One IP per dc VM, assigned deterministically: pool base + group index.
+    dc_ip_base: "{{ (lookup('env', 'LAB_DC_IP_BASE') | default('10.0.0.10', true)).split('.') }}"
+    # DNS server handed to DHCP clients (dnsmasq option 6). EMPTY = disabled,
+    # which is the default on purpose — see the bootstrap note in the header.
+    # Set it to a DC's reserved IP (printed in the report at the end of this
+    # play) once that DC actually answers DNS:
+    #   LAB_DHCP_DNS_SERVER=10.0.0.10
+    lab_dhcp_dns_server: "{{ lookup('env', 'LAB_DHCP_DNS_SERVER') | default('', true) }}"
+
+  module_defaults:
+    ansible.builtin.uri:
+      url_username: "{{ opnsense_api_key }}"
+      url_password: "{{ opnsense_api_secret }}"
+      force_basic_auth: true
+      validate_certs: false # self-signed cert on the OPNsense image
+      status_code: 200
+
+  pre_tasks:
+    - name: Fail early if API credentials are missing
+      ansible.builtin.fail:
+        msg: >-
+          Set OPNSENSE_API_KEY and OPNSENSE_API_SECRET. Create them once in
+          the OPNsense UI: System -> Access -> Users -> (admin user) ->
+          add API key.
+      when: not opnsense_api_key or not opnsense_api_secret
+
+    - name: Fail if any dc VM lacks a pinned MAC
+      ansible.builtin.fail:
+        msg: >-
+          {{ item }} has no libvirt_mac hostvar — the terraform dc module
+          pins it. Run 'terraform -chdir=terraform apply' so the 'vms'
+          output carries the MAC, then rerun.
+      loop: "{{ groups['vms_dc'] }}"
+      when: hostvars[item].libvirt_mac is not defined
+
+    - name: Probe the OPNsense API over HTTPS
+      ansible.builtin.uri:
+        url: "https://{{ opnsense_host }}/"
+        status_code: [200, 302, 401]
+        timeout: 3
+      register: https_probe
+      failed_when: false
+
+    - name: Probe the OPNsense API over HTTP
+      ansible.builtin.uri:
+        url: "http://{{ opnsense_host }}/"
+        status_code: [200, 302, 401]
+        timeout: 3
+      register: http_probe
+      failed_when: false
+
+    - name: Pick the answering scheme
+      ansible.builtin.set_fact:
+        detected_scheme: "{{ 'https' if https_probe.status == 200 else 'http' }}"
+
+    - name: Verify OPNsense is reachable at all
+      ansible.builtin.assert:
+        that: https_probe.status == 200 or http_probe.status == 200
+        fail_msg: >-
+          Neither https://{{ opnsense_host }} nor http://{{ opnsense_host }}
+          answered. Is the OPNsense VM running and reachable from this
+          machine? (Override with LAB_DNS_URL if it lives elsewhere.)
+
+  tasks:
+    # ------------------------------------------------------------
+    # 1. Read current dnsmasq configuration (also proves API access)
+    # ------------------------------------------------------------
+    - name: Read current dnsmasq configuration
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/dnsmasq/settings/get"
+        method: GET
+      register: dnsmasq_cfg
+
+    - name: Verify API authentication works
+      ansible.builtin.assert:
+        that: dnsmasq_cfg.status == 200 and dnsmasq_cfg.json.dnsmasq is defined
+        fail_msg: >-
+          Could not read dnsmasq settings (HTTP {{ dnsmasq_cfg.status }}).
+          Check OPNSENSE_API_KEY / OPNSENSE_API_SECRET.
+
+    # ------------------------------------------------------------
+    # 2. Enable DNS registration of leases + static mappings
+    # ------------------------------------------------------------
+    - name: Enable DNS registration of DHCP leases and static mappings
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/dnsmasq/settings/set"
+        method: POST
+        body_format: json
+        body:
+          dnsmasq:
+            regdhcp: "1"
+            regdhcpstatic: "1"
+      register: cfg_set
+      changed_when: >-
+        (dnsmasq_cfg.json.dnsmasq.regdhcp | default('0') | string) != '1'
+        or (dnsmasq_cfg.json.dnsmasq.regdhcpstatic | default('0') | string) != '1'
+
+    # ------------------------------------------------------------
+    # 3. Static bindings: one per vms_dc VM
+    # ------------------------------------------------------------
+    - name: Search existing static bindings
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/dnsmasq/settings/searchHost"
+        method: GET
+      register: host_search
+
+    - name: Index existing bindings by hostname
+      ansible.builtin.set_fact:
+        existing_by_name: "{{ dict(existing_rows | map(attribute='host') | zip(existing_rows)) }}"
+      vars:
+        existing_rows: "{{ host_search.json.rows | default([]) | selectattr('host', 'defined') | list }}"
+
+    - name: Compute the desired bindings (name -> pinned MAC -> stable IP)
+      ansible.builtin.set_fact:
+        wanted_bindings: >-
+          {{ (wanted_bindings | default([])) + [{
+            'name': item,
+            'mac': hostvars[item].libvirt_mac | upper,
+            'ip': (dc_ip_base[0:3] | join('.')) ~ '.' ~ (dc_ip_base[3] | int + groups['vms_dc'].index(item))
+          }] }}
+      loop: "{{ groups['vms_dc'] }}"
+
+    - name: Create missing static bindings
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/dnsmasq/settings/addHost"
+        method: POST
+        body_format: json
+        body:
+          host:
+            host: "{{ item.name }}"
+            domain: "{{ lab_domain }}"
+            ip: "{{ item.ip }}"
+            hwaddr: "{{ item.mac }}"
+            descr: "clayface lab (terraform/ansible managed)"
+      loop: "{{ wanted_bindings }}"
+      loop_control:
+        label: "{{ item.name }} -> {{ item.ip }} ({{ item.mac }})"
+      register: binding_create
+      when: item.name not in existing_by_name
+      changed_when: binding_create.status == 200
+
+    - name: Update stale static bindings (IP or MAC changed)
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/dnsmasq/settings/setHost/{{ existing_by_name[item.name].uuid }}"
+        method: POST
+        body_format: json
+        body:
+          host:
+            host: "{{ item.name }}"
+            domain: "{{ lab_domain }}"
+            ip: "{{ item.ip }}"
+            hwaddr: "{{ item.mac }}"
+            descr: "clayface lab (terraform/ansible managed)"
+      loop: "{{ wanted_bindings }}"
+      loop_control:
+        label: "{{ item.name }} -> {{ item.ip }} ({{ item.mac }})"
+      register: binding_update
+      when: >-
+        item.name in existing_by_name and (
+          (existing_by_name[item.name].ip | default('', true) | string) is not search(item.ip)
+          or (existing_by_name[item.name].hwaddr | default('', true) | string | lower) != (item.mac | lower))
+      changed_when: binding_update.status == 200
+
+    # ------------------------------------------------------------
+    # 4. Apply + verify
+    # ------------------------------------------------------------
+    - name: Reconfigure dnsmasq (apply everything)
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/dnsmasq/service/reconfigure"
+        method: POST
+      register: reconf
+      changed_when: reconf.status == 200
+
+    # ------------------------------------------------------------
+    # 4b. Unbound -> dnsmasq forward for the lab domain.
+    #     Unbound owns 10.0.0.1:53 in this image; the static bindings
+    #     live in dnsmasq's DNS (auto-assigned port). Without this
+    #     domain forward, everything above is invisible to clients.
+    # ------------------------------------------------------------
+    - name: Read dnsmasq's DNS port
+      ansible.builtin.set_fact:
+        dnsmasq_dns_port: "{{ dnsmasq_cfg.json.dnsmasq.dns_port | default('') }}"
+
+    - name: Search existing Unbound domain forwards
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/unbound/settings/search_forward"
+        method: GET
+      register: forward_search
+
+    - name: Find the forward for the lab domain
+      ansible.builtin.set_fact:
+        existing_forward: >-
+          {{ forward_search.json.rows | default([])
+            | selectattr('domain', '==', lab_domain) | list }}
+
+    - name: Create the Unbound forward ({{ lab_domain }} -> dnsmasq on 127.0.0.1:{{ dnsmasq_dns_port }})
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/unbound/settings/add_forward"
+        method: POST
+        body_format: json
+        # NOTE: body key is 'dot' (the model node), not 'forward' — the
+        # endpoint is add_forward but addBase() expects the dots.dot node.
+        body:
+          dot:
+            enabled: "1"
+            type: "forward"
+            domain: "{{ lab_domain }}"
+            server: "127.0.0.1"
+            port: "{{ dnsmasq_dns_port }}"
+            description: "clayface lab (terraform/ansible managed)"
+      register: forward_add
+      changed_when: forward_add.status == 200
+      when: existing_forward | length == 0
+
+    - name: Update the Unbound forward (dnsmasq port changed)
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/unbound/settings/set_forward/{{ existing_forward[0].uuid }}"
+        method: POST
+        body_format: json
+        body:
+          dot:
+            enabled: "1"
+            type: "forward"
+            domain: "{{ lab_domain }}"
+            server: "127.0.0.1"
+            port: "{{ dnsmasq_dns_port }}"
+      register: forward_update
+      changed_when: forward_update.status == 200
+      when: >-
+        existing_forward | length > 0 and (
+          existing_forward[0].port | default('', true) | string != dnsmasq_dns_port | string
+          or existing_forward[0].server | default('', true) | string != '127.0.0.1')
+
+    - name: Reconfigure Unbound (apply the forward)
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/unbound/service/reconfigure"
+        method: POST
+      register: unbound_reconf
+      changed_when: unbound_reconf.status == 200
+      when: forward_add is changed or forward_update is changed
+
+    # ------------------------------------------------------------
+    # 4c. DHCP option 6 -> the lab resolver. OPT-IN: runs only when
+    #     LAB_DHCP_DNS_SERVER is set (see the header).
+    #
+    #     Why opt-in: pointing every DHCP client at the DC before the
+    #     DC answers DNS leaves the whole lab without a resolver. IP
+    #     connectivity survives, so recovery is always possible
+    #     (dc.yml -e ansible_host=<ip>), but every name lookup fails
+    #     until it is reverted. The probe below turns that mistake into
+    #     a loud failure instead of a silent blackhole.
+    #
+    #     dnsmasq's DHCP ranges have no DNS-server field; the mechanism
+    #     is the generic dhcp-option=6,<ip>, exposed by OPNsense as a
+    #     dhcp_options row. Same search/add/set shape as the static
+    #     bindings above (UI: Services -> Dnsmasq DNS & DHCP ->
+    #     DHCP options). Do NOT set `option6` on the row — the config
+    #     template prefers it and would emit the IPv6 directive.
+    # ------------------------------------------------------------
+    - name: Probe the resolver we are about to hand out via DHCP
+      ansible.builtin.command:
+        cmd: "nslookup {{ lab_domain }} {{ lab_dhcp_dns_server }}"
+      register: dns_option_probe
+      changed_when: false
+      failed_when: false
+      when: lab_dhcp_dns_server | length > 0
+
+    - name: Refuse to hand out a resolver that does not answer
+      ansible.builtin.assert:
+        that: dns_option_probe.rc == 0
+        fail_msg: >-
+          {{ lab_dhcp_dns_server }} did not answer a DNS query for
+          {{ lab_domain }}. Handing it out via DHCP option 6 would leave every
+          lab VM without a resolver. Promote the DC first (playbooks/dc.yml),
+          or unset LAB_DHCP_DNS_SERVER.
+        quiet: true
+      when: lab_dhcp_dns_server | length > 0
+
+    - name: Search existing dnsmasq DHCP options
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/dnsmasq/settings/searchOption"
+        method: GET
+      register: option_search
+      when: lab_dhcp_dns_server | length > 0
+
+    - name: Find the global option-6 row (untagged, no interface)
+      ansible.builtin.set_fact:
+        existing_option6: >-
+          {{ option_search.json.rows | default([])
+            | selectattr('option', 'defined')
+            | selectattr('option', '==', '6')
+            | rejectattr('tag', 'truthy')
+            | rejectattr('interface', 'truthy')
+            | list }}
+      when: lab_dhcp_dns_server | length > 0
+
+    - name: Hand out the lab resolver via DHCP option 6
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/dnsmasq/settings/addOption"
+        method: POST
+        body_format: json
+        body:
+          option:
+            type: "set"
+            option: "6"
+            value: "{{ lab_dhcp_dns_server }}"
+            description: "clayface lab (terraform/ansible managed)"
+      register: option_add
+      changed_when: option_add.status == 200
+      when: lab_dhcp_dns_server | length > 0 and existing_option6 | length == 0
+
+    - name: Update option 6 when the resolver changed
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/dnsmasq/settings/setOption/{{ existing_option6[0].uuid }}"
+        method: POST
+        body_format: json
+        body:
+          option:
+            type: "set"
+            option: "6"
+            value: "{{ lab_dhcp_dns_server }}"
+            description: "clayface lab (terraform/ansible managed)"
+      register: option_update
+      changed_when: option_update.status == 200
+      when: >-
+        lab_dhcp_dns_server | length > 0 and existing_option6 | length > 0
+        and (existing_option6[0].value | default('', true) | string) != lab_dhcp_dns_server
+
+    - name: Reconfigure dnsmasq (apply the DHCP option)
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/dnsmasq/service/reconfigure"
+        method: POST
+      register: option_reconf
+      changed_when: option_reconf.status == 200
+      when: option_add is changed or option_update is changed
+
+    - name: Verify every dc name resolves via OPNsense
+      ansible.builtin.command:
+        cmd: "nslookup {{ item.name | lower }}.{{ lab_domain }} {{ opnsense_host }}"
+      loop: "{{ wanted_bindings }}"
+      loop_control:
+        label: "{{ item.name }}.{{ lab_domain }}"
+      register: dns_check
+      changed_when: false
+      failed_when: dns_check.rc != 0
+
+    - name: Report the bindings
+      ansible.builtin.debug:
+        msg: >-
+          Pinned: {{ wanted_bindings | map(attribute='name') | join(', ') }}
+          — resolves via {{ opnsense_host }} as
+          {{ wanted_bindings | map(attribute='name') | map('lower') | join(', ') }}.{{ lab_domain }}.

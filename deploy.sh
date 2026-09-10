@@ -1,6 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
+export OPNSENSE_API_KEY=8ZPMB9KnLcfa8+7CkyX4dKHgwoJUfwbuaFYNJ4/CWgSfSvs8bb/Fvn80nqBqDDbuuulOtoOViNqTzuOe
+export OPNSENSE_API_SECRET=C7h7CvpBffTLIWVJA7JMBI/Yjfq6gf8SZXXoBNCrU8hXy8eK7NYX8x2nnL9uHe7mCB44EInyUvrrS4wT
+
+export no_proxy="clayface,10.0.0.1,localhost,127.0.0.1${no_proxy:+,$no_proxy}"
+export NO_PROXY="$no_proxy"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TERRAFORM_DIR="$SCRIPT_DIR/terraform"
 ANSIBLE_DIR="$SCRIPT_DIR/ansible"
@@ -81,6 +87,23 @@ step "Ansible: start VMs created by terraform (start_vms.yml)"
 ansible-playbook \
     -i "$ANSIBLE_DIR/inventory/lab_inventory.py" \
     -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
-    "$ANSIBLE_DIR/playbooks/start_vms.yml" 
+    "$ANSIBLE_DIR/playbooks/start_vms.yml"
+
+# Windows-only: pins dc VMs in OPNsense DHCP/DNS via its REST API so
+# <name>.clayface resolves. Needs OPNSENSE_API_KEY / OPNSENSE_API_SECRET
+# exported (one-time API key: OPNsense UI -> System -> Access -> Users).
+step "Ansible: pin dc VMs in OPNsense DHCP/DNS (opnsense.yml)"
+ansible-playbook \
+    -i "$ANSIBLE_DIR/inventory/lab_inventory.py" \
+    -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
+    "$ANSIBLE_DIR/playbooks/opnsense.yml"
+
+# Windows-only: WinRM, no become pass needed. Idempotent — skips everything
+# already done (hostname set, password enforced, domain installed).
+step "Ansible: promote domain controller(s) (dc.yml)"
+ansible-playbook \
+    -i "$ANSIBLE_DIR/inventory/lab_inventory.py" \
+    -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
+    "$ANSIBLE_DIR/playbooks/dc.yml"
 
 step "Done. Infrastructure provisioned."

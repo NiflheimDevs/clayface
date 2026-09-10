@@ -1,0 +1,216 @@
+---
+# What it does, in order:
+#   1. waits for WinRM to answer
+#   2. renames the host to its inventory name (dc01, from lab.yaml) + reboot
+#   3. resets the built-in Administrator password to the lab password
+#   4. points the NIC's DNS client at 127.0.0.1 — BEFORE promotion, so
+#      netlogon's dynamic update registers the DC's A/SRV records into the
+#      AD zone this DC is about to host (see the task comment for why)
+#   5. promotes to domain controller — with no other DC in lab.yaml this is
+#      the FIRST DC, so promotion means installing a new forest
+#      (microsoft.ad.domain installs the AD DS role, then runs
+#      Install-ADDSForest under the hood) — and reboots when done
+#   6. re-asserts the DNS client (cheap idempotent repair)
+#   7. forwards everything the AD zone does not own to OPNsense
+#   8. verifies DNS for real: the domain's own A record and the DC locator
+#      SRV record, both resolved locally with -DnsOnly
+#   9. verifies the domain came up (Get-ADDomain)
+
+- name: Promote Windows VMs to domain controllers
+  hosts: vms_dc
+  gather_facts: false
+
+  # The password is lab-only and deliberately weak (planted
+  # misconfiguration); LAB_WIN_ADMIN_PASS overrides it inventory-wide.
+  # DSRM shares it for now — worth changing before the lab grows.
+  #
+  # The AD identity is DERIVED from the lab DNS domain rather than declared
+  # separately. CLAUDE.md's data-flow rule keeps the DNS domain out of
+  # lab.yaml on purpose (it is baked into the OPNsense image, mirrored as
+  # LAB_DOMAIN in inventory/terraform_vms.py). The AD domain is a child of
+  # it, so deriving it keeps the two from silently disagreeing: setting
+  # LAB_DOMAIN moves the inventory addresses AND the forest name together.
+  # lab_dns_forwarder is the OPNsense LAN IP — the same mirrored constant as
+  # opnsense.yml's opnsense_host and start_vms.yml's lab_dns_ip.
+  vars:
+    lab_win_admin_pass: "{{ lookup('env', 'LAB_WIN_ADMIN_PASS') | default('Admin@123', true) }}"
+    lab_domain: "{{ lookup('env', 'LAB_DOMAIN') | default('clayface', true) }}"
+    lab_ad_domain: "{{ lab_domain }}.local"
+    lab_ad_netbios: "{{ lab_domain | upper }}"
+    lab_dns_forwarder: "10.0.0.1"
+
+  tasks:
+    # ------------------------------------------------------------
+    # 1. Wait for the VM to boot and answer WinRM
+    # ------------------------------------------------------------
+    - name: Wait for WinRM to answer (VM boot after sysprep can be slow)
+      ansible.builtin.wait_for_connection:
+        timeout: 900
+
+    # ------------------------------------------------------------
+    # 2. Hostname -> inventory name (dc01, from lab.yaml) + reboot
+    # ------------------------------------------------------------
+    - name: Set hostname to {{ inventory_hostname }}
+      ansible.windows.win_hostname:
+        name: "{{ inventory_hostname }}"
+      register: hostname_result
+
+    - name: Reboot after hostname change
+      ansible.windows.win_reboot:
+        reboot_timeout: 600
+        post_reboot_delay: 30
+      when: hostname_result.reboot_required
+
+    # ------------------------------------------------------------
+    # 3. Local Administrator password (carries over to
+    #    Domain\Administrator during promotion)
+    # ------------------------------------------------------------
+    - name: Set built-in Administrator password
+      ansible.windows.win_user:
+        name: Administrator
+        password: "{{ lab_win_admin_pass }}"
+        account_disabled: false
+        password_never_expires: true
+
+    # ------------------------------------------------------------
+    # 3b. DNS client -> itself, BEFORE promotion.
+    #
+    # Netlogon registers the DC's A and SRV records by dynamic update, and
+    # dynamic update starts by resolving the zone's SOA through the machine's
+    # CONFIGURED resolver. Left as-is the resolver is OPNsense (handed out by
+    # DHCP), which knows nothing about clayface.local, so the update fails and
+    # the AD zone comes up without _msdcs — the domain then cannot be located
+    # by anything, including a future CLIENT01 domain join.
+    #
+    # Safe here: Install-ADDSForest runs with SkipPreChecks, and the pending
+    # loopback resolver (nothing listening yet) cannot break this play —
+    # WinRM is inbound, and ansible_host (<name>.<domain>) is resolved by the
+    # CONTROL NODE, not by the DC.
+    #
+    # Idempotent: the module compares current against desired first.
+    # ------------------------------------------------------------
+    - name: Point the NIC's DNS client at the local DNS server
+      ansible.windows.win_dns_client:
+        adapter_names: "*" # all IP-enabled adapters — no alias to guess
+        dns_servers:
+          - 127.0.0.1
+
+    # ------------------------------------------------------------
+    # 4. Promote to domain controller (creates the forest on first DC)
+    # ------------------------------------------------------------
+    - name: Install AD DS domain (forest) — promotes and reboots
+      microsoft.ad.domain:
+        dns_domain_name: "{{ lab_ad_domain }}"
+        domain_netbios_name: "{{ lab_ad_netbios }}"
+        safe_mode_password: "{{ lab_win_admin_pass }}"
+        reboot: true
+        reboot_timeout: 1200
+      register: domain_install
+
+    # ------------------------------------------------------------
+    # 5. Wait, then repair the DNS client
+    # ------------------------------------------------------------
+    - name: Wait for WinRM after promotion reboot
+      ansible.builtin.wait_for_connection:
+        timeout: 900
+      when: domain_install.reboot_required
+
+    # The static NameServer registry value survives DHCP lease renewals (the
+    # DHCP client writes a separate DhcpNameServer value), so this is normally
+    # a no-op — it repairs the residual cases: adapter re-enable, network
+    # reset, driver re-registration.
+    - name: Re-assert the DNS client after promotion
+      ansible.windows.win_dns_client:
+        adapter_names: "*"
+        dns_servers:
+          - 127.0.0.1
+
+    # ------------------------------------------------------------
+    # 6. DNS forwarder -> OPNsense. This must come AFTER promotion:
+    #    Set-DnsServerForwarder ships with the DNS Server role, which
+    #    Install-ADDSForest installed. Before promotion the cmdlet does
+    #    not exist, and promotion reboots internally, so there is no
+    #    deterministic window to slip this in earlier.
+    #
+    #    Deliberately a FORWARDER, not a second DNS client entry:
+    #    pointing the DC's NIC at OPNsense as well is the classic AD
+    #    anti-pattern (the DC ends up asking OPNsense for its own AD
+    #    records). Everything outside clayface.local goes here instead.
+    #
+    #    ansible.windows has no forwarder module, so the DnsServer cmdlet is
+    #    the only route. Read first: that read is the idempotency key.
+    # ------------------------------------------------------------
+    - name: Read the DNS forwarders
+      ansible.windows.win_powershell:
+        script: |
+          Import-Module DnsServer
+          ((Get-DnsServerForwarder).IPAddress.IPAddressToString -join ',')
+      register: dns_forwarders
+      changed_when: false
+
+    - name: Forward everything the AD zone does not own to OPNsense
+      ansible.windows.win_powershell:
+        script: |
+          Import-Module DnsServer
+          Set-DnsServerForwarder -IPAddress "{{ lab_dns_forwarder }}"
+      when: (dns_forwarders.output | default([], true) | first | default('', true) | string) != lab_dns_forwarder
+      changed_when: true
+
+    # ------------------------------------------------------------
+    # 7. Verify DNS. Get-ADDomain (below) reads local AD state and would
+    #    pass even with DNS completely broken, which is exactly how this
+    #    failed silently before — so assert the records themselves.
+    #
+    #    -DnsOnly forbids the NetBIOS/LLMNR fallback: without it a
+    #    "success" can come from the local cache and prove nothing.
+    #    Retries because netlogon registration is fast but not
+    #    instantaneous after the promotion reboot.
+    # ------------------------------------------------------------
+    - name: Verify DNS on the DC (its own zone, the DC locator records, the forwarder)
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module DnsServer
+          $domain = '{{ lab_ad_domain }}'
+
+          $a   = Resolve-DnsName -Name $domain -Type A -Server 127.0.0.1 -DnsOnly -ErrorAction Stop
+          $srv = Resolve-DnsName -Name "_ldap._tcp.dc._msdcs.$domain" -Type SRV -Server 127.0.0.1 -DnsOnly -ErrorAction Stop
+          $fwd = (Get-DnsServerForwarder).IPAddress.IPAddressToString
+          $cli = (Get-DnsClientServerAddress -AddressFamily IPv4).ServerAddresses
+
+          if ($cli -notcontains '127.0.0.1') {
+              throw "The DNS client does not point at the local DNS server: $($cli -join ', ')"
+          }
+          if ($fwd -notcontains '{{ lab_dns_forwarder }}') {
+              throw "The DNS forwarder is not {{ lab_dns_forwarder }}: $($fwd -join ', ')"
+          }
+
+          "A:   $($a.IPAddress -join ', ')"
+          "SRV: $($srv.NameTarget -join ', ') port $($srv.Port -join ', ')"
+          "FWD: $($fwd -join ', ')"
+          "CLI: $($cli -join ', ')"
+      register: dns_verify
+      retries: 6
+      delay: 20
+      until: dns_verify is succeeded
+
+    # ------------------------------------------------------------
+    # 8. Verify AD (kept separate from the DNS check on purpose: "AD is up
+    #    but DNS is not" is diagnosable, a merged check is not)
+    # ------------------------------------------------------------
+    - name: Verify the domain came up (Get-ADDomain)
+      ansible.windows.win_powershell:
+        script: |
+          Import-Module ActiveDirectory
+          (Get-ADDomain).DNSRoot
+      register: domain_check
+
+    - name: Report domain controller status
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} is a domain controller for
+          {{ domain_check.output | first }} (forest root,
+          NetBIOS {{ lab_ad_netbios }}), resolving its own zone on 127.0.0.1
+          and forwarding to {{ lab_dns_forwarder }}.
+          Sign in as {{ lab_ad_netbios }}\Administrator
+          (password: the lab admin password).
