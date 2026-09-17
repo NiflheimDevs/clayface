@@ -7,10 +7,10 @@ locals {
   )
 }
 
-resource "libvirt_volume" "dc01" {
-  name     = "${upper(var.name)}.qcow2"
-  pool     = "default"
-  capacity = 25 * 1024 * 1024 * 1024 # 25 GiB
+resource "libvirt_volume" "client" {
+  name = "${upper(var.name)}.qcow2"
+  pool = "default"
+  capacity = 30 * 1024 * 1024 * 1024
 
   target = {
     format = {
@@ -27,7 +27,7 @@ resource "libvirt_volume" "dc01" {
   }
 }
 
-resource "libvirt_domain" "dc" {
+resource "libvirt_domain" "client" {
   name        = var.name
   memory      = 4096
   memory_unit = "MiB"
@@ -38,6 +38,28 @@ resource "libvirt_domain" "dc" {
     type         = "hvm"
     type_arch    = "x86_64"
     type_machine = "q35"
+
+    firmware = "efi"
+
+    firmware_info = {
+      features = [
+        { name = "enrolled-keys", enabled = "no" },
+        { name = "secure-boot", enabled = "yes" },
+      ]
+    }
+
+    loader          = var.uefi_loader_path
+    loader_readonly = "yes"
+    loader_secure   = "yes"
+    loader_type     = "pflash"
+    loader_format   = "raw"
+
+    nv_ram = {
+      template        = var.uefi_nvram_template_path
+      template_format = "raw"
+      format          = "raw"
+      nv_ram = "/var/lib/libvirt/qemu/nvram/${var.name}_VARS.fd"
+    }
   }
 
   features = {
@@ -59,12 +81,12 @@ resource "libvirt_domain" "dc" {
         source = {
           volume = {
             pool   = "default"
-            volume = libvirt_volume.dc01.name
+            volume = libvirt_volume.client.name
           }
         }
 
         target = {
-          dev = "sdb"
+          dev = "sda"
           bus = "sata"
         }
       }
@@ -108,6 +130,17 @@ resource "libvirt_domain" "dc" {
           ram     = 65536
           vram    = 65536
           vga_mem = 16384
+        }
+      }
+    ]
+
+    tpms = [
+      {
+        model = "tpm-crb"
+        backend = {
+          emulator = {
+            version = "2.0"
+          }
         }
       }
     ]

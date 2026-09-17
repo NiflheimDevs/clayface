@@ -13,6 +13,7 @@
 # ------------------------------------------------------------
 - name: Start edge VMs (they provide DHCP/DNS for the lab)
   hosts: vms_gateway
+  tags: gateway
   gather_facts: false
 
   vars:
@@ -82,7 +83,8 @@
 # Then the rest of the lab
 # ------------------------------------------------------------
 - name: Start remaining VMs
-  hosts: vms_linux
+  hosts: terraform_vms:!vms_gateway
+  tags: members
   gather_facts: false
 
   vars:
@@ -133,6 +135,7 @@
 # ------------------------------------------------------------
 - name: Report final VM states
   hosts: terraform_vms
+  tags: members
   gather_facts: false
 
   vars:

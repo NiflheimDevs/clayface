@@ -1,13 +1,24 @@
 #!/bin/bash
 set -euo pipefail
 
-export OPNSENSE_API_KEY=8ZPMB9KnLcfa8+7CkyX4dKHgwoJUfwbuaFYNJ4/CWgSfSvs8bb/Fvn80nqBqDDbuuulOtoOViNqTzuOe
-export OPNSENSE_API_SECRET=C7h7CvpBffTLIWVJA7JMBI/Yjfq6gf8SZXXoBNCrU8hXy8eK7NYX8x2nnL9uHe7mCB44EInyUvrrS4wT
+# Lab secrets live in deploy.env. Create it from
+# deploy.env.example: the OPNsense API key/secret come from the OPNsense UI
+# (System -> Access -> Users).
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$SCRIPT_DIR/deploy.env" ]; then
+    set -a
+    . "$SCRIPT_DIR/deploy.env"
+    set +a
+else
+    echo "!! $SCRIPT_DIR/deploy.env not found." >&2
+    echo "   Copy deploy.env.example to deploy.env and fill in the OPNsense" >&2
+    echo "   API credentials (OPNsense UI -> System -> Access -> Users)." >&2
+    exit 1
+fi
 
 export no_proxy="clayface,10.0.0.1,localhost,127.0.0.1${no_proxy:+,$no_proxy}"
 export NO_PROXY="$no_proxy"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TERRAFORM_DIR="$SCRIPT_DIR/terraform"
 ANSIBLE_DIR="$SCRIPT_DIR/ansible"
 
@@ -83,20 +94,34 @@ ansible-playbook -i "$ANSIBLE_DIR/inventory/lab_inventory.py" "$ANSIBLE_DIR/play
 step "Ansible: configure edge (edge.yml)"
 ansible-playbook -i "$ANSIBLE_DIR/inventory/lab_inventory.py" "$ANSIBLE_DIR/playbooks/edge.yml" --ask-become-pass
 
-step "Ansible: start VMs created by terraform (start_vms.yml)"
+step "Ansible: start the edge VM (start_vms.yml --tags gateway)"
 ansible-playbook \
     -i "$ANSIBLE_DIR/inventory/lab_inventory.py" \
     -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
+    --tags gateway \
     "$ANSIBLE_DIR/playbooks/start_vms.yml"
 
-# Windows-only: pins dc VMs in OPNsense DHCP/DNS via its REST API so
-# <name>.clayface resolves. Needs OPNSENSE_API_KEY / OPNSENSE_API_SECRET
-# exported (one-time API key: OPNsense UI -> System -> Access -> Users).
-step "Ansible: pin dc VMs in OPNsense DHCP/DNS (opnsense.yml)"
+# Windows-only: pins every VM that has a terraform MAC and an `ip:` in
+# lab.yaml as a DHCP reservation + DNS record in OPNsense, via its REST API,
+# so <name>.clayface resolves from the guest's first boot. Needs
+# OPNSENSE_API_KEY / OPNSENSE_API_SECRET (from deploy.env; one-time API key:
+# OPNsense UI -> System -> Access -> Users).
+#
+# Runs BEFORE the remaining VMs boot, deliberately: a guest that boots first
+# takes a pool lease, and <name>.clayface then resolves to its reserved
+# address, which nothing answers on until that lease renews.
+step "Ansible: pin VMs with a static address in OPNsense DHCP/DNS (opnsense.yml)"
 ansible-playbook \
     -i "$ANSIBLE_DIR/inventory/lab_inventory.py" \
     -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
     "$ANSIBLE_DIR/playbooks/opnsense.yml"
+
+step "Ansible: start the remaining VMs (start_vms.yml --tags members)"
+ansible-playbook \
+    -i "$ANSIBLE_DIR/inventory/lab_inventory.py" \
+    -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
+    --tags members \
+    "$ANSIBLE_DIR/playbooks/start_vms.yml"
 
 # Windows-only: WinRM, no become pass needed. Idempotent — skips everything
 # already done (hostname set, password enforced, domain installed).
@@ -105,5 +130,11 @@ ansible-playbook \
     -i "$ANSIBLE_DIR/inventory/lab_inventory.py" \
     -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
     "$ANSIBLE_DIR/playbooks/dc.yml"
+
+step "Ansible: join workstation(s) to the domain (client.yml)"
+ansible-playbook \
+    -i "$ANSIBLE_DIR/inventory/lab_inventory.py" \
+    -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
+    "$ANSIBLE_DIR/playbooks/client.yml"
 
 step "Done. Infrastructure provisioned."

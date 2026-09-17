@@ -2,13 +2,25 @@
 # What it does (idempotent):
 #   1. detects the API scheme (https, falling back to http)
 #   2. enables "Register DHCP leases" / "Register DHCP static mappings"
-#   3. creates/updates one static DHCP binding per vms_dc VM:
+#   3. creates/updates one static DHCP binding per vms_pinned VM:
 #        inventory name (from lab.yaml) + pinned MAC (terraform)
-#        -> stable IP (pool base + group index), so <name>.clayface
-#           resolves from boot #0
+#        -> static IP (lab.yaml `ip:`), so <name>.clayface resolves from
+#           boot #0
 #   4. reconfigures dnsmasq and verifies the name resolves
 #   5. OPTIONALLY hands out a DC as the lab's DNS server (DHCP option 6) —
 #      off unless LAB_DHCP_DNS_SERVER is set, see the env overrides
+#
+# Where the two halves of a binding come from:
+#   - the MAC is terraform's, because the VM is created with it (each module
+#     derives a deterministic MAC from the VM name — see modules/*/main.tf).
+#     It has to be, since the guest's own hostname is random until a
+#     playbook renames it.
+#   - the IP is lab.yaml's, because it is a static fact about the lab, the
+#     same as a hypervisor address or the bridge name.
+#   This play only joins the two. It never deletes a row.
+#
+# With regdhcpstatic=1 a single dnsmasq host row carrying hwaddr is BOTH the
+# DHCP reservation and the DNS A record — there is no second API call.
 #
 # Run (same inventories as every other playbook):
 #   OPNSENSE_API_KEY=... OPNSENSE_API_SECRET=... \
@@ -19,7 +31,6 @@
 #   LAB_DNS_URL      full API base, e.g. https://10.0.0.1 (optional —
 #                    otherwise the scheme is auto-detected on 10.0.0.1)
 #   LAB_DOMAIN       lab DNS domain (default clayface)
-#   LAB_DC_IP_BASE   first IP of the dc pool (default 10.0.0.10)
 #   LAB_DHCP_DNS_SERVER
 #                    DNS server to hand to DHCP clients (option 6). UNSET by
 #                    default. Enable it only AFTER a DC answers DNS: every
@@ -30,7 +41,7 @@
 #                    variable set. Recovery is deleting the option row and
 #                    reconfiguring; IP connectivity is never lost.
 
-- name: Pin domain controller VMs in OPNsense DHCP/DNS
+- name: Pin VMs with a static address in OPNsense DHCP/DNS
   hosts: localhost
   connection: local
   gather_facts: false
@@ -42,8 +53,6 @@
     opnsense_api_key: "{{ lookup('env', 'OPNSENSE_API_KEY') }}"
     opnsense_api_secret: "{{ lookup('env', 'OPNSENSE_API_SECRET') }}"
     lab_domain: "{{ lookup('env', 'LAB_DOMAIN') | default('clayface', true) }}"
-    # One IP per dc VM, assigned deterministically: pool base + group index.
-    dc_ip_base: "{{ (lookup('env', 'LAB_DC_IP_BASE') | default('10.0.0.10', true)).split('.') }}"
     # DNS server handed to DHCP clients (dnsmasq option 6). EMPTY = disabled,
     # which is the default on purpose — see the bootstrap note in the header.
     # Set it to a DC's reserved IP (printed in the report at the end of this
@@ -68,14 +77,34 @@
           add API key.
       when: not opnsense_api_key or not opnsense_api_secret
 
-    - name: Fail if any dc VM lacks a pinned MAC
+    # Both halves are collected here so one run reports every problem at
+    # once. Why the pair is needed at all: see the fail message below.
+    - name: Collect Windows VMs missing a pinned MAC or a static address
+      ansible.builtin.set_fact:
+        unpinned_windows: >-
+          {{ (unpinned_windows | default([]))
+             + ([item ~ '  ->  no pinned MAC; run terraform apply']
+                if hostvars[item].libvirt_mac is not defined else [])
+             + ([item ~ '  ->  no static IP; add `ip:` to vm_placements.' ~ item ~ ' in lab.yaml']
+                if hostvars[item].libvirt_ip is not defined else []) }}
+      loop: "{{ groups['vms_windows'] | default([]) | sort }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Fail if any Windows VM cannot be pinned
       ansible.builtin.fail:
-        msg: >-
-          {{ item }} has no libvirt_mac hostvar — the terraform dc module
-          pins it. Run 'terraform -chdir=terraform apply' so the 'vms'
-          output carries the MAC, then rerun.
-      loop: "{{ groups['vms_dc'] }}"
-      when: hostvars[item].libvirt_mac is not defined
+        msg: |
+          These Windows VMs cannot be given a DHCP reservation and DNS
+          record, so Ansible will not be able to reach them:
+
+          {% for problem in unpinned_windows %}  {{ problem }}
+          {% endfor %}
+          A Windows VM built from a sysprepped base boots with a random
+          hostname (WIN-XXXXXXXXXXX), and dnsmasq registers whatever hostname
+          the guest asks for — so <name>.clayface never resolves until the
+          host has been renamed, and renaming it is what the playbook needs
+          the connection for. The pinned MAC breaks that loop.
+      when: unpinned_windows | default([]) | length > 0
 
     - name: Probe the OPNsense API over HTTPS
       ansible.builtin.uri:
@@ -140,7 +169,7 @@
         or (dnsmasq_cfg.json.dnsmasq.regdhcpstatic | default('0') | string) != '1'
 
     # ------------------------------------------------------------
-    # 3. Static bindings: one per vms_dc VM
+    # 3. Static bindings: one per vms_pinned VM
     # ------------------------------------------------------------
     - name: Search existing static bindings
       ansible.builtin.uri:
@@ -154,15 +183,25 @@
       vars:
         existing_rows: "{{ host_search.json.rows | default([]) | selectattr('host', 'defined') | list }}"
 
-    - name: Compute the desired bindings (name -> pinned MAC -> stable IP)
+    # Initialised before the loop so the list is always defined: with
+    # nothing to pin the accumulating task below runs with loop: [] and does
+    # nothing, instead of leaving wanted_bindings undefined for every task
+    # that reads it.
+    - name: Start with no wanted bindings
+      ansible.builtin.set_fact:
+        wanted_bindings: []
+
+    - name: Compute the desired bindings (name -> pinned MAC -> static IP)
       ansible.builtin.set_fact:
         wanted_bindings: >-
-          {{ (wanted_bindings | default([])) + [{
+          {{ wanted_bindings + [{
             'name': item,
             'mac': hostvars[item].libvirt_mac | upper,
-            'ip': (dc_ip_base[0:3] | join('.')) ~ '.' ~ (dc_ip_base[3] | int + groups['vms_dc'].index(item))
+            'ip': hostvars[item].libvirt_ip
           }] }}
-      loop: "{{ groups['vms_dc'] }}"
+      loop: "{{ groups['vms_pinned'] | default([]) | sort }}"
+      loop_control:
+        label: "{{ item }}"
 
     - name: Create missing static bindings
       ansible.builtin.uri:
@@ -199,9 +238,13 @@
       loop_control:
         label: "{{ item.name }} -> {{ item.ip }} ({{ item.mac }})"
       register: binding_update
+      # Plain string comparison, not `search`: that treats the wanted IP as
+      # a regex, where '.' matches any character — a stored 10.0.0.10 would
+      # "match" a wanted 10.0.0.1 and the row would silently keep the wrong
+      # address. Mirrors the hwaddr half, which was always exact.
       when: >-
         item.name in existing_by_name and (
-          (existing_by_name[item.name].ip | default('', true) | string) is not search(item.ip)
+          (existing_by_name[item.name].ip | default('', true) | string) != item.ip
           or (existing_by_name[item.name].hwaddr | default('', true) | string | lower) != (item.mac | lower))
       changed_when: binding_update.status == 200
 
@@ -378,7 +421,7 @@
       changed_when: option_reconf.status == 200
       when: option_add is changed or option_update is changed
 
-    - name: Verify every dc name resolves via OPNsense
+    - name: Verify every pinned name resolves via OPNsense
       ansible.builtin.command:
         cmd: "nslookup {{ item.name | lower }}.{{ lab_domain }} {{ opnsense_host }}"
       loop: "{{ wanted_bindings }}"
@@ -391,6 +434,8 @@
     - name: Report the bindings
       ansible.builtin.debug:
         msg: >-
-          Pinned: {{ wanted_bindings | map(attribute='name') | join(', ') }}
-          — resolves via {{ opnsense_host }} as
-          {{ wanted_bindings | map(attribute='name') | map('lower') | join(', ') }}.{{ lab_domain }}.
+          {{ 'No VMs to pin: nothing in lab.yaml carries both an `ip:` and a MAC-pinning module.' if wanted_bindings | length == 0 else
+             'Pinned: ' ~ (wanted_bindings | map(attribute='name') | join(', '))
+             ~ ' — resolves via ' ~ opnsense_host ~ ' as '
+             ~ (wanted_bindings | map(attribute='name') | map('lower') | join(', '))
+             ~ '.' ~ lab_domain ~ '.' }}

@@ -1,0 +1,180 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  unattend-cl.xml — unattend file for the Clayface Windows *client* base
+  image (client-base.qcow2). Targets Windows 11 26H1 business editions
+  (Enterprise/Education/Pro).
+
+  Companion to unattend-dc.xml, which covers the Server 2025 DC image. The
+  two differ only where the OS differs; the specialize pass below is
+  identical to the DC's on purpose — it is OS-version-independent.
+
+  The image carries no roles and no domain membership: playbooks/client.yml
+  renames the host and joins it to the forest that dc.yml created. Only the
+  local accounts and the WinRM access below are baked in.
+
+  Applied at sysprep time:
+
+      sysprep.exe /generalize /oobe /shutdown /unattend:C:\Windows\System32\sysprep\unattend.xml
+
+  What it does on the next boot (the one every client VM inherits):
+    - specialize pass (runs as SYSTEM, before any logon):
+        * ComputerName *  -> random name; playbooks/client.yml renames to the
+          inventory name (client01, from lab.yaml)
+        * winrm quickconfig -q -> WinRM listener on HTTP 5985
+        * firewall: WINRM-HTTP-In-TCP* rules enabled on ALL profiles
+          (locale-independent rule names). Matters more on a client SKU than
+          on Server: the Windows 11 firewall defaults are stricter, and the
+          lab network classifies as Public, which blocks WinRM by default.
+        * LocalAccountTokenFilterPolicy=1 (remote admin with local accounts)
+        * BypassNRO=1 — see the note on that command below
+    - oobeSystem pass:
+        * all OOBE screens skipped, no Microsoft account prompts
+        * built-in Administrator enabled with password Admin@123
+          (PlainText=true: cleartext on purpose — lab-only password, same
+          value as LAB_WIN_ADMIN_PASS default in the Ansible inventory).
+          This is what makes the account usable at all: on a client SKU the
+          built-in Administrator is disabled by default, and the Ansible
+          inventory authenticates as `Administrator`.
+        * a second local account, `builder`, as a console fallback for when
+          WinRM is down. Deliberately NOT known to the Ansible inventory —
+          one identity model, one code path.
+        * AutoLogon once, so first boot lands on a usable desktop
+
+  Result: every VM from this base is Ansible-reachable (WinRM) on first
+  boot — no console interaction, deploy.sh can build the client unattended.
+
+  This unattend has NO windowsPE pass. That pass is consumed by Setup running
+  from installation media; this file is consumed at `sysprep /generalize
+  /oobe` time, after installation, where it is never read. The DC file still
+  carries one — harmless there, omitted here.
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+
+<settings pass="specialize">
+
+  <component name="Microsoft-Windows-Shell-Setup"
+             processorArchitecture="amd64"
+             publicKeyToken="31bf3856ad364e35"
+             language="neutral"
+             versionScope="nonSxS">
+
+    <ComputerName>*</ComputerName>
+
+  </component>
+
+  <component name="Microsoft-Windows-Deployment"
+             processorArchitecture="amd64"
+             publicKeyToken="31bf3856ad364e35"
+             language="neutral"
+             versionScope="nonSxS"
+             xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+
+    <RunSynchronous>
+
+      <RunSynchronousCommand wcm:action="add">
+        <Order>1</Order>
+        <Path>cmd.exe /c winrm quickconfig -q</Path>
+        <Description>Enable WinRM listener for Ansible</Description>
+      </RunSynchronousCommand>
+
+      <RunSynchronousCommand wcm:action="add">
+        <Order>2</Order>
+        <Path>powershell.exe -NoLogo -NonInteractive -Command "Set-NetFirewallRule -Name 'WINRM-HTTP-In-TCP*' -Enabled True -Profile Any"</Path>
+        <Description>Allow WinRM through the firewall</Description>
+      </RunSynchronousCommand>
+
+      <RunSynchronousCommand wcm:action="add">
+        <Order>3</Order>
+        <Path>powershell.exe -NoLogo -NonInteractive -Command "Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name LocalAccountTokenFilterPolicy -Value 1 -Type DWord"</Path>
+        <Description>Allow remote management with local accounts</Description>
+      </RunSynchronousCommand>
+
+      <!--
+        Belt and braces, and UNVERIFIED on 26H1: the traditional way past the
+        OOBE network requirement was oobe\bypassnro.cmd, which Microsoft
+        removed in the 24H2 line. The registry value is the survivor. The
+        oobeSystem component below already supplies a local account, which is
+        what actually answers the OOBE account phase — so this command should
+        be redundant. Drop it once a build proves the image reaches OOBE
+        unattended without it.
+      -->
+      <RunSynchronousCommand wcm:action="add">
+        <Order>4</Order>
+        <Path>reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f</Path>
+        <Description>Skip the OOBE network requirement if it is still enforced</Description>
+      </RunSynchronousCommand>
+
+    </RunSynchronous>
+
+  </component>
+
+</settings>
+
+<settings pass="oobeSystem">
+
+  <component name="Microsoft-Windows-International-Core"
+             processorArchitecture="amd64"
+             publicKeyToken="31bf3856ad364e35"
+             language="neutral"
+             versionScope="nonSxS">
+
+    <InputLocale>en-US</InputLocale>
+    <SystemLocale>en-US</SystemLocale>
+    <UILanguage>en-US</UILanguage>
+    <UserLocale>en-US</UserLocale>
+
+  </component>
+
+  <component name="Microsoft-Windows-Shell-Setup"
+             processorArchitecture="amd64"
+             publicKeyToken="31bf3856ad364e35"
+             language="neutral"
+             versionScope="nonSxS"
+             xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+
+    <OOBE>
+      <HideEULAPage>true</HideEULAPage>
+      <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+      <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+      <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+      <!-- 3 = do not turn on any of the "express settings" (telemetry,
+           Defender cloud submission, location). Same value as the DC file:
+           the lab decides which defences exist, not the OOBE default. -->
+      <ProtectYourPC>3</ProtectYourPC>
+    </OOBE>
+
+    <UserAccounts>
+      <AdministratorPassword>
+        <Value>Admin@123</Value>
+        <PlainText>true</PlainText>
+      </AdministratorPassword>
+      <LocalAccounts>
+        <LocalAccount wcm:action="add">
+          <Name>builder</Name>
+          <DisplayName>Builder</DisplayName>
+          <Group>Administrators</Group>
+          <Description>Temporary local administrator for image deployment</Description>
+          <Password>
+            <Value>ChangeMe123!</Value>
+            <PlainText>true</PlainText>
+          </Password>
+        </LocalAccount>
+      </LocalAccounts>
+    </UserAccounts>
+
+    <AutoLogon>
+      <Enabled>true</Enabled>
+      <LogonCount>1</LogonCount>
+      <Username>Administrator</Username>
+      <Domain>.</Domain>
+      <Password>
+        <Value>Admin@123</Value>
+        <PlainText>true</PlainText>
+      </Password>
+    </AutoLogon>
+
+  </component>
+
+</settings>
+
+</unattend>

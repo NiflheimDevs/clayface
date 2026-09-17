@@ -36,12 +36,13 @@ docs/
   redclay.yaml              # Project knowledge base — goals, topology, decisions (intent only)
 lab.yaml                    # SINGLE SOURCE OF TRUTH: hosts, network, VM placements
 deploy.sh                   # End-to-end provisioner: terraform init/apply + ansible playbooks
-base-image/                 # Windows base image build files (unattend-dc.xml + guide)
+base-image/                 # Windows base image build files (unattend-dc.xml, unattend-cl.xml + guide)
 terraform/                  # Terraform root module (libvirt provider, multi-host)
   locals.tf                 #   Loads lab.yaml via yamldecode()
   modules/alpine/           #   Alpine Linux VM module
   modules/opnsense/         #   OPNsense edge/gateway VM module
   modules/domaincontroller/ #   Windows Server VM module (qcow2 backing on base_image_path)
+  modules/client/           #   Windows 11 workstation VM module (UEFI + TPM; see below)
 ansible/
   ansible.cfg               # Default inventory: lab_inventory.py
   requirements.yml          # Collections: ansible.windows, microsoft.ad
@@ -49,12 +50,13 @@ ansible/
   inventory/terraform_vms.py     # Dynamic inventory from terraform `vms` output
   playbooks/                # hosts.yml (hypervisors), edge.yml, start_vms.yml,
                             # dc.yml (Windows DC: hostname, admin password, promote)
+                            # client.yml (Windows client: DNS, rename, domain join)
 vm/images/                  # ISOs (tiny11, OPNsense) — gitignored, large binaries
 red-clay/                   # Obsidian vault: notes, courses, journal, diagrams
 ```
 
 **Data flow rule:** static facts (host IPs, users, network settings, VM
-placement) live ONLY in `lab.yaml`. Terraform reads it via `locals.tf`,
+placement, static VM addresses) live ONLY in `lab.yaml`. Terraform reads it via `locals.tf`,
 Ansible via `inventory/lab_inventory.py`. Derived state (which VMs exist)
 belongs to terraform and flows to Ansible through the `vms` output
 (name → hypervisor + role) into `inventory/terraform_vms.py`. Never
@@ -81,36 +83,55 @@ Exceptions to the rule — values owned elsewhere, mirrored here:
 ## Architecture (current state)
 
 - **Two hypervisor hosts** (`host_a` = 192.168.1.161, `host_b` = 192.168.1.134),
-  both reached over SSH (`qemu+ssh://...`) via the `dmacvicar/libvirt` provider
+  reached over SSH (`qemu+ssh://...`) via the `dmacvicar/libvirt` provider
   (v0.9.8 — the provider is mid-rewrite and known-flaky; pinned deliberately).
+  `host_b` is currently commented out in `lab.yaml`, so the lab runs
+  single-host; `hosts.yml` skips the VXLAN tasks when there is no peer
+  (`vxlan_remote_ip` is empty).
 - Hosts are joined by a **VXLAN overlay** (vxlan100, port 4789, over `wlan0`)
   and a bridge (`vm-br0`) — configured by the Ansible hypervisor playbook.
 - **OPNsense** VM acts as the edge (DHCP/DNS) — DNS resolves VM names so
   Ansible reaches VMs as `<name>.clayface` (domain owned by the OPNsense
   image, mirrored in `terraform_vms.py`).
-- **Terraform → Ansible link**: terraform's `vms` output (VM name → hypervisor
-  + role) feeds `ansible/inventory/terraform_vms.py`, which groups VMs into
-  `terraform_vms`, `vms_gateway` (started first), `vms_dc` (Windows DCs, WinRM
-  connection vars; also members of `vms_linux` so start_vms.yml starts them),
-  and `vms_linux`. Gateway detection is by `role` in the output — not by VM
-  name prefix; roles are `gateway` (edge VM), `dc` (module `dc` in
-  vm_placements), `linux` (everything else).
+- **Terraform → Ansible link**: terraform's `vms` output (VM name →
+  hypervisor, role, os_family, mac, ip) feeds
+  `ansible/inventory/terraform_vms.py`, which groups VMs into
+  `terraform_vms` (every VM, direct membership), `vms_gateway` (started
+  first — it provides DHCP/DNS), `vms_windows` / `vms_linux`, the role groups
+  `vms_dc` and `vms_client`, and `vms_pinned` (VMs with both a MAC and an
+  `ip:`, i.e. the ones `opnsense.yml` manages).
+  - **`role` IS the terraform module name** (`gateway`, `dc`, `client`,
+    `alpine`) and answers "which playbook owns this VM" — role groups are
+    deliberately narrow, so `dc.yml` never sees a workstation.
+  - **`os_family`** (`windows` / `linux`) answers "how does Ansible
+    connect", and is the only thing that gates the WinRM connection vars.
+    Orthogonal to role on purpose: a future member server would be a third
+    `windows` role. Terraform derives it from the module via the `module_os`
+    map in `terraform/locals.tf` — indexing that map is also what fails the
+    plan on a typo'd `module:` in lab.yaml.
+  - **`start_vms.yml` targets `terraform_vms:!vms_gateway`**, not
+    `vms_linux`. `vms_linux` now honestly means Linux; the old arrangement
+    put Windows VMs in it to fake "everything that needs starting", which
+    only held while `dc` was the sole Windows role.
 - **Gateway VM** (`opnsense01`): exactly one, always on the host named by
   `edge.host` in lab.yaml. Per-host module blocks instantiate it only on
   that host; because `edge.host` is a single scalar, zero-or-two-edge states
   are impossible by construction (a typo'd name fails the plan via the
   locals.tf guard).
-- Adding a VM = one entry in `lab.yaml` under `vm_placements`. Adding a host
+- Adding a VM = one entry in `lab.yaml` under `vm_placements` (a Windows VM
+  also needs `ip:` — see the DC section). Adding a host
   = an entry under `hosts` + one provider block + per-module blocks in
   `terraform/main.tf` (providers can't be selected dynamically).
 
 The end goal (per the Overview and proposal): Proxmox/KVM + Terraform + Packer
 + Ansible building an AD environment with planted weaknesses (Kerberoastable
 accounts, bad ACLs, NTLM relay targets), plus detection via Wazuh/SIEM.
-Much of this is **not built yet** — the lab currently has Alpine + OPNsense
-VMs, plus a Windows `dc01` VM (from the Windows base image) that
-`playbooks/dc.yml` promotes to the forest root. Don't assume components
-exist; check first.
+Much of this is **not built yet** — the lab currently has an OPNsense edge
+VM, a Windows `dc01` VM (from the Windows Server base image) that
+`playbooks/dc.yml` promotes to the forest root, and a `client01` Windows 11
+workstation (from the client base image) that `playbooks/client.yml` joins to
+it. The two Alpine placements are commented out in `lab.yaml`. Don't assume
+components exist; check first.
 
 ## Windows domain controller (dc01, role "dc")
 
@@ -167,18 +188,32 @@ exist; check first.
   The DNS client must be set BEFORE promotion: netlogon registers the DC's
   records by dynamic update into the configured resolver, so leaving it on
   OPNsense means the AD zone comes up without its own records.
-- **DHCP / name resolution (all VMs, not just the DC)**: VMs get DHCP from
-  OPNsense (Dnsmasq backend); no IPs are hardcoded. The DC VMs have a
-  **pinned MAC** (derived deterministically from the VM name in the dc
-  module; check `terraform -chdir=terraform output -json vms`). The
-  binding name → MAC → stable IP + DNS registration is automated by
-  `playbooks/opnsense.yml` via the OPNsense REST API — one-time prep is
-  creating an API key in the OPNsense UI (System → Access → Users), then
-  run with `OPNSENSE_API_KEY=... OPNSENSE_API_SECRET=...` (also settable:
-  `LAB_DNS_URL`, `LAB_DOMAIN`, `LAB_DC_IP_BASE`, `LAB_DHCP_DNS_SERVER`).
-  It runs in deploy.sh before dc.yml; without it (or before the first
-  run), bootstrap with the VM's current IP:
+- **DHCP / name resolution (all VMs)**: VMs get their addresses from DHCP
+  on OPNsense (Dnsmasq backend). The `dc` and `client` modules also derive a
+  **pinned MAC** deterministically from the VM name (check
+  `terraform -chdir=terraform output -json vms`), because dnsmasq's
+  `regdhcp=1` registers whatever hostname the *guest* supplies — and a
+  sysprepped Windows guest boots as a random `WIN-XXXXXXXXXXX`. The MAC is
+  the one identifier terraform knows before the VM exists and the guest
+  cannot change, so it is what breaks that loop.
+  `playbooks/opnsense.yml` joins the two halves into a DHCP reservation +
+  DNS A record via the OPNsense REST API (one row is both, given
+  `regdhcpstatic=1`):
+  - **the MAC comes from terraform** (the VM is created with it),
+  - **the IP comes from `lab.yaml`** — the `ip:` key under `vm_placements`,
+    same as any other static fact about the lab,
+  - the play reads them from the `vms_pinned` inventory group and never
+    deletes a row.
+  It runs in deploy.sh before dc.yml. One-time prep is an API key in the
+  OPNsense UI (System → Access → Users); `deploy.sh` reads the credentials
+  from the gitignored `deploy.env` (see `deploy.env.example`). Also
+  settable: `LAB_DNS_URL`, `LAB_DOMAIN`, `LAB_DHCP_DNS_SERVER`.
+  Without it (or before the first run), bootstrap with the VM's current IP:
   `ansible-playbook ... dc.yml -e ansible_host=<ip>`.
+  **`ip:` is required for every Windows VM** — it has no other way to
+  become reachable. Missing it fails `opnsense.yml` loudly rather than
+  letting `dc.yml`/`client.yml` hang at `wait_for_connection` for 15
+  minutes.
 - **DNS topology — dc01 is the lab resolver.** OPNsense (Unbound on
   `10.0.0.1`) keeps the `clayface` zone via its dnsmasq domain forward, so
   `<name>.clayface` resolves from boot #0 and the Ansible control node can
@@ -191,10 +226,54 @@ exist; check first.
   yet a resolver removes name resolution lab-wide (IP connectivity survives,
   so recovery is `dc.yml -e ansible_host=<ip>` plus deleting the option row).
 - Passwords: Administrator + DSRM default to `Admin@123`, overridable with
-  `LAB_WIN_ADMIN_PASS` (read by the inventory script, dc.yml, and baked in
-  the unattend file — change all three together). Lab-only and
-  deliberately weak; DSRM sharing the same password is a known shortcut
-  to revisit.
+  `LAB_WIN_ADMIN_PASS` (read by the inventory script, the Windows playbooks,
+  and baked into both unattend files — change all of them together).
+  Lab-only and deliberately weak; DSRM sharing the same password is a known
+  shortcut to revisit.
+
+## Windows workstation (client01, role "client")
+
+Structurally the DC's twin — same module shape, same pinned-MAC → DHCP
+reservation → DNS chain, same WinRM-over-NTLM connection, `ip:` required in
+`lab.yaml` for the same reason. What is genuinely different:
+
+- **UEFI, not BIOS.** The client base image is built under UEFI with secure
+  boot and a TPM 2.0, because Windows 11 setup requires that. The DC module
+  is plain BIOS. `modules/client/main.tf` therefore sets `firmware = "efi"`,
+  the OVMF loader/nvram paths, and a `tpm-crb` device — **a client VM built
+  with the DC module's firmware does not boot at all** (no MBR boot sector;
+  SeaBIOS stops at "no bootable device"), and vice versa. The builder VM's
+  firmware and the module's must match. Host needs `swtpm` and the OVMF
+  firmware files (paths are module variables `uefi_loader_path` /
+  `uefi_nvram_template_path`, since distributions differ).
+- **The overlay `capacity` must be ≥ the base's virtual size.** Check with
+  `virsh vol-info --pool default <base>.qcow2` (the file is root-only, so
+  `qemu-img info` needs sudo). The DC base is 20 GiB and the DC module
+  declares 25; the client base is also laid out on 20 GiB and the client
+  module declares 30. Undersizing it makes the overlay smaller than its own
+  backing file, which qemu refuses to open.
+- **Base image**: `client-base.qcow2`, built per `base-image/README.md` with
+  `base-image/unattend-cl.xml`. Unlike the Server image, AppX sysprep
+  failures are *more* likely here — Windows 11 ships many more provisioned
+  Store packages and keeps updating them. Disconnect the network or pause
+  Store updates before generalizing.
+- **`playbooks/client.yml`** (idempotent): sets the local Administrator
+  password, points the NIC's DNS client at the DC, proves the DC locator SRV
+  record resolves, then renames + joins via `microsoft.ad.membership` in one
+  call (it reboots internally — no separate `win_reboot`), and verifies
+  membership with `Test-ComputerSecureChannel`.
+  - It runs **after `dc.yml`** — a workstation cannot join a forest that
+    does not exist, and the join is driven by SRV lookups into the AD zone
+    `dc.yml` creates.
+  - **DNS before join is not optional.** The domain is located via
+    `_ldap._tcp.dc._msdcs.<domain>`, and DHCP hands out OPNsense, whose
+    Unbound does not host that zone. Set per host (not via DHCP option 6) so
+    it works whether or not `LAB_DHCP_DNS_SERVER` is enabled.
+  - The connection does **not** break by joining: `ansible_user:
+    Administrator` with no domain prefix over NTLM still authenticates
+    against the local SAM, which `LocalAccountTokenFilterPolicy=1` permits.
+  - `domain_server` is deliberately not set on the join — step 3 already
+    proved DNS works, and pinning the DC would mask a broken resolver.
 
 ## How to operate
 
@@ -223,6 +302,17 @@ inventory/lab_inventory.py -i inventory/terraform_vms.py`).
   because hosts.yml is what creates that bridge.
 - **Image management is manual** — ISOs/qcow2 base images are copied to hosts
   by hand into `vm/images/`; provisioning does not fetch them.
+- **A base image is a read-only backing file, forever.** Booting one directly
+  (even briefly) corrupts every overlay stacked on top of it, silently and
+  detected only later. So the builder domain must be undefined once the base
+  is published: `virsh -c qemu:///system undefine <builder> --nvram`. The
+  installed `client-creator` domain currently points straight at
+  `client-base.qcow2` — it is the live builder, and must be undefined after
+  sysprep and before any `client01` VM is booted. Keep a pre-sysprep copy as
+  the escape hatch (`client-base-bck.qcow2`).
+- **EFI domains need `--nvram` to undefine.** `terraform destroy` on a client
+  VM can fail with `cannot undefine domain with nvram`; recovery is
+  `virsh -c qemu:///system undefine client01 --nvram`.
 - **VXLAN is a single-peer static mesh** (`vxlan_remote_ip`) — fine for two
   hosts, breaks at three. Multi-host needs full-mesh FDB entries (see
   `vxlan_peer_ips` in lab_inventory.py) or a spine.

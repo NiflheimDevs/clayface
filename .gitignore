@@ -15,4 +15,8 @@ red-clay/.obsidian/workspaces.json
 red-clay/.obsidian/graph.json
 red-clay/.obsidian/plugins/
 
+# lab secrets sourced by deploy.sh (API keys); template is deploy.env.example
+deploy.env
+
 ignoreme/
+thesis/Clayface-Thesis.pdf

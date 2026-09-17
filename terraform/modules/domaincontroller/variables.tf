@@ -7,8 +7,3 @@ variable "base_image_path" {
   type        = string
   default     = "/var/lib/libvirt/images/ws-base.qcow2"
 }
-
-output "mac" {
-  description = "The pinned MAC address of the VM's NIC. Consumed by the root module's `vms` output so Ansible (and OPNsense static mappings) can tie name -> MAC -> DHCP lease."
-  value       = local.dc_mac
-}

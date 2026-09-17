@@ -1,0 +1,205 @@
+---
+# What it does, in order:
+#   1. waits for WinRM to answer
+#   2. resets the built-in Administrator password to the lab password
+#   3. points the NIC's DNS client at the domain controller
+#   4. proves the AD domain is locatable — the DC locator SRV record must
+#      resolve — before attempting the join
+#   5. renames the host to its inventory name (client01, from lab.yaml) and
+#      joins the forest, in one call, rebooting when done
+#   6. verifies domain membership and that the secure channel actually works
+
+
+- name: Join Windows workstations to the lab domain
+  hosts: vms_client
+  gather_facts: false
+  vars:
+    lab_win_admin_pass: "{{ lookup('env', 'LAB_WIN_ADMIN_PASS') | default('Admin@123', true) }}"
+    lab_domain: "{{ lookup('env', 'LAB_DOMAIN') | default('clayface', true) }}"
+    lab_ad_domain: "{{ lab_domain }}.local"
+    lab_ad_netbios: "{{ lab_domain | upper }}"
+
+  pre_tasks:
+    # ------------------------------------------------------------
+    # The DC's address is read from the inventory hostvars, not written
+    # down here: terraform already read it from lab.yaml's `ip:`, and a
+    # third copy in a third file is a copy that rots.
+    # ------------------------------------------------------------
+    - name: Fail if the inventory has no domain controller
+      ansible.builtin.assert:
+        that: (groups['vms_dc'] | default([])) | length > 0
+        fail_msg: >-
+          No domain controller in the inventory. Run playbooks/dc.yml first —
+          a workstation cannot join a forest that does not exist.
+
+    - name: Read the domain controller's address from the inventory
+      ansible.builtin.set_fact:
+        lab_dc_ip: "{{ hostvars[groups['vms_dc'][0]].libvirt_ip | default('') }}"
+
+    - name: Fail if the domain controller has no static address
+      ansible.builtin.assert:
+        that: lab_dc_ip | length > 0
+        fail_msg: >-
+          {{ groups['vms_dc'][0] }} has no libvirt_ip hostvar, so this play
+          has no address to point the client's DNS at. Add `ip:` under
+          vm_placements.{{ groups['vms_dc'][0] }} in lab.yaml, run
+          `terraform -chdir=terraform apply`, then rerun.
+
+  tasks:
+    # ------------------------------------------------------------
+    # 1. Wait for the VM to boot and answer WinRM. Generous: the first boot
+    #    after sysprep runs specialize and OOBE before WinRM is usable.
+    # ------------------------------------------------------------
+    - name: Wait for WinRM to answer (VM boot after sysprep can be slow)
+      ansible.builtin.wait_for_connection:
+        timeout: 900
+
+    # ------------------------------------------------------------
+    # 2. Local Administrator password. Enforced here as well as baked into
+    #    the unattend, so the value in the inventory is true by construction
+    #    rather than by trusting the image.
+    # ------------------------------------------------------------
+    - name: Set built-in Administrator password
+      ansible.windows.win_user:
+        name: Administrator
+        password: "{{ lab_win_admin_pass }}"
+        account_disabled: false
+        password_never_expires: true
+
+    # ------------------------------------------------------------
+    # 3. DNS client -> the DC. REQUIRED for the join.
+    #
+    #    The domain is located through the DC locator SRV records
+    #    (_ldap._tcp.dc._msdcs.<domain>), which live in the AD zone that only
+    #    the DC hosts. DHCP hands out OPNsense, whose Unbound knows nothing
+    #    about clayface.local — left alone, the join fails with a generic
+    #    "the specified domain either does not exist or could not be
+    #    contacted".
+    #
+    #    Set per host rather than through DHCP option 6 on purpose: there is
+    #    no second machine to break, and it works whether or not
+    #    LAB_DHCP_DNS_SERVER has been enabled in opnsense.yml.
+    #
+    #    Idempotent: the module compares current against desired first.
+    # ------------------------------------------------------------
+    - name: Point the NIC's DNS client at the domain controller
+      ansible.windows.win_dns_client:
+        adapter_names: "*" # all IP-enabled adapters — no alias to guess
+        dns_servers:
+          - "{{ lab_dc_ip }}"
+
+    # ------------------------------------------------------------
+    # 4. Prove the domain is locatable BEFORE joining. A clean failure here
+    #    names the actual problem; the Win32 error from a failed join does
+    #    not. Same verification idiom as dc.yml.
+    #
+    #    -DnsOnly forbids the NetBIOS/LLMNR fallback: without it a success
+    #    can come from the local cache and prove nothing about DNS.
+    #
+    #    No -Server: the join resolves through the adapter's configured DNS,
+    #    so that is what this has to exercise. Querying the DC directly would
+    #    pass even when step 3 failed to take, and the join would then fail
+    #    with an opaque Win32 error instead of here.
+    # ------------------------------------------------------------
+    - name: Verify the domain is locatable from the client
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $cli = (Get-DnsClientServerAddress -AddressFamily IPv4).ServerAddresses
+          if ($cli -notcontains '{{ lab_dc_ip }}') {
+              throw "The DNS client does not point at the domain controller: $($cli -join ', ')"
+          }
+
+          $srv = Resolve-DnsName -Name "_ldap._tcp.dc._msdcs.{{ lab_ad_domain }}" `
+                   -Type SRV -DnsOnly -ErrorAction Stop
+          "SRV: $($srv.NameTarget -join ', ') port $($srv.Port -join ', ')"
+          "CLI: $($cli -join ', ')"
+      register: srv_check
+      changed_when: false
+      retries: 6
+      delay: 20
+      until: srv_check is succeeded
+
+    # ------------------------------------------------------------
+    # 5. Rename + join in one call.
+    #
+    #    hostname is the inventory name (client01, from lab.yaml), which is
+    #    also what the OPNsense DHCP reservation and A record are keyed on —
+    #    see playbooks/opnsense.yml. The guest boots as a random
+    #    WIN-XXXXXXXXXXX after sysprep /generalize, so this is the step that
+    #    makes <name>.clayface finally mean this machine.
+    #
+    #    domain_server is deliberately NOT set: step 4 already proved the
+    #    SRV records resolve, so the join goes through the same DNS path a
+    #    real one would. Pinning the DC here would paper over a broken
+    #    resolver instead of failing loudly.
+    #
+    #    The credentials are the domain's, not the local machine's:
+    #    <NETBIOS>\Administrator, which after dc.yml is the forest's own
+    #    built-in Administrator (the local one carried over at promotion).
+    # ------------------------------------------------------------
+    - name: Rename to {{ inventory_hostname }} and join {{ lab_ad_domain }}
+      microsoft.ad.membership:
+        hostname: "{{ inventory_hostname }}"
+        dns_domain_name: "{{ lab_ad_domain }}"
+        domain_admin_user: "{{ lab_ad_netbios }}\\Administrator"
+        domain_admin_password: "{{ lab_win_admin_pass }}"
+        state: domain
+        reboot: true
+        reboot_timeout: 1200
+      register: domain_join
+
+    # The reboot above drops the connection; the module's action plugin waits
+    # for it, but assert reachability before the verification task so a
+    # failure is attributed to the reboot and not to the check.
+    # No `when:` on this - microsoft.ad's action plugin resets
+    # reboot_required to False once it has rebooted
+    # (plugin_utils/_module_with_reboot.py), so gating on it never runs.
+    #
+    # The connection does NOT break by joining the domain, which looks like
+    # it should: ansible_user is bare `Administrator` over NTLM, which still
+    # authenticates against the LOCAL SAM, and LocalAccountTokenFilterPolicy=1
+    # (set by the unattend's specialize pass) permits remote admin with it.
+    - name: Wait for WinRM after the join reboot
+      ansible.builtin.wait_for_connection:
+        timeout: 900
+
+    # ------------------------------------------------------------
+    # 6. Verify membership AND that the secure channel actually works.
+    #    PartOfDomain alone is a claim the guest makes about itself;
+    #    Test-ComputerSecureChannel proves the machine account password in
+    #    AD is good, which is what later authenticates a domain logon.
+    # ------------------------------------------------------------
+    - name: Verify domain membership and the secure channel
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $cs = Get-CimInstance Win32_ComputerSystem
+
+          if (-not $cs.PartOfDomain) {
+              throw "$env:COMPUTERNAME is not joined to a domain."
+          }
+          if ($cs.Domain -ne '{{ lab_ad_domain }}') {
+              throw "Joined to '$($cs.Domain)', expected '{{ lab_ad_domain }}'."
+          }
+          if (-not (Test-ComputerSecureChannel)) {
+              throw "The secure channel to $($cs.Domain) is broken — the machine account password is not accepted."
+          }
+
+          "Name:    $($cs.Name)"
+          "Domain:  $($cs.Domain)"
+          "OrgUnit: $($cs.OrganizationalUnit)"
+      register: membership_check
+      changed_when: false
+      retries: 6
+      delay: 20
+      until: membership_check is succeeded
+
+    - name: Report workstation status
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} ({{ membership_check.output | first }})
+          is joined to {{ lab_ad_domain }} with a working secure channel,
+          resolving names through {{ lab_dc_ip }}.
+          Sign in as {{ lab_ad_netbios }}\Administrator
+          (password: the lab admin password).

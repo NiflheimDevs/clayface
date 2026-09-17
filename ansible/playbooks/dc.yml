@@ -190,6 +190,7 @@
           "FWD: $($fwd -join ', ')"
           "CLI: $($cli -join ', ')"
       register: dns_verify
+      changed_when: false
       retries: 6
       delay: 20
       until: dns_verify is succeeded
@@ -204,6 +205,7 @@
           Import-Module ActiveDirectory
           (Get-ADDomain).DNSRoot
       register: domain_check
+      changed_when: false
 
     - name: Report domain controller status
       ansible.builtin.debug:

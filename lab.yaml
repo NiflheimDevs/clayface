@@ -14,9 +14,9 @@ hosts:
     address: 192.168.1.161
     user: kiasoh
 
-  host_b:
-    address: 192.168.1.134
-    user: kiasoh
+  # host_b:
+  #   address: 192.168.1.134
+  #   user: kiasoh
 
 edge:
   host: host_a
@@ -35,11 +35,27 @@ edge_vm:
 
 # VM placement map for everything except the gateway: vm name ->
 # { module: terraform module under terraform/modules/, host: hypervisor
-# alias from `hosts` above }. Adding a VM = adding one entry here.
+# alias from `hosts` above, ip: optional static address }.
+#
+# `ip:` is what turns a VM into a DHCP reservation + DNS record in OPNsense
+# (playbooks/opnsense.yml, driven by the module's pinned MAC). Required for
+# any guest whose hostname is not baked into its image: dnsmasq registers
+# the hostname the guest supplies in its DHCP request, and every Windows VM
+# built from a sysprepped base boots as WIN-XXXXXXXXXXX. Without a
+# reservation <name>.clayface never resolves, and the playbook that renames
+# the guest cannot reach it to do the renaming.
 vm_placements:
-  alpine01:
-    module: alpine
+  dc01:
+    module: dc
     host: host_a
-  alpine02:
-    module: alpine
-    host: host_b
+    ip: 10.0.0.10
+  client01:
+    module: client
+    host: host_a
+    ip: 10.0.0.20
+  # alpine01:
+  #   module: alpine
+  #   host: host_a
+  # alpine02:
+  #   module: alpine
+  #   host: host_b

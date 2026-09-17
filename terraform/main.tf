@@ -79,3 +79,33 @@ module "dc_host_b" {
 
   name = each.key
 }
+
+module "client_host_a" {
+  source = "./modules/client"
+
+  providers = {
+    libvirt = libvirt.host_a
+  }
+
+  for_each = {
+    for name, p in local.vm_placements :
+    name => p if p["host"] == "host_a" && p["module"] == "client"
+  }
+
+  name = each.key
+}
+
+module "client_host_b" {
+  source = "./modules/client"
+
+  providers = {
+    libvirt = libvirt.host_b
+  }
+
+  for_each = {
+    for name, p in local.vm_placements :
+    name => p if p["host"] == "host_b" && p["module"] == "client"
+  }
+
+  name = each.key
+}

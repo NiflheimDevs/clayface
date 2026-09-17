@@ -1,6 +1,6 @@
 output "name" {
   description = "Name of the libvirt domain created by this module"
-  value       = libvirt_domain.dc.name
+  value       = libvirt_domain.client.name
 }
 
 output "mac" {

@@ -74,7 +74,7 @@ Writing it down forced some floating decisions to become real:
 
 Naming: the project is now called **[[Clayface]]**. the knowledge base originally called it RedClay; it has been renamed to match.
 
-Current phase: [[Active Directory]] — DC01, CLIENT01, users/groups/permissions, Kerberos and LDAP, then Linux AD integration, IDP01, and the first attack paths.
+Current phase: [[Attacker/Active Directory]] — DC01, CLIENT01, users/groups/permissions, Kerberos and LDAP, then Linux AD integration, IDP01, and the first attack paths.
 
 ### Actions:
 1. [[AD]]

@@ -7,7 +7,19 @@ locals {
 
   edge_host = local.lab["edge"]["host"]
 
+  # This is the guard for `edge.host`, not dead code. Indexing a map with a
+  # key that does not exist is an error, so a typo'd edge.host fails the plan
+  # instead of silently dropping the gateway VM. Kept for that reason even
+  # though nothing dereferences it.
   edge_host_attrs = local.lab["hosts"][local.edge_host]
+
+  # Every module under terraform/modules/ that a vm_placement may name, and
+  # the guest OS family it produces.
+  module_os = {
+    alpine = "linux"
+    dc     = "windows"
+    client = "windows"
+  }
 
   # Provider configurations are always evaluated by terraform, even when no
   # resource uses them. A hypervisor commented out of lab.yaml therefore
