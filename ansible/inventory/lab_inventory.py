@@ -84,9 +84,18 @@ def build_inventory(lab):
             "host in the `hosts` map"
         ) from None
 
+    # The AD identity facts are consumed by playbooks that target the VMs
+    # (dc01, client01), not the hypervisors - so they go on `all`, which
+    # every host inherits. See CLAUDE.md's data-flow rule: users and group
+    # membership are static lab facts and belong in lab.yaml.
+    ad = lab.get("ad") or {}
+
     return {
         "_meta": {"hostvars": {**hypervisor_hosts, **edge_hosts}},
-        "all": {"children": ["hypervisors", "edge"]},
+        "all": {
+            "children": ["hypervisors", "edge"],
+            "vars": {"lab_ad": ad},
+        },
         "hypervisors": {"hosts": list(hypervisor_hosts)},
         "edge": {"hosts": list(edge_hosts)},
     }

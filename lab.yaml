@@ -59,3 +59,82 @@ vm_placements:
   # alpine02:
   #   module: alpine
   #   host: host_b
+
+# Active Directory identity (docs/ad-identity-design.md).
+#
+# The forest name is deliberately NOT here: dc.yml derives it from
+# LAB_DOMAIN ("clayface" + ".local"), so a second knob could only ever
+# disagree with it. These are the objects that live inside that forest.
+#
+# No passwords here either — LAB_USER_PASS comes from deploy.env.
+ad:
+  # Anchor OU under the domain root. Keeps lab objects out of the built-in
+  # containers and gives the lab one link point that is not Default Domain
+  # Policy.
+  ou: Clayface
+
+  # Child OUs, in creation order.
+  ous:
+    - Users
+    - Groups
+    - ServiceAccounts
+    - Workstations
+
+  groups:
+    GG-Employees:
+      description: All human employees. Authorizes interactive logon to workstations.
+      # Role groups are employees too. Nesting keeps the interactive logon
+      # right granted once, to one group, instead of once per role.
+      nested: [GG-Developers, GG-IT-Admins]
+    GG-Developers:
+      description: Developer role. Maps to the app_developer role in IDP01.
+    GG-IT-Admins:
+      description: Workstation administrators. Local admin and LAPS read on workstations.
+
+  users:
+    ron.weas:
+      ou: Users
+      groups: [GG-Employees]
+      description: Unprivileged employee. The baseline identity.
+    bob.sing:
+      ou: Users
+      groups: [GG-Employees, GG-Developers]
+      description: Employee and developer.
+    abed.nad:
+      ou: Users
+      groups: [GG-Employees, GG-IT-Admins]
+      description: IT admin and helpdesk.
+    adm-hermione:
+      ou: Users
+      groups: [Domain Admins]
+      description: Tier-0 administrator. Must never log on to a workstation.
+      tier0: true
+    svc-idp-ldap:
+      ou: ServiceAccounts
+      groups: []
+      description: Directory bind account for IDP01. Read-only, scoped.
+
+  workstation:
+    logon_group: GG-Employees
+    admin_group: GG-IT-Admins
+
+  idp:
+    bind_account: svc-idp-ldap
+    # The OUs the bind account may read. Everything else is out of scope —
+    # see the negative assertions in ad_validate.yml.
+    read_ous: [Users, Groups]
+
+  laps:
+    managed_account: lapsadmin
+
+  # Deliberate weakness toggles (docs/ad-identity-design.md section 13).
+  # All off. These are read by the playbooks but no playbook acts on them
+  # yet — the weakness wave is a separate cycle.
+  weaknesses:
+    kerberoastable_idp_bind: false
+    excessive_local_admin: false
+    excessive_laps_read: false
+    weak_gpo_permission: false
+    unconstrained_delegation: false
+    excessive_idp_directory_permissions: false
+    excessive_group_membership: false
