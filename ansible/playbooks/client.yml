@@ -356,3 +356,123 @@
           "CHANGED: $($drift -join ', ')"
       register: ws_user_rights
       changed_when: "'CHANGED' in (ws_user_rights.output | join(' '))"
+
+# ---------------------------------------------------------------------------
+# Play 2: move the machine accounts into OU=Workstations.
+#
+# Runs on the DC, not the workstation: microsoft.ad.computer requires the
+# ActiveDirectory module on the TARGET host, and a stock Windows 11 client has
+# no RSAT. It stays in this playbook rather than moving to ad.yml because
+# ad.yml runs before the join, when client01$ does not exist yet.
+#
+# This is not cosmetic. GPOs linked to OU=Workstations are what deliver the
+# workstation baseline, and a machine sitting in CN=Computers receives none
+# of them.
+# ---------------------------------------------------------------------------
+- name: Place joined workstations in the Workstations OU
+  hosts: vms_dc
+  gather_facts: false
+
+  vars:
+    lab_domain: "{{ lookup('env', 'LAB_DOMAIN') | default('clayface', true) }}"
+    lab_ad_domain: "{{ lab_domain }}.local"
+    ad_base_dn: "DC={{ lab_ad_domain | replace('.', ',DC=') }}"
+    ad_workstations_dn: "OU=Workstations,OU={{ lab_ad.ou }},{{ ad_base_dn }}"
+
+  tasks:
+    - name: Fail if the inventory has no workstations
+      ansible.builtin.assert:
+        that: (groups['vms_client'] | default([])) | length > 0
+        fail_msg: >-
+          No workstation in the inventory, so there is no machine account to
+          move. Run playbooks/client.yml's first play to join them.
+
+    # microsoft.ad.computer MOVES an object it finds by `identity` when
+    # `path` names a different container — no Move-ADObject needed. The `$`
+    # suffix is what marks it as a computer account rather than a user.
+    - name: Move each workstation's machine account into OU=Workstations
+      microsoft.ad.computer:
+        identity: "{{ item }}$"
+        path: "{{ ad_workstations_dn }}"
+        state: present
+      loop: "{{ groups['vms_client'] }}"
+      loop_control:
+        label: "{{ item }}$"
+
+    - name: Verify the machine accounts landed in OU=Workstations
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ActiveDirectory
+          # Compare the object's PARENT DN, not a prefix of its own DN: a DN
+          # always starts with CN=<name>,, so a `-like 'OU=Workstations,*'`
+          # guard can never match and always throws.
+          foreach ($n in @({% for h in groups['vms_client'] %}'{{ h }}'{% if not loop.last %}, {% endif %}{% endfor %})) {
+              $c = Get-ADComputer -Identity "$n$"
+              $parent = ($c.DistinguishedName -split ',', 2)[1]
+              if ($parent -ne '{{ ad_workstations_dn }}') {
+                  throw "$n`$ is in $parent, not {{ ad_workstations_dn }}"
+              }
+              "$n`$ -> $($c.DistinguishedName)"
+          }
+      register: machine_ou
+      changed_when: false
+
+    - name: Report the machine account placement
+      ansible.builtin.debug:
+        msg: "{{ machine_ou.output }}"
+
+# ---------------------------------------------------------------------------
+# Play 3: force a policy refresh and prove the workstation policy landed.
+#
+# Last, and separate from play 1, because the GPOs are linked to
+# OU=Workstations and only take effect once play 2 has moved the machine
+# account there.
+# ---------------------------------------------------------------------------
+- name: Refresh and verify workstation policy
+  hosts: vms_client
+  gather_facts: false
+
+  tasks:
+    - name: Force a policy refresh, then wait for the LAPS policy to appear
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          gpupdate /force /target:computer | Out-Null
+
+          # The machine's own DN comes from the Group Policy engine's state,
+          # NOT from Win32_ComputerSystem.OrganizationalUnit: that property
+          # is empty on a joined Windows 11 client, so a check against it can
+          # never pass. The GP state value is the same one gpresult reads.
+          $gpState = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State\Machine'
+          function Get-MachineDn {
+              (Get-ItemProperty $gpState -Name 'Distinguished-Name' `
+                  -ErrorAction SilentlyContinue).'Distinguished-Name'
+          }
+
+          $deadline = (Get-Date).AddMinutes(5)
+          do {
+              $laps = Test-Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\LAPS'
+              $dn   = Get-MachineDn
+              if ($laps -and $dn -like '*,OU=Workstations,*') { break }
+              Start-Sleep -Seconds 15
+          } while ((Get-Date) -lt $deadline)
+
+          if ($dn -notlike '*,OU=Workstations,*') {
+              throw "Machine account is not in OU=Workstations: '$dn'"
+          }
+          if (-not $laps) {
+              throw 'The LAPS policy did not land. Is WS - LAPS linked to OU=Workstations?'
+          }
+          # The registry policy store is the honest signal: it only exists
+          # because the GPO was applied, unlike the ActiveStore firewall
+          # profiles, which are enabled by default anyway.
+          "OrgUnit: $dn"
+          "LAPS policy: present"
+          "PasswordAgeDays: $((Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\LAPS').PasswordAgeDays)"
+      register: policy_landing
+      changed_when: false
+
+    - name: Report workstation policy status
+      ansible.builtin.debug:
+        msg: "{{ policy_landing.output }}"
