@@ -19,6 +19,18 @@
     lab_ad_domain: "{{ lab_domain }}.local"
     lab_ad_netbios: "{{ lab_domain | upper }}"
 
+    lab_user_pass: "{{ lookup('env', 'LAB_USER_PASS') | default('Passw0rd!Lab', true) }}"
+
+    # Tier-0 accounts are denied interactive and remote-interactive logon on
+    # workstations. Derived from lab.yaml's per-user `tier0` flag rather than
+    # written down here, so adding a second tier-0 account is one lab.yaml
+    # edit.
+    ad_tier0_users: >-
+      {{ lab_ad.users | dict2items
+         | selectattr('value.tier0', 'defined')
+         | selectattr('value.tier0')
+         | map(attribute='key') | list }}
+
   pre_tasks:
     # ------------------------------------------------------------
     # The DC's address is read from the inventory hostvars, not written
@@ -203,3 +215,144 @@
           resolving names through {{ lab_dc_ip }}.
           Sign in as {{ lab_ad_netbios }}\Administrator
           (password: the lab admin password).
+
+    # ------------------------------------------------------------
+    # Local Administrators. This is the hinge of the attack graph: local
+    # admin on the workstation is what makes an LSASS dump possible, and it
+    # is what weakness W2 widens.
+    #
+    # win_group_membership ADDS. It does not replace the group, so the
+    # built-in Administrator (this play's own transport) and the account
+    # LAPS creates both survive.
+    # ------------------------------------------------------------
+    - name: Grant the workstation admin group local Administrator rights
+      ansible.windows.win_group_membership:
+        name: Administrators
+        members:
+          - "{{ lab_ad_netbios }}\\{{ lab_ad.workstation.admin_group }}"
+        state: present
+
+    # ------------------------------------------------------------
+    # User rights. These are per-machine LOCAL security settings, not Group
+    # Policy — deliberately, because GptTmpl.inf is the only GPO home for
+    # them and writing it by hand does not bump the GPO version (spec
+    # section 7.3). The trade is recorded there: no inheritance, no 90-minute
+    # reassertion, and a rebuilt workstation needs this play re-run.
+    #
+    # /areas USER_RIGHTS restricts the template to [Privilege Rights], so the
+    # group-membership section of the same template CANNOT replace local
+    # group membership. Dropping that flag has the same failure mode as
+    # Restricted Groups.
+    #
+    # SeInteractiveLogonRight REPLACES the default (Users), so
+    # BUILTIN\Administrators and Domain Admins must both be listed or they
+    # are locked off this machine. Deny always beats allow, which is why
+    # adm-hermione is denied here even though she would otherwise be allowed
+    # through Domain Admins.
+    #
+    # SeNetworkLogonRight is deliberately untouched: narrowing it would cut
+    # Ansible's WinRM access to this machine.
+    # ------------------------------------------------------------
+    - name: Apply the workstation logon rights
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+
+          $want = @{
+              'SeInteractiveLogonRight'           = @('*S-1-5-32-544',
+                                                      '{{ lab_ad_netbios }}\Domain Admins',
+                                                      '{{ lab_ad_netbios }}\{{ lab_ad.workstation.logon_group }}')
+              'SeRemoteInteractiveLogonRight'     = @('{{ lab_ad_netbios }}\{{ lab_ad.workstation.admin_group }}')
+              'SeDenyInteractiveLogonRight'       = @({% for u in ad_tier0_users %}'{{ lab_ad_netbios }}\{{ u }}', {% endfor %}'{{ lab_ad_netbios }}\{{ lab_ad.idp.bind_account }}')
+              'SeDenyRemoteInteractiveLogonRight' = @({% for u in ad_tier0_users %}'{{ lab_ad_netbios }}\{{ u }}', {% endfor %}'{{ lab_ad_netbios }}\{{ lab_ad.idp.bind_account }}')
+              'SeDenyNetworkLogonRight'           = @('{{ lab_ad_netbios }}\{{ lab_ad.idp.bind_account }}')
+          }
+
+          # secedit stores and exports user rights as SIDs, never names.
+          # Resolve the desired names once so the drift comparison and the
+          # rewritten template are in the same alphabet: comparing
+          # CLAYFACE\GG-IT-Admins against *S-1-5-21-...-1106 would report
+          # drift on every single run and reconfigure the machine forever.
+          # A name that does not resolve throws, which is the right failure
+          # for a typo'd group.
+          $wantSid = @{}
+          foreach ($k in $want.Keys) {
+              $wantSid[$k] = @($want[$k] | ForEach-Object {
+                  if ($_ -like '*S-1-*') { $_ }
+                  else {
+                      '*' + (New-Object System.Security.Principal.NTAccount($_)).Translate(
+                          [System.Security.Principal.SecurityIdentifier]).Value
+                  }
+              } | Sort-Object)
+          }
+          $want = $wantSid
+
+          $tmp = Join-Path $env:TEMP 'clayface-secpol.inf'
+          secedit /export /cfg $tmp /areas USER_RIGHTS | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "secedit /export failed ($LASTEXITCODE)" }
+
+          # secedit exports UTF-16LE; Get-Content detects the BOM.
+          $lines   = Get-Content -LiteralPath $tmp
+          $current = @{}
+          $inPriv  = $false
+          foreach ($line in $lines) {
+              if ($line -match '^\[') {
+                  $inPriv = ($line -match '^\[Privilege Rights\]')
+                  continue
+              }
+              if (-not $inPriv) { continue }
+              if ($line -match '^\s*(Se\w+)\s*=\s*(.*)$') {
+                  $current[$matches[1]] = @($matches[2] -split ',' |
+                      ForEach-Object { $_.Trim() } | Where-Object { $_ } | Sort-Object)
+              }
+          }
+
+          $drift = @()
+          foreach ($k in $want.Keys) {
+              $have = @($current[$k] | Sort-Object)
+              $need = @($want[$k] | Sort-Object)
+              if (($have -join ',') -ne ($need -join ',')) { $drift += $k }
+          }
+          if ($drift.Count -eq 0) { 'OK'; return }
+
+          # Rebuild the file: keep every other right as exported, drop the
+          # managed ones, and re-emit them at the END OF THE
+          # [Privilege Rights] SECTION. secedit reads by section, so the
+          # obvious "append after the file loop" version drops them into
+          # whatever section happens to be last (normally [Version]) and
+          # secedit silently ignores them. The $emitted guard covers the
+          # case where [Privilege Rights] is itself the last section, which
+          # is what `/areas USER_RIGHTS` normally produces.
+          $out     = New-Object System.Collections.Generic.List[string]
+          $inPriv  = $false
+          $emitted = $false
+          foreach ($line in $lines) {
+              if ($line -match '^\[') {
+                  if ($inPriv -and -not $emitted) {
+                      foreach ($k in ($want.Keys | Sort-Object)) {
+                          $out.Add("$k = " + ($want[$k] -join ','))
+                      }
+                      $emitted = $true
+                  }
+                  $inPriv = ($line -match '^\[Privilege Rights\]')
+                  $out.Add($line)
+                  continue
+              }
+              if ($inPriv -and $line -match '^\s*(Se\w+)\s*=' -and
+                  $want.ContainsKey($matches[1])) { continue }
+              if ($line.Trim()) { $out.Add($line) }
+          }
+          if ($inPriv -and -not $emitted) {
+              foreach ($k in ($want.Keys | Sort-Object)) {
+                  $out.Add("$k = " + ($want[$k] -join ','))
+              }
+              $emitted = $true
+          }
+          Set-Content -LiteralPath $tmp -Value $out -Encoding Unicode
+
+          secedit /configure /db "$env:TEMP\clayface-secedit.sdb" `
+              /cfg $tmp /areas USER_RIGHTS /quiet
+          if ($LASTEXITCODE -ne 0) { throw "secedit /configure failed ($LASTEXITCODE)" }
+          "CHANGED: $($drift -join ', ')"
+      register: ws_user_rights
+      changed_when: "'CHANGED' in (ws_user_rights.output | join(' '))"
