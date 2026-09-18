@@ -104,3 +104,29 @@
                 | subelements('value.nested') }}"
       loop_control:
         label: "{{ item.1 }} -> {{ item.0.key }}"
+
+    # update_password: on_create, not always. Re-asserting the password on
+    # every deploy would reset pwdLastSet each time and quietly undo any
+    # credential change a scenario depends on. The password still comes from
+    # the environment, so a fresh lab gets a known one; an existing one keeps
+    # whatever it has.
+    #
+    # groups.add is additive for the same reason the nesting is: membership
+    # drift is a finding, not something to repair silently.
+    - name: Create the lab user accounts
+      microsoft.ad.user:
+        name: "{{ item.key }}"
+        sam_account_name: "{{ item.key }}"
+        upn: "{{ item.key }}@{{ lab_ad_domain }}"
+        path: "{{ ad_ou_dn[item.value.ou] }}"
+        description: "{{ item.value.description }}"
+        password: "{{ lab_user_pass }}"
+        update_password: on_create
+        enabled: true
+        groups:
+          add: "{{ item.value.groups | default([]) }}"
+        state: present
+      loop: "{{ lab_ad.users | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      no_log: true
