@@ -1,0 +1,74 @@
+---
+# The AD identity layer: OUs, groups, users, account policy, the LAPS schema
+# and its OU permissions, and the IDP01 directory delegation.
+#
+# Design: docs/ad-identity-design.md
+#
+# Order in deploy.sh: after dc.yml (the forest must exist), before
+# ad_gpo.yml (the OUs must exist for the GPO links to target).
+#
+# Everything here runs on the DC: the microsoft.ad object modules require
+# the ActiveDirectory PowerShell module on the TARGET host, and a Windows 11
+# workstation has no RSAT installed.
+
+- name: Build the AD identity layer
+  hosts: vms_dc
+  gather_facts: false
+
+  vars:
+    lab_domain: "{{ lookup('env', 'LAB_DOMAIN') | default('clayface', true) }}"
+    lab_ad_domain: "{{ lab_domain }}.local"
+    lab_ad_netbios: "{{ lab_domain | upper }}"
+    lab_user_pass: "{{ lookup('env', 'LAB_USER_PASS') | default('Passw0rd!Lab', true) }}"
+
+    # Derived from the forest name, never written down twice.
+    ad_base_dn: "DC={{ lab_ad_domain | replace('.', ',DC=') }}"
+    ad_anchor_dn: "OU={{ lab_ad.ou }},{{ ad_base_dn }}"
+
+  tasks:
+    - name: Fail if lab.yaml has no usable `ad` section
+      ansible.builtin.assert:
+        that:
+          - lab_ad is defined
+          - lab_ad.ou is defined
+          - lab_ad.users | default({}) | length > 0
+        fail_msg: >-
+          lab.yaml has no `ad` section (or it is empty), so this play has
+          nothing to build. See docs/ad-identity-design.md.
+
+    - name: Create the anchor OU
+      microsoft.ad.ou:
+        name: "{{ lab_ad.ou }}"
+        path: "{{ ad_base_dn }}"
+        description: Clayface lab objects (docs/ad-identity-design.md)
+        protect_from_deletion: true
+        state: present
+
+    - name: Create the child OUs
+      microsoft.ad.ou:
+        name: "{{ item }}"
+        path: "{{ ad_anchor_dn }}"
+        protect_from_deletion: true
+        state: present
+      loop: "{{ lab_ad.ous }}"
+
+    - name: Read back the OU distinguished names
+      ansible.windows.win_powershell:
+        script: |
+          Import-Module ActiveDirectory
+          $dn = @{}
+          $dn['{{ lab_ad.ou }}'] = '{{ ad_anchor_dn }}'
+          foreach ($n in @({% for o in lab_ad.ous %}'{{ o }}'{% if not loop.last %}, {% endif %}{% endfor %})) {
+              $dn[$n] = "OU=$n,{{ ad_anchor_dn }}"
+          }
+          $dn | ConvertTo-Json -Compress
+      register: ad_ou_dn_raw
+      changed_when: false
+
+    - name: Register the OU distinguished names as a fact
+      ansible.builtin.set_fact:
+        ad_ou_dn: "{{ ad_ou_dn_raw.output | first | from_json }}"
+
+    - name: Report the OU tree
+      ansible.builtin.debug:
+        msg: "{{ ad_ou_dn }}"
