@@ -1,0 +1,398 @@
+---
+# Read-only assertions over the AD identity layer.
+#
+# Design: docs/ad-identity-design.md section 16. Nothing here writes; every
+# task is safe to re-run and none of them change state.
+#
+# Run after client.yml, so the machine account placement and the workstation
+# policy can be asserted too.
+
+- name: Validate the AD identity layer on the domain controller
+  hosts: vms_dc
+  gather_facts: false
+
+  vars:
+    lab_domain: "{{ lookup('env', 'LAB_DOMAIN') | default('clayface', true) }}"
+    lab_ad_domain: "{{ lab_domain }}.local"
+    lab_ad_netbios: "{{ lab_domain | upper }}"
+    ad_base_dn: "DC={{ lab_ad_domain | replace('.', ',DC=') }}"
+    ad_anchor_dn: "OU={{ lab_ad.ou }},{{ ad_base_dn }}"
+    lab_user_pass: "{{ lookup('env', 'LAB_USER_PASS') | default('Passw0rd!Lab', true) }}"
+
+    # Every OU the lab creates, plus the domain root. The domain root is in
+    # the list because an explicit ACE there is exactly what a DCSync-shaped
+    # W6 looks like.
+    # Single `{{ }}` expressions throughout this vars block, never a bare
+    # `[{% for ... %}]`: Ansible only converts a rendered value into a real
+    # list when the whole template is one expression. A list-looking literal
+    # built out of a for-tag stays a STRING, and the `for dn in ...` that
+    # consumes it then iterates its characters.
+    ad_scope_dns: >-
+      {{ (lab_ad.ous | map('regex_replace', '^', 'OU=')
+                     | map('regex_replace', '$', ',' + ad_anchor_dn) | list)
+         + [ad_anchor_dn, ad_base_dn] }}
+
+    ad_read_ous_dn: >-
+      {{ lab_ad.idp.read_ous | map('regex_replace', '^', 'OU=')
+                             | map('regex_replace', '$', ',' + ad_anchor_dn)
+                             | list }}
+
+    # The logon group plus the role groups nested inside it. A user reaches
+    # interactive logon through either, which is the whole reason the role
+    # groups are nested rather than granted separately.
+    ad_logon_groups: >-
+      {{ [lab_ad.workstation.logon_group]
+         + (lab_ad.groups[lab_ad.workstation.logon_group].nested | default([])) }}
+
+
+    ad_tier0_users: >-
+      {{ lab_ad.users | dict2items
+         | selectattr('value.tier0', 'defined')
+         | selectattr('value.tier0')
+         | map(attribute='key') | list }}
+
+  tasks:
+    - name: Assert every OU in lab.yaml exists
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ActiveDirectory
+          $bad = @()
+          foreach ($dn in @({% for dn in ad_scope_dns %}'{{ dn }}'{% if not loop.last %}, {% endif %}{% endfor %})) {
+              # The domain root is not an OU, so only assert OU-ness below it.
+              if ($dn -like 'DC=*') { continue }
+              if (-not (Get-ADOrganizationalUnit -Identity $dn -ErrorAction SilentlyContinue)) {
+                  $bad += $dn
+              }
+          }
+          if ($bad.Count) { throw "missing OUs: $($bad -join ', ')" }
+          # -Filter is required: with -SearchBase and no -Filter the cmdlet
+          # prompts, which fails under a non-interactive WinRM session.
+          $ous = Get-ADOrganizationalUnit -SearchBase '{{ ad_anchor_dn }}' `
+                     -SearchScope OneLevel -Filter * |
+                     Select-Object -ExpandProperty DistinguishedName
+          if ($ous.Count -ne {{ lab_ad.ous | length }}) {
+              throw "expected {{ lab_ad.ous | length }} child OUs under the anchor, found $($ous.Count)"
+          }
+          "OK: anchor OU plus $($ous.Count) child OUs present"
+          $ous | ForEach-Object { "  $_" }
+      changed_when: false
+
+    # One assertion per group rather than a single recursive one, because
+    # Get-ADGroupMember -Recursive returns LEAF principals only: it answers
+    # "which users", never "which groups", so the intermediate role groups
+    # would show up as missing from an expected set that named them.
+    #
+    # The nesting itself is asserted separately below — that GG-Employees
+    # contains GG-Developers and GG-IT-Admins, which is what lets bob.sing
+    # reach interactive logon through the nest rather than by direct
+    # membership.
+    - name: Assert each logon group holds exactly its designed members
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ActiveDirectory
+          $want = @({% for entry in lab_ad.users | dict2items | selectattr('value.groups', 'contains', item) %}'{{ entry.key }}'{% if not loop.last %}, {% endif %}{% endfor %})
+          $have = @(Get-ADGroupMember '{{ item }}' |
+                      Select-Object -ExpandProperty SamAccountName)
+          # The logon group also holds the role groups nested inside it, so
+          # those are expected members rather than drift.
+          $nested  = @({% for g in lab_ad.groups[item].nested | default([]) %}'{{ g }}'{% if not loop.last %}, {% endif %}{% endfor %})
+          $missing = @($want | Where-Object { $have -notcontains $_ })
+          $extra   = @($have | Where-Object { $want -notcontains $_ -and $nested -notcontains $_ })
+          if ($missing.Count -or $extra.Count) {
+              throw "{{ item }} mismatch. missing=[$($missing -join ',')] extra=[$($extra -join ',')]"
+          }
+          "OK: {{ item }} holds $($have.Count) members, all expected"
+      loop: "{{ ad_logon_groups }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+
+    - name: Assert the role groups are nested inside the logon group
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ActiveDirectory
+          $have = @(Get-ADGroupMember '{{ lab_ad.workstation.logon_group }}' |
+                      Select-Object -ExpandProperty SamAccountName)
+          $bad = @({% for g in lab_ad.groups[lab_ad.workstation.logon_group].nested | default([]) %}'{{ g }}'{% if not loop.last %}, {% endif %}{% endfor %} |
+                     Where-Object { $have -notcontains $_ })
+          if ($bad.Count) { throw "{{ lab_ad.workstation.logon_group }} does not contain: $($bad -join ', ')" }
+          "OK: the role groups are nested, so one logon right covers every role"
+      changed_when: false
+
+    - name: Assert tier-0 accounts have no workstation admin group
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ActiveDirectory
+          foreach ($u in @({% for u in ad_tier0_users %}'{{ u }}'{% if not loop.last %}, {% endif %}{% endfor %})) {
+              $g = @((Get-ADPrincipalGroupMembership $u).Name)
+              if ($g -contains '{{ lab_ad.workstation.admin_group }}') {
+                  throw "$u is in {{ lab_ad.workstation.admin_group }} — tier-0 must not administer workstations"
+              }
+              "$u : not in {{ lab_ad.workstation.admin_group }}"
+          }
+      changed_when: false
+
+    - name: Assert the domain account policy matches the design
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ActiveDirectory
+          $p = Get-ADDefaultDomainPasswordPolicy
+          $bad = @()
+          if ($p.MinPasswordLength -ne 12)                  { $bad += 'MinPasswordLength' }
+          if (-not $p.ComplexityEnabled)                    { $bad += 'ComplexityEnabled' }
+          if ($p.PasswordHistoryCount -ne 24)               { $bad += 'PasswordHistoryCount' }
+          if ($p.ReversibleEncryptionEnabled)               { $bad += 'ReversibleEncryptionEnabled' }
+          if ($p.LockoutThreshold -ne 0)                    { $bad += 'LockoutThreshold (expected 0 = disabled)' }
+          if ($bad.Count) { throw "account policy drift: $($bad -join ', ')" }
+          'OK: account policy matches the design'
+      changed_when: false
+
+    # The schema attribute objects use lDAPDisplayName, not name: a
+    # `(name=msLAPS-*)` filter matches zero objects and would leave this
+    # guard permanently false, re-running a forest-wide one-way schema
+    # update on every deploy.
+    - name: Assert the LAPS schema is extended
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ActiveDirectory
+          $a = @(Get-ADObject -SearchBase (Get-ADRootDSE).schemaNamingContext `
+                   -LDAPFilter '(lDAPDisplayName=msLAPS-*)')
+          if ($a.Count -eq 0) { throw 'the msLAPS-* schema attributes are absent' }
+          "OK: LAPS schema present ($($a.Count) attributes)"
+      changed_when: false
+
+    # Two halves, and the second is the one that matters.
+    #
+    # Scoping is asserted on the ACL, not by a search: every authenticated
+    # user in a default AD can read the whole directory, so "can it read the
+    # domain root?" answers YES for any account and proves nothing. What the
+    # lab actually controls is which OUs the bind account holds an EXPLICIT
+    # ACE on, and that is what is checked — exactly one explicit GenericRead
+    # Allow on each read OU, and zero explicit ACEs anywhere else in the
+    # anchor OU, the child OUs, or the domain root. An explicit ACE on the
+    # domain root is the DCSync-shaped W6 this test exists to catch.
+    #
+    # Then the functional half: bind as the account and actually read.
+    # Scoping is asserted on the ACL, not by a search: every authenticated
+    # user in a default AD can read the whole directory, so "can it read the
+    # domain root?" answers YES for any account and proves nothing. What the
+    # lab actually controls is which OUs the bind account holds an EXPLICIT
+    # ACE on, and that is what is checked — exactly one explicit GenericRead
+    # Allow on each read OU, and zero explicit ACEs anywhere else in the
+    # anchor OU, the child OUs, or the domain root. An explicit ACE on the
+    # domain root is the DCSync-shaped W6 this test exists to catch.
+    - name: Assert the IDP delegation is scoped
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ActiveDirectory
+
+          $sid = (New-Object System.Security.Principal.NTAccount(
+                    '{{ lab_ad_netbios }}', '{{ lab_ad.idp.bind_account }}')
+                 ).Translate([System.Security.Principal.SecurityIdentifier])
+
+          # A function, not an inline try: PowerShell's try/catch is a
+          # statement, so it cannot be used as an expression inside a
+          # Where-Object block.
+          function Test-IsBindAce($ace) {
+              if ($ace.IsInherited) { return $false }
+              try {
+                  return ($ace.IdentityReference.Translate(
+                      [System.Security.Principal.SecurityIdentifier]).Value -eq $sid.Value)
+              } catch { return $false }
+          }
+
+          $scope   = @({% for dn in ad_scope_dns %}'{{ dn }}'{% if not loop.last %}, {% endif %}{% endfor %})
+          $allowed = @({% for dn in ad_read_ous_dn %}'{{ dn }}'{% if not loop.last %}, {% endif %}{% endfor %})
+
+          foreach ($dn in $scope) {
+              $explicit = @((Get-Acl -Path "AD:\$dn").Access |
+                              Where-Object { Test-IsBindAce $_ })
+              if ($allowed -contains $dn) {
+                  if ($explicit.Count -ne 1 -or
+                      $explicit[0].AccessControlType -ne 'Allow' -or
+                      $explicit[0].ActiveDirectoryRights -notmatch 'GenericRead') {
+                      throw "$dn should carry exactly one explicit GenericRead Allow ACE for the bind account, found $($explicit.Count)"
+                  }
+              } elseif ($explicit.Count -ne 0) {
+                  throw "$dn carries $($explicit.Count) explicit ACE(s) for the bind account — the delegation is too broad (this is what weakness W6 looks like)"
+              }
+          }
+
+          $privileged = @((Get-ADPrincipalGroupMembership '{{ lab_ad.idp.bind_account }}' |
+                             Select-Object -ExpandProperty Name) |
+                          Where-Object { $_ -ne 'Domain Users' })
+          if ($privileged.Count) {
+              throw "the bind account is in $($privileged -join ', ') — it must hold no group membership"
+          }
+
+          "OK: explicit ACEs only on the $($allowed.Count) scoped OUs, no group membership"
+      changed_when: false
+
+    # The functional half. no_log, because this task carries the bind
+    # password in its rendered script — the project rule is that a password
+    # is never logged. The scoping task above is deliberately separate so
+    # that its result stays visible.
+    - name: Assert the IDP bind account can actually read its scoped OUs
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          # System.DirectoryServices does NOT contain LdapConnection; it lives
+          # in System.DirectoryServices.Protocols.
+          Add-Type -AssemblyName System.DirectoryServices.Protocols
+
+          # Bind as the account with explicit credentials, because it is
+          # denied interactive and network logon and so cannot open a
+          # session. The three-argument NetworkCredential matters: the
+          # two-argument form stores the whole 'DOMAIN\user' string in
+          # UserName, which Negotiate cannot parse, and every bind then fails
+          # with "The supplied credential is invalid."
+          $conn = New-Object System.DirectoryServices.Protocols.LdapConnection('{{ lab_ad_domain }}:389')
+          $conn.Credential = New-Object System.Net.NetworkCredential(
+              '{{ lab_ad.idp.bind_account }}', '{{ lab_user_pass }}', '{{ lab_ad_netbios }}')
+          # Negotiate, not Basic: the DC requires strong authentication, so a
+          # Basic bind is refused outright, and Basic would put the password
+          # on the wire in the clear over 389.
+          $conn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Negotiate
+          $conn.Bind()
+
+          function Test-Search([string]$Base, [string]$Filter) {
+              $req = New-Object System.DirectoryServices.Protocols.SearchRequest(
+                  $Base, $Filter,
+                  [System.DirectoryServices.Protocols.SearchScope]::Subtree)
+              try   { $conn.SendRequest($req) | Out-Null; 'ALLOWED' }
+              catch { 'DENIED' }
+          }
+
+          $bad = @()
+          foreach ($dn in @({% for dn in ad_read_ous_dn %}'{{ dn }}'{% if not loop.last %}, {% endif %}{% endfor %})) {
+              $r = Test-Search $dn '(objectClass=user)'
+              if ($r -ne 'ALLOWED') { $bad += "$dn ($r)" }
+          }
+          if ($bad.Count) { throw "the bind account cannot read: $($bad -join ', ')" }
+          'OK: the bind account reads every scoped OU'
+      changed_when: false
+      no_log: true
+
+- name: Validate the workstation side
+  hosts: vms_client
+  gather_facts: false
+
+  vars:
+    lab_domain: "{{ lookup('env', 'LAB_DOMAIN') | default('clayface', true) }}"
+    lab_ad_netbios: "{{ lab_domain | upper }}"
+
+  tasks:
+    # The machine's own DN comes from the Group Policy engine's state, NOT
+    # from Win32_ComputerSystem.OrganizationalUnit: that property is empty on
+    # a joined Windows 11 client, so a check against it cannot pass.
+    - name: Assert the machine account is in OU=Workstations
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $dn = (Get-ItemProperty `
+                   'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State\Machine' `
+                   -Name 'Distinguished-Name').'Distinguished-Name'
+          if ($dn -notlike '*,OU=Workstations,*') {
+              throw "machine account is in '$dn', so no workstation GPO applies"
+          }
+          "OK: $dn"
+      changed_when: false
+
+    - name: Assert the workstation policy landed
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $bad = @()
+
+          if (-not (Test-Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\LAPS')) {
+              $bad += 'LAPS policy absent'
+          }
+          $lm = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' `
+                   -Name LmCompatibilityLevel -ErrorAction SilentlyContinue).LmCompatibilityLevel
+          if ($lm -ne 5) { $bad += "LmCompatibilityLevel=$lm (expected 5)" }
+
+          if ($bad.Count) { throw "policy drift: $($bad -join '; ')" }
+          'OK: workstation policy applied'
+      changed_when: false
+
+    - name: Assert the local Administrators group is the designed set
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $members = @(Get-LocalGroupMember -Group Administrators |
+                         Select-Object -ExpandProperty Name)
+          $want = '{{ lab_ad_netbios }}\{{ lab_ad.workstation.admin_group }}'
+          if ($members -notcontains $want) { throw "$want is not a local administrator" }
+          # The built-in Administrator must survive: it is the Ansible
+          # transport, and losing it means losing remote access entirely.
+          if (-not ($members | Where-Object { $_ -like '*\Administrator' })) {
+              throw 'the built-in Administrator is no longer a local administrator — remote access is at risk'
+          }
+          $members -join ', '
+      changed_when: false
+
+    # secedit stores and exports user rights as SIDs, never names, so a check
+    # that greps the export for 'CLAYFACE\GG-Employees' always fails. The
+    # expected names are resolved to SIDs first, which also makes the check
+    # independent of the display language.
+    - name: Assert the logon rights are the designed set
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+
+          function Resolve-Sid([string]$name) {
+              if ($name -like '*S-1-*') { return $name }
+              '*' + (New-Object System.Security.Principal.NTAccount($name)).Translate(
+                  [System.Security.Principal.SecurityIdentifier]).Value
+          }
+
+          $tmp = Join-Path $env:TEMP 'clayface-validate.inf'
+          secedit /export /cfg $tmp /areas USER_RIGHTS | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "secedit /export failed ($LASTEXITCODE)" }
+
+          $current = @{}
+          $inPriv  = $false
+          foreach ($line in Get-Content -LiteralPath $tmp) {
+              if ($line -match '^\[') {
+                  $inPriv = ($line -match '^\[Privilege Rights\]')
+                  continue
+              }
+              if (-not $inPriv) { continue }
+              if ($line -match '^\s*(Se\w+)\s*=\s*(.*)$') {
+                  $current[$matches[1]] = @($matches[2] -split ',' |
+                      ForEach-Object { $_.Trim() } | Where-Object { $_ })
+              }
+          }
+
+          $checks = @(
+              @{ k = 'SeInteractiveLogonRight';           want = '*S-1-5-32-544' },
+              @{ k = 'SeInteractiveLogonRight';           want = '{{ lab_ad_netbios }}\Domain Admins' },
+              @{ k = 'SeInteractiveLogonRight';           want = '{{ lab_ad_netbios }}\{{ lab_ad.workstation.logon_group }}' },
+              @{ k = 'SeRemoteInteractiveLogonRight';     want = '{{ lab_ad_netbios }}\{{ lab_ad.workstation.admin_group }}' },
+              @{ k = 'SeDenyInteractiveLogonRight';       want = '{{ lab_ad_netbios }}\{{ lab_ad.idp.bind_account }}' },
+              @{ k = 'SeDenyRemoteInteractiveLogonRight'; want = '{{ lab_ad_netbios }}\{{ lab_ad.idp.bind_account }}' },
+              @{ k = 'SeDenyNetworkLogonRight';           want = '{{ lab_ad_netbios }}\{{ lab_ad.idp.bind_account }}' }
+          )
+          $bad = @()
+          foreach ($c in $checks) {
+              $sid = Resolve-Sid $c.want
+              if (@($current[$c.k]) -notcontains $sid) {
+                  $bad += "$($c.k) missing $($c.want)"
+              }
+          }
+          # SeNetworkLogonRight is deliberately untouched — narrowing it
+          # would cut Ansible's WinRM access to this machine — so its absence
+          # is a remote-access emergency, not a hardening win.
+          if (-not $current['SeNetworkLogonRight']) {
+              $bad += 'SeNetworkLogonRight is absent, which breaks WinRM to this host'
+          }
+          if ($bad.Count) { throw "logon rights drift: $($bad -join '; ')" }
+          'OK: logon rights match the design'
+      changed_when: false
