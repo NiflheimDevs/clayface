@@ -190,3 +190,89 @@
           "CHANGED: $($drift -join ', ')"
       register: ad_account_policy
       changed_when: "'CHANGED' in (ad_account_policy.output | join(' '))"
+
+    # ---------------------------------------------------------------
+    # LAPS. The schema extension is a forest-wide, one-way operation, so it
+    # is guarded on a schema check rather than run blind on every deploy.
+    # Verified against Microsoft's LAPS schema reference: a new Server 2025
+    # forest has the LAPS *client* but NOT the msLAPS-* attributes — those
+    # still require Update-LapsADSchema.
+    # ---------------------------------------------------------------
+    - name: Check whether the LAPS schema is already extended
+      ansible.windows.win_powershell:
+        script: |
+          Import-Module ActiveDirectory
+          $root = (Get-ADRootDSE).schemaNamingContext
+          # lDAPDisplayName, not name: schema attribute objects do not carry
+          # a `name` value, so a (name=...) filter matches nothing and this
+          # guard is permanently false - which would re-run a forest-wide,
+          # one-way schema extension on every single deploy.
+          $attr = Get-ADObject -SearchBase $root `
+                    -LDAPFilter '(lDAPDisplayName=msLAPS-Password)' `
+                    -Properties lDAPDisplayName -ErrorAction SilentlyContinue
+          if ($attr) { 'PRESENT' } else { 'ABSENT' }
+      register: laps_schema
+      changed_when: false
+
+    - name: Extend the AD schema for Windows LAPS
+      ansible.windows.win_powershell:
+        script: |
+          Update-LapsADSchema -Confirm:$false | Out-Null
+          'CHANGED'
+      when: "'PRESENT' not in (laps_schema.output | join(' '))"
+      changed_when: true
+
+    # `Import-Module ActiveDirectory` is not decoration: the AD: PSDrive is
+    # registered by that module, and module autoloading fires on cmdlet
+    # discovery, not on provider-path resolution. Without it this fails with
+    # "Cannot find drive. A drive with the name 'AD' does not exist."
+    #
+    # The guard must match the LAPS attribute by schemaIDGUID, not just look
+    # for "a SELF ACE with an extended right". Every OU inherits a SELF ACE
+    # from the domain root's default security descriptor, so the coarse form
+    # matches on an OU this task has never touched, reports OK, and leaves the
+    # workstation unable to write its own password - a failure that only shows
+    # up later, as LAPS silently never rotating.
+    - name: Let computers in OU=Workstations store their own LAPS password
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ActiveDirectory
+          $ou = '{{ ad_ou_dn.Workstations }}'
+          $schema = (Get-ADRootDSE).schemaNamingContext
+          $attr = Get-ADObject -SearchBase $schema `
+                    -LDAPFilter '(lDAPDisplayName=msLAPS-Password)' `
+                    -Properties schemaIDGUID
+          # No pipeline here: schemaIDGUID is already a 16-byte array, and
+          # piping it enumerates the bytes, handing the Guid constructor a
+          # single byte.
+          $want = [Guid]::new([byte[]]$attr.schemaIDGUID)
+          $has = (Get-Acl -Path "AD:\$ou").Access |
+              Where-Object { $_.IdentityReference -like '*SELF' -and
+                             $_.AccessControlType -eq 'Allow' -and
+                             $_.ObjectType -eq $want }
+          if ($has) { 'OK'; return }
+          Set-LapsADComputerSelfPermission -Identity $ou -Confirm:$false
+          'CHANGED'
+      register: laps_self
+      changed_when: "'CHANGED' in (laps_self.output | join(' '))"
+
+    # Requires BOTH this right and membership of the decryption principal
+    # configured in the LAPS policy (task 10) — ADPasswordEncryptionPrincipal
+    # is GG-IT-Admins. Two independent gates, which is why weakness W3 has
+    # two ways to be introduced.
+    - name: Let the workstation admins read LAPS passwords on OU=Workstations
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ActiveDirectory
+          $ou     = '{{ ad_ou_dn.Workstations }}'
+          $who    = '{{ lab_ad_netbios }}\{{ lab_ad.workstation.admin_group }}'
+          $has = (Get-Acl -Path "AD:\$ou").Access |
+              Where-Object { $_.IdentityReference -eq $who -and
+                             $_.ActiveDirectoryRights -match 'ExtendedRight' }
+          if ($has) { 'OK'; return }
+          Set-LapsADReadPasswordPermission -Identity $ou -AllowedPrincipals $who -Confirm:$false
+          'CHANGED'
+      register: laps_read
+      changed_when: "'CHANGED' in (laps_read.output | join(' '))"
