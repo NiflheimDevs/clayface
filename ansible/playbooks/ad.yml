@@ -3,13 +3,6 @@
 # and its OU permissions, and the IDP01 directory delegation.
 #
 # Design: docs/ad-identity-design.md
-#
-# Order in deploy.sh: after dc.yml (the forest must exist), before
-# ad_gpo.yml (the OUs must exist for the GPO links to target).
-#
-# Everything here runs on the DC: the microsoft.ad object modules require
-# the ActiveDirectory PowerShell module on the TARGET host, and a Windows 11
-# workstation has no RSAT installed.
 
 - name: Build the AD identity layer
   hosts: vms_dc
@@ -100,8 +93,8 @@
           add: "{{ item.1 }}"
         state: present
       loop: "{{ lab_ad.groups | dict2items
-                | selectattr('value.nested', 'defined') | list
-                | subelements('value.nested') }}"
+        | selectattr('value.nested', 'defined') | list
+        | subelements('value.nested') }}"
       loop_control:
         label: "{{ item.1 }} -> {{ item.0.key }}"
 
