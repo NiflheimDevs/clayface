@@ -1,7 +1,7 @@
 
 resource "libvirt_domain" "opnsense" {
   name        = var.name
-  memory      = 3000
+  memory      = 2500
   memory_unit = "MiB"
   vcpu        = 3
   type        = "kvm"
