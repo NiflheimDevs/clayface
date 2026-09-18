@@ -130,3 +130,63 @@
       loop_control:
         label: "{{ item.key }}"
       no_log: true
+
+    # Read-compare-write in one script: the cmdlet has no idempotency of its
+    # own, and this is the same "the read is the idempotency key" idiom
+    # dc.yml uses for the DNS forwarder.
+    #
+    # LockoutThreshold 0 (disabled) is a deliberate deviation, documented in
+    # docs/ad-identity-design.md section 14: in AD the built-in
+    # Administrator CAN be locked out, and Administrator is the Ansible
+    # transport. The enablement recipe is in section 5.1.
+    #
+    # MaxPasswordAge needs care: AD encodes "never expires" as a zero
+    # interval, and the cmdlet surfaces that as either TimeSpan.Zero or a
+    # sentinel-sized value depending on version. Both are normalised to 0
+    # here so the comparison does not drift on a value that never changes.
+    - name: Set the domain account policy
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ActiveDirectory
+
+          $want = @{
+              MinPasswordLength           = 12
+              ComplexityEnabled           = $true
+              PasswordHistoryCount        = 24
+              MaxPasswordAge              = 0
+              MinPasswordAge              = 1
+              ReversibleEncryptionEnabled = $false
+              LockoutThreshold            = 0
+          }
+
+          $p = Get-ADDefaultDomainPasswordPolicy
+          $curMaxAge = if ($p.MaxPasswordAge -eq [TimeSpan]::Zero -or
+                          $p.MaxPasswordAge.TotalDays -ge 9999) {
+              0
+          } else { [int]$p.MaxPasswordAge.TotalDays }
+
+          $cur = @{
+              MinPasswordLength           = $p.MinPasswordLength
+              ComplexityEnabled           = $p.ComplexityEnabled
+              PasswordHistoryCount        = $p.PasswordHistoryCount
+              MaxPasswordAge              = $curMaxAge
+              MinPasswordAge              = [int]$p.MinPasswordAge.TotalDays
+              ReversibleEncryptionEnabled = $p.ReversibleEncryptionEnabled
+              LockoutThreshold            = $p.LockoutThreshold
+          }
+
+          $drift = @($want.Keys | Where-Object { $want[$_] -ne $cur[$_] })
+          if ($drift.Count -eq 0) { 'OK'; return }
+
+          Set-ADDefaultDomainPasswordPolicy -Identity '{{ lab_ad_domain }}' `
+              -MinPasswordLength $want.MinPasswordLength `
+              -ComplexityEnabled $want.ComplexityEnabled `
+              -PasswordHistoryCount $want.PasswordHistoryCount `
+              -MaxPasswordAge (New-TimeSpan -Days $want.MaxPasswordAge) `
+              -MinPasswordAge (New-TimeSpan -Days $want.MinPasswordAge) `
+              -ReversibleEncryptionEnabled $want.ReversibleEncryptionEnabled `
+              -LockoutThreshold $want.LockoutThreshold
+          "CHANGED: $($drift -join ', ')"
+      register: ad_account_policy
+      changed_when: "'CHANGED' in (ad_account_policy.output | join(' '))"
