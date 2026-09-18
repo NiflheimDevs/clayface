@@ -27,6 +27,28 @@
     gpo_laps: "WS - LAPS"
     gpo_workstations_dn: "OU=Workstations,{{ ad_anchor_dn }}"
 
+    # (key, name, type, value). DWord unless stated. Rendered into the GPO by
+    # Set-GPRegistryValue, which bumps the GPO version so clients reapply.
+    #
+    # Deliberately absent: the Defender ASR rule 'Block credential stealing
+    # from lsass.exe'. Enabling it breaks the primary attack path at weakness
+    # W2. That is OMITTED HARDENING, not a planted weakness — a gap, not
+    # something changed to create a scenario. See spec section 12.
+    ws_registry_policy:
+      - {key: 'HKLM\SYSTEM\CurrentControlSet\Control\Lsa', name: LmCompatibilityLevel,  value: 5}
+      - {key: 'HKLM\SYSTEM\CurrentControlSet\Control\Lsa', name: NoLMHash,              value: 1}
+      - {key: 'HKLM\SYSTEM\CurrentControlSet\Control\Lsa', name: RestrictAnonymousSAM,  value: 1}
+      - {key: 'HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters',       name: RequireSecuritySignature, value: 1}
+      - {key: 'HKLM\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters',  name: RequireSecuritySignature, value: 1}
+      - {key: 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer',     name: NoDriveTypeAutoRun,       value: 255}
+      - {key: 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System',       name: InactivityTimeoutSecs,    value: 900}
+      - {key: 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System',       name: ConsentPromptBehaviorAdmin, value: 2}
+      - {key: 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System',       name: ConsentPromptBehaviorUser,  value: 0}
+      - {key: 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection', name: DisableRealtimeMonitoring, value: 0}
+      - {key: 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\SpyNet',             name: SpynetReporting,          value: 2}
+      - {key: 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\SpyNet',             name: SubmitSamplesConsent,     value: 2}
+      - {key: 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender',                    name: PUAProtection,            value: 1}
+
   tasks:
     # microsoft.ad.gpo manages LINKS ONLY — its own documentation says it
     # does not create or delete GPOs. So creation is New-GPO and linking is
@@ -75,3 +97,93 @@
     - name: Report the linked GPOs
       ansible.builtin.debug:
         msg: "{{ gpo_links.output | first }}"
+
+    # ---------------------------------------------------------------
+    # Firewall. -PolicyStore writes into the GPO's registry.pol and bumps
+    # the GPO version, which is why this is safe where a hand-written
+    # GptTmpl.inf would not be.
+    # ---------------------------------------------------------------
+    - name: Enable and configure the firewall profiles in the baseline
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $store = '{{ lab_ad_domain }}\{{ gpo_baseline }}'
+          $want = @{
+              Enabled               = 'True'
+              DefaultInboundAction  = 'Block'
+              DefaultOutboundAction = 'Allow'
+              LogAllowed            = 'True'
+              LogBlocked            = 'True'
+          }
+
+          # A GPO with no firewall settings yet returns nothing rather than
+          # defaults, so "no profiles" is itself the drift signal.
+          $cur = @(Get-NetFirewallProfile -PolicyStore $store `
+                    -Name Domain,Private,Public -ErrorAction SilentlyContinue)
+          $drift = @()
+          if ($cur.Count -eq 0) { $drift += 'no firewall settings in the GPO' }
+          else {
+              foreach ($p in $cur) {
+                  foreach ($k in $want.Keys) {
+                      if ([string]$p.$k -ne $want[$k]) { $drift += "$($p.Name).$k" }
+                  }
+              }
+          }
+          if ($drift.Count -eq 0) { 'OK'; return }
+
+          # AllowLocalFirewallRules is deliberately NOT set here. The base
+          # image enables WinRM via `winrm quickconfig`, which creates LOCAL
+          # rules; disabling local rule merging would remove Ansible's access
+          # to every workstation.
+          Set-NetFirewallProfile -PolicyStore $store -Name Domain,Private,Public `
+              -Enabled True -DefaultInboundAction Block -DefaultOutboundAction Allow `
+              -LogAllowed True -LogBlocked True
+          "CHANGED: $($drift -join ', ')"
+      register: fw_profiles
+      changed_when: "'CHANGED' in (fw_profiles.output | join(' '))"
+
+    # Explicit management-plane rule. The image's local WinRM rules would
+    # probably cover this, but a firewall that blocks inbound by default plus
+    # a management path that depends on an invisible local rule is a lab
+    # that cannot be reached after one policy refresh.
+    - name: Permit WinRM from the lab subnet
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $store = '{{ lab_ad_domain }}\{{ gpo_baseline }}'
+          $name  = 'Lab WinRM (Ansible)'
+          if (Get-NetFirewallRule -PolicyStore $store -DisplayName $name `
+                -ErrorAction SilentlyContinue) { 'OK'; return }
+          New-NetFirewallRule -PolicyStore $store -DisplayName $name `
+              -Description 'Allow Ansible over WinRM from the lab subnet' `
+              -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5985 `
+              -RemoteAddress 10.0.0.0/24 -Profile Any | Out-Null
+          'CHANGED'
+      register: fw_winrm
+      changed_when: "'CHANGED' in (fw_winrm.output | join(' '))"
+
+    # Read-compare-write per value. Keepers are deliberately skipped rather
+    # than re-applied, so the task reports honestly whether anything moved.
+    - name: Apply the registry hardening to the baseline GPO
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module GroupPolicy
+
+          $gpo  = '{{ gpo_baseline }}'
+          $key  = '{{ item.key }}'
+          $name = '{{ item.name }}'
+          $want = {{ item.value }}
+
+          $cur = Get-GPRegistryValue -Name $gpo -Key $key -ValueName $name `
+                   -ErrorAction SilentlyContinue
+          if ($null -ne $cur -and $cur.Value -eq $want) { 'OK'; return }
+
+          Set-GPRegistryValue -Name $gpo -Key $key -ValueName $name `
+              -Type DWord -Value $want | Out-Null
+          'CHANGED'
+      loop: "{{ ws_registry_policy }}"
+      loop_control:
+        label: "{{ item.key }}\\{{ item.name }}"
+      register: gpo_registry
+      changed_when: "'CHANGED' in (gpo_registry.output | join(' '))"
