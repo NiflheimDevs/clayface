@@ -131,10 +131,39 @@ ansible-playbook \
     -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
     "$ANSIBLE_DIR/playbooks/dc.yml"
 
+# Builds the identity layer inside the forest: OUs, groups, users, the domain
+# account policy, the LAPS schema extension and its OU permissions, and the
+# IDP01 read-only delegation. Needs LAB_USER_PASS (optional; defaults).
+step "Ansible: build the AD identity layer (ad.yml)"
+ansible-playbook \
+    -i "$ANSIBLE_DIR/inventory/lab_inventory.py" \
+    -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
+    "$ANSIBLE_DIR/playbooks/ad.yml"
+
+# Before client.yml: the GPOs must be linked to OU=Workstations before a
+# workstation is moved into it, or the first policy refresh finds an empty OU
+# and the machine comes up unmanaged until the next cycle.
+step "Ansible: build the workstation GPOs (ad_gpo.yml)"
+ansible-playbook \
+    -i "$ANSIBLE_DIR/inventory/lab_inventory.py" \
+    -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
+    "$ANSIBLE_DIR/playbooks/ad_gpo.yml"
+
 step "Ansible: join workstation(s) to the domain (client.yml)"
 ansible-playbook \
     -i "$ANSIBLE_DIR/inventory/lab_inventory.py" \
     -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
     "$ANSIBLE_DIR/playbooks/client.yml"
+
+# Read-only. Asserts the identity layer is what docs/ad-identity-design.md
+# says it is, including the negative cases — a workstation that did not
+# receive policy, a tier-0 account that can administer one, a delegation
+# that is broader than its two OUs. Runs last: it asserts workstation state,
+# which only exists after client.yml.
+step "Ansible: validate the AD identity layer (ad_validate.yml)"
+ansible-playbook \
+    -i "$ANSIBLE_DIR/inventory/lab_inventory.py" \
+    -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
+    "$ANSIBLE_DIR/playbooks/ad_validate.yml"
 
 step "Done. Infrastructure provisioned."
