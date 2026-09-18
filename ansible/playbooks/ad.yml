@@ -72,3 +72,35 @@
     - name: Report the OU tree
       ansible.builtin.debug:
         msg: "{{ ad_ou_dn }}"
+
+    - name: Create the security groups
+      microsoft.ad.group:
+        name: "{{ item.key }}"
+        scope: global
+        category: security
+        description: "{{ item.value.description }}"
+        path: "{{ ad_ou_dn.Groups }}"
+        state: present
+      loop: "{{ lab_ad.groups | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    # Additive, not `set`: a group that someone added a member to is exactly
+    # what weakness W7 looks like, and ad_validate.yml is what notices. A
+    # `set` would silently repair the drift instead.
+    # `path` is required even though the group already exists: the module's
+    # default lookup path is the well-known CN=Users container, so without it
+    # it does not find a group in OU=Groups and fails its `scope` precondition
+    # with "scope must be set when state=present and the group does not exist".
+    - name: Nest the role groups into their parent groups
+      microsoft.ad.group:
+        name: "{{ item.0.key }}"
+        path: "{{ ad_ou_dn.Groups }}"
+        members:
+          add: "{{ item.1 }}"
+        state: present
+      loop: "{{ lab_ad.groups | dict2items
+                | selectattr('value.nested', 'defined') | list
+                | subelements('value.nested') }}"
+      loop_control:
+        label: "{{ item.1 }} -> {{ item.0.key }}"
