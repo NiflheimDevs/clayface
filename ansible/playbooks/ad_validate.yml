@@ -44,7 +44,6 @@
       {{ [lab_ad.workstation.logon_group]
          + (lab_ad.groups[lab_ad.workstation.logon_group].nested | default([])) }}
 
-
     ad_tier0_users: >-
       {{ lab_ad.users | dict2items
          | selectattr('value.tier0', 'defined')
@@ -179,14 +178,6 @@
     # domain root is the DCSync-shaped W6 this test exists to catch.
     #
     # Then the functional half: bind as the account and actually read.
-    # Scoping is asserted on the ACL, not by a search: every authenticated
-    # user in a default AD can read the whole directory, so "can it read the
-    # domain root?" answers YES for any account and proves nothing. What the
-    # lab actually controls is which OUs the bind account holds an EXPLICIT
-    # ACE on, and that is what is checked — exactly one explicit GenericRead
-    # Allow on each read OU, and zero explicit ACEs anywhere else in the
-    # anchor OU, the child OUs, or the domain root. An explicit ACE on the
-    # domain root is the DCSync-shaped W6 this test exists to catch.
     - name: Assert the IDP delegation is scoped
       ansible.windows.win_powershell:
         script: |
@@ -288,6 +279,12 @@
     lab_domain: "{{ lookup('env', 'LAB_DOMAIN') | default('clayface', true) }}"
     lab_ad_netbios: "{{ lab_domain | upper }}"
 
+    ad_tier0_users: >-
+      {{ lab_ad.users | dict2items
+         | selectattr('value.tier0', 'defined')
+         | selectattr('value.tier0')
+         | map(attribute='key') | list }}
+
   tasks:
     # The machine's own DN comes from the Group Policy engine's state, NOT
     # from Win32_ComputerSystem.OrganizationalUnit: that property is empty on
@@ -378,7 +375,13 @@
               @{ k = 'SeRemoteInteractiveLogonRight';     want = '{{ lab_ad_netbios }}\{{ lab_ad.workstation.admin_group }}' },
               @{ k = 'SeDenyInteractiveLogonRight';       want = '{{ lab_ad_netbios }}\{{ lab_ad.idp.bind_account }}' },
               @{ k = 'SeDenyRemoteInteractiveLogonRight'; want = '{{ lab_ad_netbios }}\{{ lab_ad.idp.bind_account }}' },
-              @{ k = 'SeDenyNetworkLogonRight';           want = '{{ lab_ad_netbios }}\{{ lab_ad.idp.bind_account }}' }
+              @{ k = 'SeDenyNetworkLogonRight';           want = '{{ lab_ad_netbios }}\{{ lab_ad.idp.bind_account }}' }{% for u in ad_tier0_users %},
+              # Tier-0 is the case this whole play exists for: {{ u }} reaches
+              # SeInteractiveLogonRight through Domain Admins, and only these
+              # two denies outrank that allow. Losing them is silent — the
+              # account simply starts being able to log on to workstations.
+              @{ k = 'SeDenyInteractiveLogonRight';       want = '{{ lab_ad_netbios }}\{{ u }}' },
+              @{ k = 'SeDenyRemoteInteractiveLogonRight'; want = '{{ lab_ad_netbios }}\{{ u }}' }{% endfor %}
           )
           $bad = @()
           foreach ($c in $checks) {

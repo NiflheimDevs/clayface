@@ -19,8 +19,6 @@
     lab_ad_domain: "{{ lab_domain }}.local"
     lab_ad_netbios: "{{ lab_domain | upper }}"
 
-    lab_user_pass: "{{ lookup('env', 'LAB_USER_PASS') | default('Passw0rd!Lab', true) }}"
-
     # Tier-0 accounts are denied interactive and remote-interactive logon on
     # workstations. Derived from lab.yaml's per-user `tier0` flag rather than
     # written down here, so adding a second tier-0 account is one lab.yaml
