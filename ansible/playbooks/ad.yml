@@ -276,3 +276,55 @@
           'CHANGED'
       register: laps_read
       changed_when: "'CHANGED' in (laps_read.output | join(' '))"
+
+    # Read-only, scoped to exactly the OUs named in lab.yaml, inherited to
+    # their descendants. Everything outside that scope is denied by
+    # omission — OU=Workstations (where the confidential LAPS attributes
+    # live), OU=ServiceAccounts, and the domain root itself.
+    #
+    # GenericRead is the LDAP read right, not a filesystem right: it covers
+    # list contents and read properties, which is what a directory sync and
+    # an LDAP search need.
+    #
+    # Why not dsacls: its /I: inheritance flags are easy to get backwards and
+    # the failure is silent. ActiveDirectorySecurityInheritance::All states
+    # "this object and all descendants" unambiguously in the code.
+    - name: Grant the IDP bind account read-only access to its scoped OUs
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ActiveDirectory
+          Add-Type -AssemblyName System.DirectoryServices
+
+          $who = '{{ lab_ad.idp.bind_account }}'
+          $sid = (New-Object System.Security.Principal.NTAccount(
+                    '{{ lab_ad_netbios }}', $who)
+                 ).Translate([System.Security.Principal.SecurityIdentifier])
+
+          $wantOus = @({% for o in lab_ad.idp.read_ous %}'{{ ad_ou_dn[o] }}'{% if not loop.last %}, {% endif %}{% endfor %})
+          $changed = @()
+
+          foreach ($ou in $wantOus) {
+              $acl = Get-Acl -Path "AD:\$ou"
+              $has = $acl.Access | Where-Object {
+                  $_.IdentityReference.Translate(
+                      [System.Security.Principal.SecurityIdentifier]) -eq $sid -and
+                  $_.AccessControlType -eq 'Allow' -and
+                  $_.ActiveDirectoryRights -match 'GenericRead'
+              }
+              if ($has) { continue }
+
+              $rule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+                  $sid,
+                  [System.DirectoryServices.ActiveDirectoryRights]::GenericRead,
+                  [System.Security.AccessControl.AccessControlType]::Allow,
+                  [System.DirectoryServices.ActiveDirectorySecurityInheritance]::All)
+              $acl.AddAccessRule($rule)
+              Set-Acl -Path "AD:\$ou" -AclObject $acl
+              $changed += $ou
+          }
+
+          if ($changed.Count -eq 0) { 'OK' }
+          else { "CHANGED: $($changed -join '; ')" }
+      register: idp_delegation
+      changed_when: "'CHANGED' in (idp_delegation.output | join(' '))"
