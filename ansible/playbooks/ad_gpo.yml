@@ -187,3 +187,48 @@
         label: "{{ item.key }}\\{{ item.name }}"
       register: gpo_registry
       changed_when: "'CHANGED' in (gpo_registry.output | join(' '))"
+
+    # The value list lives inside the task rather than in `vars`, because two
+    # of the ten settings are built from `lab_ad` (the admin group and the
+    # managed account name) and splitting them across two places invites
+    # drift.
+    #
+    # AutomaticAccountManagement* makes LAPS create and enable its own
+    # managed local account, so the built-in Administrator is never touched —
+    # and built-in Administrator is the Ansible transport. Target 1 means
+    # "use the configured custom account name"; 2 would hand LAPS the
+    # built-in Administrator.
+    - name: Apply the LAPS policy to the LAPS GPO
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module GroupPolicy
+
+          $gpo = '{{ gpo_laps }}'
+          $key = 'HKLM\SOFTWARE\Policies\Microsoft\Windows\LAPS'
+          $changed = @()
+
+          foreach ($item in @(
+              @{ n = 'BackupDirectory';                         t = 'DWord';  v = 2 },
+              @{ n = 'PasswordLength';                          t = 'DWord';  v = 20 },
+              @{ n = 'PasswordComplexity';                      t = 'DWord';  v = 4 },
+              @{ n = 'PasswordAgeDays';                         t = 'DWord';  v = 30 },
+              @{ n = 'ADPasswordEncryptionEnabled';             t = 'DWord';  v = 1 },
+              @{ n = 'AutomaticAccountManagementEnabled';       t = 'DWord';  v = 1 },
+              @{ n = 'AutomaticAccountManagementTarget';        t = 'DWord';  v = 1 },
+              @{ n = 'AutomaticAccountManagementEnableAccount'; t = 'DWord';  v = 1 },
+              @{ n = 'ADPasswordEncryptionPrincipal';           t = 'String'; v = '{{ lab_ad_netbios }}\{{ lab_ad.workstation.admin_group }}' },
+              @{ n = 'AutomaticAccountManagementNameOrPrefix';  t = 'String'; v = '{{ lab_ad.laps.managed_account }}' }
+          )) {
+              $cur = Get-GPRegistryValue -Name $gpo -Key $key -ValueName $item.n `
+                       -ErrorAction SilentlyContinue
+              if ($null -ne $cur -and [string]$cur.Value -eq [string]$item.v) { continue }
+              Set-GPRegistryValue -Name $gpo -Key $key -ValueName $item.n `
+                  -Type $item.t -Value $item.v | Out-Null
+              $changed += $item.n
+          }
+
+          if ($changed.Count -eq 0) { 'OK' }
+          else { "CHANGED: $($changed -join ', ')" }
+      register: gpo_laps_policy
+      changed_when: "'CHANGED' in (gpo_laps_policy.output | join(' '))"
