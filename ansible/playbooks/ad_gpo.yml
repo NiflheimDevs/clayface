@@ -1,0 +1,77 @@
+---
+# Workstation Group Policy: two GPOs, created and linked here, filled with
+# registry-based content only.
+#
+# Design: docs/ad-identity-design.md section 7.
+#
+# REGISTRY POLICY ONLY — no GptTmpl.inf. Set-GPRegistryValue and the
+# NetSecurity cmdlets both bump the GPO's version number, so clients notice
+# the change. Hand-writing GptTmpl.inf into SYSVOL does not, and
+# microsoft.ad has no security-policy cmdlet. The user rights and local group
+# settings that would have gone in GptTmpl.inf are applied on the host by
+# client.yml instead. See section 7.3 for the full reasoning and the trigger
+# for revisiting it.
+
+- name: Build the workstation Group Policy objects
+  hosts: vms_dc
+  gather_facts: false
+
+  vars:
+    lab_domain: "{{ lookup('env', 'LAB_DOMAIN') | default('clayface', true) }}"
+    lab_ad_domain: "{{ lab_domain }}.local"
+    lab_ad_netbios: "{{ lab_domain | upper }}"
+    ad_base_dn: "DC={{ lab_ad_domain | replace('.', ',DC=') }}"
+    ad_anchor_dn: "OU={{ lab_ad.ou }},{{ ad_base_dn }}"
+
+    gpo_baseline: "WS - Security Baseline"
+    gpo_laps: "WS - LAPS"
+    gpo_workstations_dn: "OU=Workstations,{{ ad_anchor_dn }}"
+
+  tasks:
+    # microsoft.ad.gpo manages LINKS ONLY — its own documentation says it
+    # does not create or delete GPOs. So creation is New-GPO and linking is
+    # the module.
+    - name: Create the workstation GPOs
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module GroupPolicy
+          $changed = @()
+          foreach ($n in @('{{ gpo_baseline }}', '{{ gpo_laps }}')) {
+              if (-not (Get-GPO -Name $n -ErrorAction SilentlyContinue)) {
+                  New-GPO -Name $n `
+                    -Comment 'Clayface lab — see docs/ad-identity-design.md' | Out-Null
+                  $changed += $n
+              }
+          }
+          if ($changed.Count -eq 0) { 'OK' }
+          else { "CHANGED: $($changed -join '; ')" }
+      register: gpo_create
+      changed_when: "'CHANGED' in (gpo_create.output | join(' '))"
+
+    - name: Link the GPOs to OU=Workstations
+      microsoft.ad.gpo:
+        name: "{{ item }}"
+        target: "{{ gpo_workstations_dn }}"
+        state: present
+      loop:
+        - "{{ gpo_baseline }}"
+        - "{{ gpo_laps }}"
+
+    - name: Verify both links resolve
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module GroupPolicy
+          $links = (Get-GPInheritance -Target '{{ gpo_workstations_dn }}').GpoLinks
+          $names = @($links | Select-Object -ExpandProperty DisplayName)
+          foreach ($n in @('{{ gpo_baseline }}', '{{ gpo_laps }}')) {
+              if ($names -notcontains $n) { throw "$n is not linked to {{ gpo_workstations_dn }}" }
+          }
+          "linked: $($names -join ', ')"
+      register: gpo_links
+      changed_when: false
+
+    - name: Report the linked GPOs
+      ansible.builtin.debug:
+        msg: "{{ gpo_links.output | first }}"
