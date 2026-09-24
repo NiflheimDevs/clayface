@@ -45,10 +45,10 @@ edge_vm:
 # reservation <name>.clayface never resolves, and the playbook that renames
 # the guest cannot reach it to do the renaming.
 vm_placements:
-  # dc01:
-  #   module: dc
-  #   host: host_a
-  #   ip: 10.0.0.10
+  dc01:
+    module: dc
+    host: host_a
+    ip: 10.0.0.10
   # client01:
   #   module: client
   #   host: host_a
