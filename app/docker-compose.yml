@@ -1,0 +1,144 @@
+# docker-compose.yml — the Clayface Portal stack.
+#
+# Deployed to the lab's application host at /opt/clayface/app, where Ansible
+# writes the .env file this project reads. Compose loads ./.env automatically
+# for interpolation, which is how the secrets get in without ever being written
+# into this file, into the repository, or into the image.
+#
+# Only nginx publishes host ports. The portal and its database are reachable
+# over the compose network by service name and from nowhere else, so the only
+# way in is through TLS on 443 — or through 80, which redirects there. That
+# boundary matters for the lab: every route an attacker can reach, they reach
+# through nginx.
+#
+# Neither image is pulled on the host. Both arrive in the tarball that Ansible
+# produces with `docker save` on the control node, so `pull_policy: never` is
+# set on every service: if an image is missing, the deployment should fail with
+# "no such image" rather than quietly reach for a registry that the lab VM
+# cannot route to anyway.
+
+name: clayface-app
+
+services:
+  portal:
+    image: clayface/portal:lab
+    pull_policy: never
+    restart: unless-stopped
+    environment:
+      # Connection details. The host and port are the compose service name and
+      # postgres's own default, so they only need to be set if the database is
+      # moved somewhere else.
+      DB_HOST: ${DB_HOST:-postgres}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${DB_NAME:-clayface}
+      DB_USER: ${DB_USER:-clayface_app}
+      # No fallback for the three secrets, and that is deliberate. A default
+      # here would be a hardcoded credential in the compose file, and the
+      # hardening toggle for that weakness is supposed to be the only place a
+      # fallback can live. ":?" makes Compose refuse to start the stack at all
+      # when the value is missing, which is a clearer failure than an empty
+      # variable reaching the application.
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET must be set in .env}
+      SERVICE_ACCOUNT_USER: ${SERVICE_ACCOUNT_USER:-svc-app-portal}
+      SERVICE_ACCOUNT_PASSWORD: ${SERVICE_ACCOUNT_PASSWORD:?SERVICE_ACCOUNT_PASSWORD must be set in .env}
+
+      DATA_DIR: ${DATA_DIR:-/data}
+      # The healthcheck below assumes 8080. If this changes, change it too.
+      LISTEN_ADDR: ${LISTEN_ADDR:-:8080}
+
+      # The weakness toggles. All default to true, which is the posture the lab
+      # is deployed in: the deployment is vulnerable unless somebody has
+      # deliberately said otherwise. Set any of them to false in .env to run the
+      # hardened version of that one code path.
+      WEAK_SQLI_LOGIN: ${WEAK_SQLI_LOGIN:-true}
+      WEAK_SQLI_SEARCH: ${WEAK_SQLI_SEARCH:-true}
+      WEAK_COMMAND_INJECTION_DIAGNOSTICS: ${WEAK_COMMAND_INJECTION_DIAGNOSTICS:-true}
+      WEAK_IDOR_DOCUMENTS: ${WEAK_IDOR_DOCUMENTS:-true}
+      WEAK_BROKEN_ADMIN_AUTHZ: ${WEAK_BROKEN_ADMIN_AUTHZ:-true}
+      WEAK_PATH_TRAVERSAL_DOWNLOAD: ${WEAK_PATH_TRAVERSAL_DOWNLOAD:-true}
+      WEAK_HARDCODED_DB_CREDENTIALS: ${WEAK_HARDCODED_DB_CREDENTIALS:-true}
+      WEAK_FORGEABLE_SESSION_TOKEN: ${WEAK_FORGEABLE_SESSION_TOKEN:-true}
+      WEAK_SERVICE_ACCOUNT_CREDENTIAL_IN_DB: ${WEAK_SERVICE_ACCOUNT_CREDENTIAL_IN_DB:-true}
+      WEAK_SSRF_URL_FETCH: ${WEAK_SSRF_URL_FETCH:-true}
+      WEAK_VERBOSE_ERRORS_DEBUG_ENDPOINT: ${WEAK_VERBOSE_ERRORS_DEBUG_ENDPOINT:-true}
+    volumes:
+      # The document store. A named volume, so the sample documents are written
+      # once, on the first boot, and survive redeployment — which is the point,
+      # since they are what the exfiltration story is about.
+      - portal_data:/data
+    expose:
+      # Documentation only: `expose` publishes nothing. The portal is reachable
+      # from nginx and from no other container that has not joined this network.
+      - "8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # busybox wget, which is in the image already. The endpoint is
+      # unauthenticated on purpose so that the healthcheck needs no credentials.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  postgres:
+    image: postgres:16-alpine
+    pull_policy: never
+    restart: unless-stopped
+    environment:
+      # Hardcoded rather than interpolated: these three are the database's
+      # identity, they are the same in every deployment of this lab, and the
+      # portal's DB_NAME/DB_USER defaults have to agree with them.
+      POSTGRES_DB: clayface
+      POSTGRES_USER: clayface_app
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # The doubled dollar signs are Compose escapes: they reach the container
+      # as $POSTGRES_USER and $POSTGRES_DB, so the check reads the same
+      # variables the server was configured with instead of repeating them.
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  nginx:
+    image: nginx:1.27-alpine
+    pull_policy: never
+    restart: unless-stopped
+    ports:
+      # The only published ports in the stack. 443 terminates TLS; 80 exists
+      # solely to redirect to it.
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # Ansible generates the certificate on the VM. Nothing here is committed:
+      # a self-signed certificate in the repository would be a certificate
+      # whose private key is public, which is worse than no certificate at all
+      # because it looks like one.
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      portal:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # Through the front door rather than against the config: this proves nginx
+      # is up, holding a certificate, and proxying to a portal that answers.
+      test: ["CMD-SHELL", "wget -q --no-check-certificate -O /dev/null https://127.0.0.1/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  # Both are named so that their contents outlive the containers, and so that
+  # `docker compose down -v` is an explicit act rather than a side effect of
+  # recreating a service.
+  postgres_data:
+  portal_data:

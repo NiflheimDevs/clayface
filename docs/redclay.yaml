@@ -138,6 +138,26 @@ core:
         - database_services
         - internal_services
 
+      # What is actually deployed, as of the application-tier cycle. The
+      # block above is intent; this is fact, and it is the part that goes
+      # stale — see docs/app01-design.md for the full design.
+      current_state:
+        built: true
+        provisioned_by:
+          terraform_module: terraform/modules/app
+          lab_yaml_key: app01
+          playbook: ansible/playbooks/app.yml
+          validator: ansible/playbooks/app_validate.yml
+        address: 10.0.0.30
+        containers:
+          - nginx (TLS termination, the only published port)
+          - portal (Go, the deliberately vulnerable application)
+          - postgres (the portal's own database)
+        not_yet:
+          - DMZ segmentation (still on the flat vm-br0 L2)
+          - IDP01-backed authentication (the portal carries a service
+            account as a credential; it does not federate)
+
     - name: IDP01
       type: identity_provider
       status: core
@@ -164,6 +184,23 @@ app01:
   principle: >
     Multiple logical applications and services should normally run as
     containers on APP01 instead of requiring separate VMs.
+
+  # The realized subset of `example_services` below. That list stays as
+  # intent — it is the shape a future service should slot into — but these
+  # three are what exists and what the attack scenarios target.
+  current_services:
+    - name: nginx
+      type: reverse_proxy
+      note: Terminates TLS with a self-signed certificate; the only
+        container that publishes a host port.
+    - name: portal
+      type: web_application
+      note: Go service. Deliberately vulnerable; the weakness toggles live
+        in lab.yaml under app.weaknesses and are documented in
+        docs/app01-design.md.
+    - name: postgres
+      type: database
+      note: Container-local, not reachable from outside the app01 host.
 
   example_services:
     - name: public_portal

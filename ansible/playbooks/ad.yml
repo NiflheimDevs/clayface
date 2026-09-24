@@ -104,6 +104,13 @@
     # the environment, so a fresh lab gets a known one; an existing one keeps
     # whatever it has.
     #
+    # A user may name its own password environment variable with
+    # `password_env:` in lab.yaml. Only svc-app-portal does: APP01 plants that
+    # credential in its config and in its database, so the account has to be
+    # rotatable without touching the human accounts, and the planted copy and
+    # the real one have to be the same string. When the variable is unset the
+    # account falls back to the shared lab password like everyone else.
+    #
     # groups.add is additive for the same reason the nesting is: membership
     # drift is a finding, not something to repair silently.
     - name: Create the lab user accounts
@@ -113,7 +120,9 @@
         upn: "{{ item.key }}@{{ lab_ad_domain }}"
         path: "{{ ad_ou_dn[item.value.ou] }}"
         description: "{{ item.value.description }}"
-        password: "{{ lab_user_pass }}"
+        password: >-
+          {{ (lookup('env', item.value.password_env) | default(lab_user_pass, true))
+             if item.value.password_env is defined else lab_user_pass }}
         update_password: on_create
         enabled: true
         groups:

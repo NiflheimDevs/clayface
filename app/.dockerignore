@@ -1,0 +1,31 @@
+# Keep the build context small without breaking the build.
+#
+# vendor/ is deliberately NOT listed here, and that is the whole reason this
+# file is written by hand rather than generated. The image is built with
+# -mod=vendor on a host that may have no network, so the vendored dependencies
+# must travel in the context. Excluding vendor/ — which is what a "clean"
+# dockerignore template would do, on the assumption that the build fetches its
+# own modules — turns the build into a failure.
+#
+# Nothing under internal/seed/documents/ may be excluded either, for a different
+# reason: those files are compiled into the binary with //go:embed, so a missing
+# one fails the build with "no matching files found" rather than failing at
+# runtime. This is why there is no blanket *.md rule below.
+
+.git
+.gitignore
+
+# Real credentials live here, and the image must never carry them: the
+# application reads them from the environment at run time.
+.env
+.env.*
+
+# Generated on the VM by Ansible, mounted into the nginx container at run time.
+certs/
+
+# Mounted into the nginx container at run time and not needed to build the Go
+# binary.
+nginx/
+docker-compose.yml
+
+*.log

@@ -3,10 +3,18 @@
 Design for the Active Directory identity layer of the Clayface lab: the OUs,
 users, groups, memberships, policies, and the contract between AD and IDP01.
 
-Status: **design, not built.** Today `dc01` is a bare forest — promoted by
-`ansible/playbooks/dc.yml`, with `client01` joined by `client.yml` and sitting
-in the default `CN=Computers` container. There are no custom OUs, users,
-groups, or GPOs. This document specifies them.
+Status: **the playbook is written; the layer has not been run.** Everything in
+this document that is implemented lives in `ansible/playbooks/ad.yml`, which
+`deploy.sh` now runs after `dc.yml` and `client.yml`. It has never executed
+against a live forest — the lab was down when it was written — so treat this as
+a specification with an implementation attached, not as a description of a
+working domain. `dc01` is still, as far as anyone has observed, a bare forest:
+promoted by `ansible/playbooks/dc.yml`, with `client01` joined by `client.yml`
+and sitting in the default `CN=Computers` container. There are no custom OUs,
+users, groups, or GPOs on disk. This document specifies them.
+
+Sections 1, 1.1, 4, 4.1, 4.2 and 10 were corrected when APP01 was built — see
+the note in section 1. The IDP01 half remains a contract for a later cycle.
 
 The forest is **`clayface.local`**, NetBIOS **`CLAYFACE`**. It is derived, not
 declared: `dc.yml` builds it from `LAB_DOMAIN` (default `clayface`). Any other
@@ -21,13 +29,21 @@ security groups, group nesting, domain account policy, Group Policy Objects,
 the CLIENT01 workstation policy set, Windows LAPS, and the AD-side half of the
 IDP01 integration.
 
-**Out of scope.** IDP01 and APP01 are designed here but not built. No VM, no
-terraform module, no playbook. The IDP01 section is a contract for a later
-cycle.
+**Out of scope.** IDP01 is designed here but not built. No VM, no terraform
+module, no playbook. The IDP01 section is a contract for a later cycle.
 
-**Explicitly rejected.** Domain-joining any Linux component. Making DB01 or
-APP01 depend on AD. Creating AD service accounts for components that do not
-consume AD. Any permission whose only justification is "to make AD matter".
+> **Update — APP01 is built, and it changed one thing in this document.**
+> `app01` now exists (`terraform/modules/app`, `playbooks/app.yml`, see
+> `docs/app01-design.md`), and it *does* consume AD: the portal carries a
+> directory credential for the service account `svc-app-portal`, and `ad.yml`
+> creates that account. Sections 1.1, 4 and 10 were written when it did not,
+> and have been corrected in place. Everything else here is unchanged — in
+> particular, **APP01 is still not domain-joined**, which is the rejection that
+> mattered.
+
+**Explicitly rejected.** Domain-joining any Linux component. Making DB01 depend
+on AD. Creating AD service accounts for components that do not consume AD. Any
+permission whose only justification is "to make AD matter".
 
 ### 1.1 The identity planes
 
@@ -40,21 +56,32 @@ APP   application authorization APP01 roles           its own store
 DB    database authorization    PostgreSQL roles      its own store
 ```
 
-Only two components consume AD:
+Only two components consume AD as an *authentication* dependency:
 
 - **CLIENT01** — employees authenticate directly against AD (Kerberos/NTLM
   domain logon). This is the traditional enterprise identity plane.
 - **IDP01** — uses AD as an upstream *user store* and *credential validator*.
   It does not federate with AD in the protocol sense; see section 11.
 
-APP01 and DB01 do not consume AD at all. Their "service accounts" are a
-PostgreSQL role and application configuration — local artefacts, not directory
-objects. OPNsense does not authenticate against AD in this design. Kali and
-any attacker system are outside the identity plane entirely.
+APP01 is a third consumer, of a different kind: it is **not** domain-joined and
+nothing on it authenticates *to* AD, but the portal holds a directory
+credential for `svc-app-portal` and uses it as a service identity. That account
+is a real directory object, created by `ad.yml`. The design deliberately makes
+that credential reachable through the application's own weaknesses — a database
+dump yields it — which is what turns a Linux foothold into a domain credential.
+`docs/app01-design.md` is the authority on the application side; section 10
+below lists the edge in the attack graph.
 
-The consequence that matters: **there is exactly one AD service account in this
-design** (`svc-idp-ldap`), because there is exactly one non-Windows consumer
-that genuinely needs directory access.
+DB01 does not consume AD. Its "service account" is a PostgreSQL role — a local
+artefact, not a directory object. OPNsense does not authenticate against AD in
+this design. Kali and any attacker system are outside the identity plane
+entirely.
+
+The consequence that matters: **there are two AD service accounts in this
+design** — `svc-idp-ldap` for IDP01, and `svc-app-portal` for APP01 — because
+there are two non-Windows consumers with a genuine reason to hold a directory
+identity. Neither has an SPN, group membership, or any right beyond what its
+own function needs; see sections 4 and 10.
 
 ---
 
@@ -154,6 +181,7 @@ Five named accounts plus the built-in `Administrator`. Six objects total.
 | `abed.nad` | IT admin / helpdesk | `OU=Users` | `GG-Employees`, `GG-IT-Admins` | local admin on CLIENT01; LAPS read | CLIENT01 logon; workstation support |
 | `adm-hermione` | Tier-0 administrator | `OU=Users` | `Domain Admins` | domain-wide | DC administration |
 | `svc-idp-ldap` | Directory bind account for IDP01 | `OU=ServiceAccounts` | none | read-only, scoped to two OUs | IDP01 |
+| `svc-app-portal` | Service identity for APP01's portal | `OU=ServiceAccounts` | none | none in AD; its credential is planted in the portal and its database | APP01 |
 | `Administrator` | Built-in. Ansible transport + break-glass | `CN=Users` (built-in) | `Domain Admins` | domain-wide | Ansible over WinRM |
 
 ### 4.1 Why these, and what was rejected
@@ -178,17 +206,23 @@ in `GG-IT-Admins`. Tier-0 does not belong in the group that grants workstation
 local admin — that membership would quietly make every tier-0 account a local
 admin everywhere.
 
-**`svc-idp-ldap` is the only AD service account**, and it exists because IDP01
-is the only component that genuinely needs to read the directory. It is a plain
-user object rather than a gMSA, for two reasons: a gMSA's 240-character
-machine-managed password cannot be transported to a Linux host as a bind
-credential without a keytab, and a gMSA cannot be Kerberoasted, which would
-remove a scenario rather than add one. See weakness W1.
+**`svc-idp-ldap` and `svc-app-portal` are the two AD service accounts.** Each
+exists because a non-Windows component genuinely holds a directory identity.
+`svc-idp-ldap` reads the directory; `svc-app-portal` does not read it at all —
+its account exists so that the portal's *planted* credential is a real one, and
+so that stealing it is worth something. Both are plain user objects rather than
+gMSAs, for two reasons: a gMSA's 240-character machine-managed password cannot
+be transported to a Linux host as a bind credential without a keytab, and a
+gMSA cannot be Kerberoasted, which would remove a scenario rather than add one.
+See weakness W1.
 
 **Rejected accounts:**
 
-- AD accounts for APP01 or DB01 — neither consumes AD. Their service identity
-  is a PostgreSQL role and application config.
+- AD accounts for DB01 — it does not consume AD. Its service identity is a
+  PostgreSQL role.
+- A distinct application account per portal role — APP01's roles are its own
+  store, and multiplying directory objects for them would invent an AD
+  dependency the application does not have.
 - A dedicated security/admin account distinct from `adm-hermione` — a third
   privileged identity with no consumer.
 - Departmental users (HR, finance, …) — no OU, no resource, and no GPO targets
@@ -203,6 +237,15 @@ Account passwords come from `LAB_USER_PASS` (new env var, read by
 `LAB_WIN_ADMIN_PASS` is already handled — **never committed to `lab.yaml`**.
 `lab.yaml` holds usernames, OUs, groups, and memberships (facts); the secrets
 come from the environment.
+
+**One account is the exception.** `svc-app-portal` names its own password
+variable in `lab.yaml` (`password_env: LAB_SVC_APP_PASS`) so that it rotates
+separately from the human accounts. The reason is on the application side:
+APP01 plants that same string in its configuration and in its database, so the
+planted copy and the real account must be the same string, and rotating it must
+not mean rotating `ron.weas`. When the variable is unset the account falls back
+to the shared lab password like everyone else — which works, but only as long
+as it is set *before* `ad.yml` first creates the account.
 
 The baseline gives every human the same lab password. That is a deliberate
 deviation and it is recorded in section 14, not an oversight: it is what makes
@@ -717,7 +760,8 @@ Kali → initial access → credential discovery → AD enumeration
 | AD groups → IDP01 roles | **Authorization bypass.** If the mapping is widened, group membership becomes application privilege. This is the one edge where an AD change has consequences outside AD |
 | `adm-hermione` in `Domain Admins` | **Privilege escalation target.** The tier-0 account is what the chain is ultimately climbing toward |
 | Deny-logon rights on `adm-hermione` | **The boundary that makes the previous row interesting.** Without it, tier-0 on a workstation is normal behaviour, not an attack |
-| APP01 → PostgreSQL | **Data access.** The final step. Deliberately outside AD — it is a separate identity plane, which is precisely why the boundary is worth preserving |
+| `svc-app-portal` → APP01 configuration and database | **The Linux-to-AD pivot.** The portal's own weaknesses expose a credential for a real directory account, so compromising APP01 yields an AD identity. This is the edge that makes APP01 matter to *this* document rather than only to the application design |
+| APP01 → PostgreSQL | **Data access.** Deliberately outside AD — it is a separate identity plane, which is precisely why the boundary is worth preserving. It is also where `svc-app-portal`'s credential is planted, which is what makes the row above reachable |
 
 The chain has a clean shape: an employee credential gives a foothold, local
 admin on the workstation converts that into domain credentials, and one of

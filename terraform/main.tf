@@ -109,3 +109,33 @@ module "client_host_b" {
 
   name = each.key
 }
+
+module "app_host_a" {
+  source = "./modules/app"
+
+  providers = {
+    libvirt = libvirt.host_a
+  }
+
+  for_each = {
+    for name, p in local.vm_placements :
+    name => p if p["host"] == "host_a" && p["module"] == "app"
+  }
+
+  name = each.key
+}
+
+module "app_host_b" {
+  source = "./modules/app"
+
+  providers = {
+    libvirt = libvirt.host_b
+  }
+
+  for_each = {
+    for name, p in local.vm_placements :
+    name => p if p["host"] == "host_b" && p["module"] == "app"
+  }
+
+  name = each.key
+}

@@ -155,6 +155,27 @@ ansible-playbook \
     -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
     "$ANSIBLE_DIR/playbooks/client.yml"
 
+# Builds the application tier: the container images are built here on the
+# control node, shipped to app01 as a docker-save tarball, loaded and brought
+# up with docker compose. Needs a running docker daemon on this machine, and
+# LAB_APP_SSH_PASS / LAB_APP_DB_PASS / LAB_SVC_APP_PASS (optional; defaults).
+# Runs after client.yml only because it is independent of the domain — app01
+# is not domain-joined, it carries a service account as a credential.
+step "Ansible: deploy the application tier (app.yml)"
+ansible-playbook \
+    -i "$ANSIBLE_DIR/inventory/lab_inventory.py" \
+    -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
+    "$ANSIBLE_DIR/playbooks/app.yml"
+
+# Read-only. Runs each planted weakness over HTTPS against the running stack
+# and asserts it works, keyed to app.weaknesses in lab.yaml; a toggle that
+# is off is asserted to fail instead. No lab mutation, no restarts.
+step "Ansible: validate the application tier (app_validate.yml)"
+ansible-playbook \
+    -i "$ANSIBLE_DIR/inventory/lab_inventory.py" \
+    -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
+    "$ANSIBLE_DIR/playbooks/app_validate.yml"
+
 # Read-only. Asserts the identity layer is what docs/ad-identity-design.md
 # says it is, including the negative cases — a workstation that did not
 # receive policy, a tier-0 account that can administer one, a delegation

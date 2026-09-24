@@ -1,0 +1,796 @@
+---
+# The Clayface application host (app01, role "app"): builds the portal image
+# on the control node, ships it to the VM in one tarball, and brings the
+# compose stack up. playbooks/app_validate.yml is what proves the result.
+#
+# What it does (idempotent):
+#   Play 1, control node:
+#     1. verifies the docker CLI and a REACHABLE docker daemon (the daemon is
+#        never started from here - see the failure message)
+#     2. builds the portal image (clayface/portal:lab) from this repo's app/
+#        directory, stamped with a label carrying a digest of the app
+#        sources, so a second run with unchanged sources does not rebuild
+#     3. pulls the two third-party images (postgres:16-alpine and
+#        nginx:1.27-alpine) only when they are absent. A tag that is already
+#        present is never re-pulled, so a deploy cannot silently move the
+#        database or proxy version
+#     4. packs ALL THREE images into one tarball (docker save) for the VM
+#   Play 2, the app VM (SSH as the `clayface` user):
+#     1. asserts the hand-built base image is what we think it is: docker,
+#        the docker compose v2 plugin, docker socket access, sudo. It never
+#        installs or repairs anything - a gap fails with a message naming it
+#     2. creates /opt/clayface/app, owned by clayface
+#     3. copies the tarball and runs docker load. The VM never reaches a
+#        registry: the compose file sets pull_policy: never
+#     4. ships app/docker-compose.yml and app/nginx/nginx.conf verbatim
+#     5. generates the self-signed TLS keypair ON THE VM, and never again:
+#        the `creates:` guard leaves an existing certificate alone, because
+#        regenerating it would be a silent change to the lab
+#     6. renders /opt/clayface/app/.env - the stack's entire configuration,
+#        including the eleven WEAK_* toggles from lab.yaml
+#     7. docker compose up --detach, then waits for both published ports to
+#        answer (from the control node, the same vantage point
+#        app_validate.yml asserts from) and for one running container per
+#        service
+#
+# Order: it is independent of the AD layer, so it runs after client.yml and
+# immediately before app_validate.yml - last in deploy.sh.
+#
+# What it does NOT do:
+#   - install, upgrade or repair anything on the VM. Docker and the compose
+#     plugin are part of the base image; they are asserted, never installed
+#   - start the docker daemon on the control node
+#   - publish anything but nginx's ports (80/443). The portal and the
+#     database stay on the compose network
+#   - touch any other VM or the lab network (no firewall, no DNS)
+#
+# Run (the same two inventories as every other playbook):
+#   ansible-playbook -i inventory/lab_inventory.py \
+#                    -i inventory/terraform_vms.py playbooks/app.yml
+#
+# Env overrides (deploy.sh exports them from deploy.env; all are optional):
+#   LAB_APP_SOURCE_DIR      repo directory holding the app sources
+#                           (default <repo>/app)
+#   LAB_APP_HTTP_PORT       published plaintext port (default 80)
+#   LAB_APP_HTTPS_PORT      published TLS port (default 443)
+#   LAB_APP_DB_PASS         DB_PASSWORD in .env (default Clayface_DB_2024!,
+#                           the same string as the portal's compiled-in
+#                           fallback credential - see the var comment)
+#   LAB_APP_SESSION_SECRET  SESSION_SECRET in .env (default a fixed lab value)
+#   LAB_SVC_APP_USER        SERVICE_ACCOUNT_USER (default: lab.yaml's
+#                           `app.service_account`, i.e. svc-app-portal)
+#   LAB_SVC_APP_PASS        SERVICE_ACCOUNT_PASSWORD (default: LAB_USER_PASS,
+#                           itself defaulting to Passw0rd!Lab)
+#   LAB_APP_TLS_CN          certificate CN/SAN (default the VM's ansible_host)
+#   LAB_APP_IMAGE_TARBALL   tarball path on the control node
+#                           (default /tmp/clayface-app-images.tar)
+#   LAB_APP_HEALTH_TIMEOUT  seconds to wait for the published ports
+#                           (default 120)
+#
+# The weakness toggles are NOT overridable here. They are static lab facts
+# and live only in lab.yaml (`app.weaknesses`), per CLAUDE.md's data-flow
+# rule; this play renders them into .env and nothing else.
+
+# ============================================================
+# Play 1 - control node: build the images, pack one tarball
+# ============================================================
+- name: Build the application images on the control node
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # App sources: Dockerfile (build context), docker-compose.yml and
+    # nginx/nginx.conf (shipped verbatim). Derived from this file's location
+    # so the play works from any working directory.
+    app_source_dir: >-
+      {{ lookup('env', 'LAB_APP_SOURCE_DIR')
+         | default(playbook_dir ~ '/../../app', true) }}
+    app_required_files:
+      - Dockerfile
+      - docker-compose.yml
+      - nginx/nginx.conf
+
+    # Image names are fixed by the app/ contract: the compose file on the VM
+    # refers to exactly these and sets pull_policy: never, so the VM only
+    # ever runs what this play packed. All three have to be listed here —
+    # the proxy included, even though nothing builds it locally: it is a
+    # third-party tag like the database one, and leaving it out means
+    # `docker compose up` on the VM fails on an image that was never loaded,
+    # because pull_policy: never forbids fetching it there.
+    app_portal_image: clayface/portal:lab
+    app_db_image: postgres:16-alpine
+    app_proxy_image: nginx:1.27-alpine
+
+    # ONE tarball carries all three images; play 2 copies it to the VM.
+    app_control_tarball: >-
+      {{ lookup('env', 'LAB_APP_IMAGE_TARBALL')
+         | default('/tmp/clayface-app-images.tar', true) }}
+
+    # Label stamped into the portal image with the source digest. No dots:
+    # Jinja's map(attribute=...) splits its argument on '.', so a dotted
+    # label key cannot be read back out of `docker image inspect`.
+    app_digest_label: clayface-source-digest
+
+  pre_tasks:
+    # app.yml is a no-op without an app VM, and a silent no-op is the one
+    # outcome a deploy must not have - the group comes from terraform's
+    # `vms` output via inventory/terraform_vms.py.
+    - name: Fail if the inventory has no app VM
+      ansible.builtin.assert:
+        that: groups['vms_app'] | default([]) | length > 0
+        fail_msg: >-
+          No hosts in `vms_app`. Is app01 in lab.yaml `vm_placements` (with
+          its `ip:`) and did `terraform apply` run? The group is built by
+          inventory/terraform_vms.py from terraform's `vms` output.
+
+    - name: Check that the docker CLI is installed here
+      ansible.builtin.command:
+        cmd: docker --version
+      register: app_docker_cli
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if this machine has no docker CLI
+      ansible.builtin.fail:
+        msg: >-
+          `docker` is not on PATH on the control node, so the portal image
+          cannot be built. Install docker (or run this play from a machine
+          that has it) - the image is built here, not on the VM.
+      when: app_docker_cli.rc | default(1) != 0
+
+    # The daemon is detected, never started: starting it is a host-level
+    # decision (and on many distributions needs root), so this play stops
+    # with an instruction instead of touching system services.
+    - name: Check that the docker daemon is reachable
+      ansible.builtin.command:
+        cmd: docker info
+      register: app_docker_info
+      changed_when: false
+      failed_when: false
+
+    - name: Fail with an actionable message when the daemon is not running
+      ansible.builtin.fail:
+        msg: |
+          The docker daemon is not reachable from the control node:
+
+          {{ app_docker_info.stderr | default('') | trim | default('docker info failed', true) }}
+
+          Start it yourself (`sudo systemctl start docker`) and re-run, or
+          make sure this user can use the docker socket (group `docker`).
+          This playbook does not start system services: the images are built
+          here, so the daemon has to be up before it runs.
+      when: app_docker_info.rc | default(1) != 0
+
+    - name: Stat the app sources this play needs
+      ansible.builtin.stat:
+        path: "{{ app_source_dir }}/{{ item }}"
+      register: app_source_stat
+      loop: "{{ app_required_files }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Fail if any app source file is missing
+      ansible.builtin.fail:
+        msg: |
+          These files are missing from {{ app_source_dir }}:
+
+          {% for f in app_source_stat.results | rejectattr('stat.exists') %}  {{ f.item }}
+          {% endfor %}
+          The image is built from app/Dockerfile and the other two are copied
+          to the VM, so all three are required. Set LAB_APP_SOURCE_DIR if the
+          app sources live somewhere else.
+      when: app_source_stat.results | rejectattr('stat.exists') | list | length > 0
+
+  tasks:
+    # ------------------------------------------------------------
+    # 1. Fingerprint the sources + look at what is already built
+    # ------------------------------------------------------------
+    # Content, not timestamps: renaming a file changes the digest (the name
+    # is in the hashed line), touching one does not. chdir + relative names
+    # keep the digest independent of where the checkout lives.
+    - name: Compute a digest of the app sources
+      ansible.builtin.shell:
+        cmd: >-
+          find . -type f -print0 | sort -z | xargs -0 sha256sum
+          | sha256sum | cut -d' ' -f1
+        chdir: "{{ app_source_dir }}"
+      register: app_source_digest
+      changed_when: false
+
+    - name: Look for an existing portal image here
+      ansible.builtin.command:
+        cmd: docker image inspect {{ app_portal_image }}
+      register: app_portal_inspect
+      changed_when: false
+      failed_when: false
+
+    # `docker image inspect` prints a JSON array (empty when the image is
+    # absent). map(attribute=..., default=...) is what makes this safe to
+    # read: chained attribute access on a missing key raises instead of
+    # yielding an empty string.
+    - name: Read the source digest stamped into that image
+      ansible.builtin.set_fact:
+        app_portal_digest: >-
+          {{ app_portal_inspect.stdout | default('[]', true) | from_json | list
+             | map(attribute='Config', default={})
+             | map(attribute='Labels', default={})
+             | map(attribute=app_digest_label, default='')
+             | first | default('', true) }}
+
+    # ------------------------------------------------------------
+    # 2. Build the portal image (only when the sources changed)
+    # ------------------------------------------------------------
+    - name: Build the portal image from the app sources
+      ansible.builtin.command:
+        cmd: >-
+          docker build --quiet
+          --label {{ app_digest_label }}={{ app_source_digest.stdout | trim }}
+          --tag {{ app_portal_image }} {{ app_source_dir }}
+      register: app_portal_build
+      when: >-
+        app_portal_inspect.rc | default(1) != 0
+        or app_portal_digest != (app_source_digest.stdout | trim)
+      changed_when: true
+
+    # ------------------------------------------------------------
+    # 3. Third-party images: pull only when absent
+    # ------------------------------------------------------------
+    - name: Look for an existing database image here
+      ansible.builtin.command:
+        cmd: docker image inspect {{ app_db_image }}
+      register: app_db_inspect
+      changed_when: false
+      failed_when: false
+
+    - name: Pull the database image (only when it is absent)
+      ansible.builtin.command:
+        cmd: docker pull {{ app_db_image }}
+      register: app_db_pull
+      when: app_db_inspect.rc | default(1) != 0
+      changed_when: true
+
+    - name: Look for an existing proxy image here
+      ansible.builtin.command:
+        cmd: docker image inspect {{ app_proxy_image }}
+      register: app_proxy_inspect
+      changed_when: false
+      failed_when: false
+
+    - name: Pull the proxy image (only when it is absent)
+      ansible.builtin.command:
+        cmd: docker pull {{ app_proxy_image }}
+      register: app_proxy_pull
+      when: app_proxy_inspect.rc | default(1) != 0
+      changed_when: true
+
+    # ------------------------------------------------------------
+    # 4. One tarball for all three images
+    # ------------------------------------------------------------
+    - name: Check whether the image tarball is already here
+      ansible.builtin.stat:
+        path: "{{ app_control_tarball }}"
+      register: app_tarball_stat
+
+    # Repacked when any image moved, or when the tarball is gone. Play 2
+    # copies this file by checksum, so the copy (and the docker load that
+    # follows it) only happens when its content actually changed.
+    - name: Pack all three images into one tarball for the VM
+      ansible.builtin.command:
+        cmd: >-
+          docker save --output {{ app_control_tarball }}
+          {{ app_portal_image }} {{ app_db_image }} {{ app_proxy_image }}
+      register: app_tarball_save
+      when: >-
+        not (app_tarball_stat.stat.exists | default(false))
+        or app_portal_build is changed
+        or app_db_pull is changed
+        or app_proxy_pull is changed
+      changed_when: true
+
+    - name: Report what play 2 will ship
+      ansible.builtin.debug:
+        msg: |
+          app sources    : {{ app_source_dir }}
+          source digest  : {{ app_source_digest.stdout | trim }}
+             portal image: {{ app_portal_image }}
+                          {{ 'rebuilt' if app_portal_build is changed
+                             else 'unchanged (digest ' ~ (app_portal_digest | default('none', true)) ~ ')' }}
+             database    : {{ app_db_image }}
+                          {{ 'pulled' if app_db_pull is changed else 'already present, not re-pulled' }}
+             proxy       : {{ app_proxy_image }}
+                          {{ 'pulled' if app_proxy_pull is changed else 'already present, not re-pulled' }}
+          tarball        : {{ app_control_tarball }}
+                          {{ 'repacked' if app_tarball_save is changed else 'already current' }}
+
+# ============================================================
+# Play 2 - the app VM: ship the stack and bring it up
+# ============================================================
+- name: Deploy the application stack on the app VM
+  hosts: vms_app
+  gather_facts: false
+
+  # The play runs as the login user (clayface): the files in the project
+  # directory are then owned by clayface, and `docker compose` runs as the
+  # same user a human would use. Only creating /opt/clayface/app needs root,
+  # which the one task that does it asks for explicitly.
+  become: false
+
+  vars:
+    app_source_dir: >-
+      {{ lookup('env', 'LAB_APP_SOURCE_DIR')
+         | default(playbook_dir ~ '/../../app', true) }}
+    app_control_tarball: >-
+      {{ lookup('env', 'LAB_APP_IMAGE_TARBALL')
+         | default('/tmp/clayface-app-images.tar', true) }}
+
+    # Compose project directory on the VM (owned by clayface) and the two
+    # repo files that land in it. Everything else in there is generated:
+    # .env by this play, certs/ by openssl.
+    app_dir: /opt/clayface/app
+    app_owner: clayface
+    # `certs`, a sibling of the compose file, NOT `nginx/certs`: the compose
+    # file bind-mounts ./certs to /etc/nginx/certs in the container, and that
+    # relative path is resolved against the compose project directory. The
+    # path nginx sees inside the container is a separate thing and is set in
+    # nginx/nginx.conf.
+    app_tls_dir: "{{ app_dir }}/certs"
+    app_env_file: "{{ app_dir }}/.env"
+    app_images_tarball: "{{ app_dir }}/clayface-app-images.tar"
+    app_images_tarball: "{{ app_dir }}/clayface-app-images.tar"
+
+    # The three image tags. Play 1 (control node) builds/pulls these; play 2
+    # needs the same names to `docker image inspect` and `docker load` them,
+    # and play vars do not cross play boundaries - hence the repeat.
+    app_portal_image: clayface/portal:lab
+    app_db_image: postgres:16-alpine
+    app_proxy_image: nginx:1.27-alpine
+
+
+    # The three compose services, and the ports ONLY nginx publishes. Both
+    # port numbers are single-sourced here and read by app_validate.yml from
+    # the same env vars.
+    app_compose_services:
+      - portal
+      - nginx
+      - postgres
+    app_http_port: "{{ lookup('env', 'LAB_APP_HTTP_PORT') | default(80, true) }}"
+    app_https_port: "{{ lookup('env', 'LAB_APP_HTTPS_PORT') | default(443, true) }}"
+    app_health_timeout: >-
+      {{ lookup('env', 'LAB_APP_HEALTH_TIMEOUT') | default(120, true) }}
+
+    # .env values. Passwords come from the environment (deploy.env) and are
+    # deliberately weak lab defaults; never from lab.yaml, which holds no
+    # credentials at all.
+    #
+    # The database password default is not a free choice: it is the same string
+    # as the `hardcodedDBPassword` constant compiled into the portal
+    # (app/internal/config/config.go). That coincidence is the weakness. The
+    # toggle is documented as "anyone who obtains the image obtains a working
+    # database password", and that sentence is only true while the deployed
+    # password and the literal are the same value. Change one, change both.
+    app_db_pass: >-
+      {{ lookup('env', 'LAB_APP_DB_PASS') | default('Clayface_DB_2024!', true) }}
+    app_session_secret: >-
+      {{ lookup('env', 'LAB_APP_SESSION_SECRET')
+         | default('clayface-lab-session-secret', true) }}
+    app_svc_user: >-
+      {{ lookup('env', 'LAB_SVC_APP_USER')
+         | default((lab_app | default({}, true)).service_account
+                   | default('svc-app-portal', true), true) }}
+    # The account named above is an ordinary AD user (lab.yaml `ad.users`) that
+    # merely names its own password variable, so its unset-fallback is the house
+    # default for every lab account - the same chain ad.yml walks. The planted
+    # copy and the real account have to be the same string, or "dump the
+    # database, take the credential, use it against the DC" breaks.
+    app_svc_pass: >-
+      {{ lookup('env', 'LAB_SVC_APP_PASS')
+         | default(lookup('env', 'LAB_USER_PASS') | default('Passw0rd!Lab', true),
+                   true) }}
+    app_tls_cn: >-
+      {{ lookup('env', 'LAB_APP_TLS_CN') | default(ansible_host, true) }}
+
+    # The eleven weakness toggles, lowercase, exactly as lab.yaml spells them
+    # (`app.weaknesses`). The env var rendered into .env is
+    # `WEAK_` + the key uppercased - that mapping is the whole point of
+    # keeping this list here. A key lab.yaml does not mention renders as true
+    # (the documented default), and a key lab.yaml has that is NOT in this
+    # list would go unrendered - the pre_task below reports both.
+    app_weakness_keys:
+      - sqli_login
+      - sqli_search
+      - command_injection_diagnostics
+      - idor_documents
+      - broken_admin_authz
+      - path_traversal_download
+      - hardcoded_db_credentials
+      - forgeable_session_token
+      - service_account_credential_in_db
+      - ssrf_url_fetch
+      - verbose_errors_debug_endpoint
+    app_weaknesses: "{{ (lab_app | default({}, true)).weaknesses | default({}, true) }}"
+
+    # The .env the stack reads, rendered inline (there is no template file:
+    # the contract for this file is entirely in this play). Everything not
+    # listed as an env var above is a fixed interface value - DB_HOST etc.
+    # name services on the compose network, not lab hosts, so they are not
+    # lab.yaml facts and do not belong there.
+    app_env_content: |
+      # Rendered by ansible/playbooks/app.yml. Do not edit on the VM: the
+      # next deploy overwrites this file.
+      #
+      # Values come from the environment (LAB_APP_DB_PASS,
+      # LAB_APP_SESSION_SECRET, LAB_SVC_APP_PASS) and the WEAK_* toggles come
+      # from lab.yaml `app.weaknesses`.
+      DB_HOST=postgres
+      DB_PORT=5432
+      DB_NAME=clayface
+      DB_USER=clayface_app
+      DB_PASSWORD={{ app_db_pass }}
+      SESSION_SECRET={{ app_session_secret }}
+      SERVICE_ACCOUNT_USER={{ app_svc_user }}
+      SERVICE_ACCOUNT_PASSWORD={{ app_svc_pass }}
+      DATA_DIR=/data
+      LISTEN_ADDR=:8080
+      {% for key in app_weakness_keys %}
+      WEAK_{{ key | upper }}={{ (app_weaknesses[key] | default(true) | bool) | ternary('true', 'false') }}
+      {% endfor %}
+
+  pre_tasks:
+    # ------------------------------------------------------------
+    # The base image is asserted, never repaired. Everything below
+    # is a precondition of the hand-built app-base image.
+    # ------------------------------------------------------------
+    - name: Fail if lab.yaml has no usable `app.weaknesses` map
+      ansible.builtin.assert:
+        that: app_weaknesses | length > 0
+        fail_msg: >-
+          lab.yaml has no `app.weaknesses` map (or it is empty), so the
+          stack's deliberate weaknesses cannot be rendered into .env. They
+          are static lab facts and belong in lab.yaml next to vm_placements,
+          not in this playbook.
+
+    - name: Note which toggles lab.yaml leaves out
+      ansible.builtin.set_fact:
+        app_weakness_defaulted: "{{ app_weakness_keys | reject('in', app_weaknesses) | list }}"
+
+    - name: Warn about toggles that fall back to their default
+      ansible.builtin.debug:
+        msg: >-
+          lab.yaml `app.weaknesses` does not mention
+          {{ app_weakness_defaulted | join(', ') }}. They are rendered as
+          true (the documented default); spell them out in lab.yaml so the
+          lab's state is stated rather than implied.
+      when: app_weakness_defaulted | length > 0
+
+    # A key in lab.yaml that is not in app_weakness_keys would never reach
+    # .env: the app would silently run without that weakness, which is
+    # exactly the kind of drift app_validate.yml exists to catch.
+    - name: Note any toggle in lab.yaml this play does not know
+      ansible.builtin.set_fact:
+        app_weakness_unknown: "{{ app_weaknesses.keys() | reject('in', app_weakness_keys) | list }}"
+
+    - name: Warn about unknown toggles
+      ansible.builtin.debug:
+        msg: >-
+          lab.yaml `app.weaknesses` declares
+          {{ app_weakness_unknown | join(', ') }}, which this play does not
+          render into .env and app_validate.yml does not assert. Either the
+          toggle list in both playbooks is stale, or the key is a typo.
+      when: app_weakness_unknown | length > 0
+
+    - name: Check that the docker CLI is present on the VM
+      ansible.builtin.command:
+        cmd: docker --version
+      register: app_docker_cli
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if docker is missing from the base image
+      ansible.builtin.fail:
+        msg: >-
+          `docker` is missing on {{ inventory_hostname }}. The app VM runs a
+          hand-built Ubuntu base image that must already carry Docker and
+          the compose v2 plugin - this playbook asserts the image, it never
+          installs anything. Rebuild app-base.qcow2 per base-image/README.md.
+      when: app_docker_cli.rc | default(1) != 0
+
+    - name: Check that the docker compose v2 plugin is present
+      ansible.builtin.command:
+        cmd: docker compose version
+      register: app_compose_cli
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the compose v2 plugin is missing
+      ansible.builtin.fail:
+        msg: >-
+          `docker compose` is unavailable on {{ inventory_hostname }}. The
+          stack is brought up with the compose v2 plugin (the docker-compose
+          v1 Python script is NOT used), so the base image needs the
+          docker-compose-plugin package. This playbook asserts the image, it
+          never installs anything.
+      when: app_compose_cli.rc | default(1) != 0
+
+    # `docker info` is the socket check: the CLI alone proves nothing about
+    # whether `clayface` may talk to the daemon.
+    - name: Check that the login user can reach the docker daemon
+      ansible.builtin.command:
+        cmd: docker info
+      register: app_docker_info
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the docker daemon is not usable by this user
+      ansible.builtin.fail:
+        msg: |
+          `docker info` failed for {{ ansible_user }} on
+          {{ inventory_hostname }}:
+
+          {{ app_docker_info.stderr | default('') | trim | default('docker info failed', true) }}
+
+          Either the daemon is not running, or {{ ansible_user }} is not in
+          the `docker` group and cannot use the socket. Every docker command
+          in this play runs as the login user, so the hand-built base image
+          has to grant that access - it is asserted here, not repaired.
+      when: app_docker_info.rc | default(1) != 0
+
+    # The sudoers question, asked the way it can be asked without escalating:
+    # on Ubuntu the `sudo` group is what /etc/sudoers grants. The tasks
+    # below exercise the escalation for real (they create /opt/clayface/app),
+    # so a broken sudo fails loudly there too.
+    # - name: Read the login user's groups
+    #   ansible.builtin.command:
+    #     cmd: id -nG
+    #   register: app_user_groups
+    #   changed_when: false
+    #   failed_when: false
+    #
+    # - name: Fail if the login user cannot escalate with sudo
+    #   ansible.builtin.fail:
+    #     msg: >-
+    #       {{ ansible_user }} is in
+    #       "{{ app_user_groups.stdout | default('no groups at all', true) | trim }}"
+    #       on {{ inventory_hostname }}, which does not include `sudo` (or
+    #       `wheel`). This play needs root once - to create
+    #       {{ app_dir }} - and the base image is asserted, not repaired: add
+    #       the user to `sudo` when building it. Check LAB_APP_SSH_PASS too if
+    #       the password is the problem.
+    #   when: >-
+    #     not ('sudo' in (app_user_groups.stdout | default('', true)).split()
+    #          or 'wheel' in (app_user_groups.stdout | default('', true)).split())
+
+  tasks:
+    # ------------------------------------------------------------
+    # 1. Project directory (the only thing that needs root)
+    # ------------------------------------------------------------
+    - name: Create the compose project directory tree
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ app_owner }}"
+        mode: "0755"
+      become: true
+      loop:
+        - "{{ app_dir }}"
+        - "{{ app_dir }}/nginx"
+        - "{{ app_tls_dir }}"
+      loop_control:
+        label: "{{ item }}"
+
+    # ------------------------------------------------------------
+    # 2. Images: copy the tarball, load it when it changed
+    # ------------------------------------------------------------
+    - name: Ship the image tarball to the VM
+      ansible.builtin.copy:
+        src: "{{ app_control_tarball }}"
+        dest: "{{ app_images_tarball }}"
+        owner: "{{ app_owner }}"
+        mode: "0644"
+      register: app_tarball_copy
+
+    - name: Check whether the portal image is already loaded
+      ansible.builtin.command:
+        cmd: docker image inspect {{ app_portal_image }}
+      register: app_portal_loaded
+      changed_when: false
+      failed_when: false
+
+    - name: Check whether the database image is already loaded
+      ansible.builtin.command:
+        cmd: docker image inspect {{ app_db_image }}
+      register: app_db_loaded
+      changed_when: false
+      failed_when: false
+
+    - name: Check whether the proxy image is already loaded
+      ansible.builtin.command:
+        cmd: docker image inspect {{ app_proxy_image }}
+      register: app_proxy_loaded
+      changed_when: false
+      failed_when: false
+
+    # `docker load` has no "already loaded" mode: it always rewrites the tag,
+    # so it is guarded on the tarball having changed or an image being
+    # absent. That is what keeps a re-run from touching the stack.
+    - name: Load the images into the VM's docker daemon
+      ansible.builtin.command:
+        cmd: docker load --input {{ app_images_tarball }}
+      register: app_images_load
+      when: >-
+        app_tarball_copy is changed
+        or app_portal_loaded.rc | default(1) != 0
+        or app_db_loaded.rc | default(1) != 0
+        or app_proxy_loaded.rc | default(1) != 0
+      changed_when: true
+
+    # ------------------------------------------------------------
+    # 3. Compose file + nginx config, verbatim from the repo
+    # ------------------------------------------------------------
+    - name: Ship the compose file
+      ansible.builtin.copy:
+        src: "{{ app_source_dir }}/docker-compose.yml"
+        dest: "{{ app_dir }}/docker-compose.yml"
+        owner: "{{ app_owner }}"
+        mode: "0644"
+      register: app_compose_file
+
+    - name: Ship the nginx site configuration
+      ansible.builtin.copy:
+        src: "{{ app_source_dir }}/nginx/nginx.conf"
+        dest: "{{ app_dir }}/nginx/nginx.conf"
+        owner: "{{ app_owner }}"
+        mode: "0644"
+      register: app_nginx_conf
+
+    # ------------------------------------------------------------
+    # 4. TLS: generated once, on the VM, and never again
+    # ------------------------------------------------------------
+    - name: Check for an existing certificate
+      ansible.builtin.stat:
+        path: "{{ app_tls_dir }}/privkey.pem"
+      register: app_tls_key
+
+    # `creates:` is the idempotency: with the key present the task is
+    # skipped, so a re-run cannot rotate the certificate under the stack
+    # (which would be a silent change to the lab's TLS identity).
+    # umask 027: the key is readable by the nginx master process (root inside
+    # the container, the default for the nginx image) and by nobody else.
+    - name: Generate the self-signed certificate
+      ansible.builtin.shell:
+        cmd: >-
+          umask 027 &&
+          openssl req -x509 -nodes -newkey rsa:2048 -days 3650
+          -keyout {{ app_tls_dir }}/privkey.pem
+          -out {{ app_tls_dir }}/fullchain.pem
+          -subj '/CN={{ app_tls_cn }}'
+          -addext 'subjectAltName=DNS:{{ app_tls_cn }}'
+        creates: "{{ app_tls_dir }}/privkey.pem"
+      register: app_tls_generate
+
+    # The pair, not just the key: `creates:` only guards privkey.pem, and a
+    # half-written pair would leave nginx unable to start.
+    - name: Stat both halves of the certificate
+      ansible.builtin.stat:
+        path: "{{ app_tls_dir }}/{{ item }}"
+      register: app_tls_files
+      loop:
+        - privkey.pem
+        - fullchain.pem
+
+    - name: Fail if the certificate pair is incomplete
+      ansible.builtin.fail:
+        msg: >-
+          {{ app_tls_dir }} is missing
+          {{ app_tls_files.results | rejectattr('stat.exists')
+             | map(attribute='item') | join(', ') }}. The certificate is
+          generated once and then left alone, so remove the whole directory
+          (`rm -rf {{ app_tls_dir }}`) and re-run to have it generated again.
+      when: app_tls_files.results | rejectattr('stat.exists') | list | length > 0
+
+    # ------------------------------------------------------------
+    # 5. The environment file: the stack's whole configuration
+    # ------------------------------------------------------------
+    # Rendered from lab.yaml + the env overrides. no_log: it carries the
+    # database password, the session secret and the service account
+    # credential, and the project rule is that a password is never logged.
+    - name: Render the application environment file
+      ansible.builtin.copy:
+        content: "{{ app_env_content }}"
+        dest: "{{ app_env_file }}"
+        owner: "{{ app_owner }}"
+        mode: "0640"
+      register: app_env_rendered
+      no_log: true
+
+    # ------------------------------------------------------------
+    # 6. Bring the stack up and wait for it
+    # ------------------------------------------------------------
+    # Deliberately unconditional: `docker compose up --detach` is a
+    # convergence step - it recreates only the containers whose config or
+    # image changed and leaves the rest running. changed_when reads
+    # compose's own verdict rather than guessing.
+    - name: Bring the stack up
+      ansible.builtin.command:
+        cmd: docker compose up --detach
+        chdir: "{{ app_dir }}"
+      register: app_compose_up
+      changed_when: >-
+        ((app_compose_up.stdout | default('')) ~ (app_compose_up.stderr | default('')))
+        is search('Started|Created|Recreated')
+
+    # Both published ports, waited on from the CONTROL node: nginx is the
+    # only thing that listens on them, and reachability from here is what
+    # app_validate.yml needs before it starts asserting.
+    - name: Wait for the published ports to answer
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: "{{ item }}"
+        timeout: "{{ app_health_timeout }}"
+      delegate_to: localhost
+      loop:
+        - "{{ app_https_port }}"
+        - "{{ app_http_port }}"
+      loop_control:
+        label: "{{ ansible_host }}:{{ item }}"
+      changed_when: false
+
+    # Ports prove nginx; this proves the other two services. The compose
+    # project label is set by compose itself, so no project name has to be
+    # guessed here (it is derived from the directory name).
+    - name: Count the project's running containers
+      ansible.builtin.command:
+        cmd: >-
+          docker ps --quiet
+          --filter label=com.docker.compose.project.working_dir={{ app_dir }}
+      register: app_running
+      changed_when: false
+
+    - name: Assert every service has a running container
+      ansible.builtin.assert:
+        that: app_running.stdout_lines | length == app_compose_services | length
+        fail_msg: >-
+          Expected {{ app_compose_services | length }} running containers in
+          {{ app_dir }} ({{ app_compose_services | join(', ') }}), found
+          {{ app_running.stdout_lines | length }}. Run `docker compose ps`
+          and `docker compose logs` in {{ app_dir }} on the VM to see why.
+        success_msg: >-
+          {{ app_compose_services | length }} containers running
+          ({{ app_compose_services | join(', ') }}).
+
+    - name: Read the stack's state for the report
+      ansible.builtin.command:
+        cmd: docker compose ps
+        chdir: "{{ app_dir }}"
+      register: app_compose_ps
+      changed_when: false
+
+    - name: Report the deployed stack
+      ansible.builtin.debug:
+        msg: |
+          app01 stack ({{ ansible_host }}):
+            https      : https://{{ app_tls_cn }}:{{ app_https_port }}
+            http       : http://{{ ansible_host }}:{{ app_http_port }} (redirects to TLS in nginx)
+            project dir: {{ app_dir }} (owner {{ app_owner }})
+            compose    : {{ app_dir }}/docker-compose.yml
+            nginx      : {{ app_dir }}/nginx/nginx.conf
+            env        : {{ app_env_file }}
+            certificate: {{ app_tls_dir }} (CN {{ app_tls_cn }},
+                         {{ 'generated on this run' if app_tls_generate is changed
+                            else 'kept - never regenerated' }})
+            images     : {{ 'loaded from ' ~ app_images_tarball if app_images_load is changed
+                            else 'already present (tarball unchanged)' }}
+
+          Files re-rendered this run:
+          {{ ([ '  compose file' if app_compose_file is changed else '',
+                '  nginx.conf' if app_nginx_conf is changed else '',
+                '  .env' if app_env_rendered is changed else '' ]
+              | select | join('\n')) or '  nothing (all of them already correct)' }}
+
+          Weakness toggles written to .env (from lab.yaml `app.weaknesses`):
+          {% for key in app_weakness_keys %}  WEAK_{{ key | upper }}={{ (app_weaknesses[key] | default(true) | bool) | ternary('true', 'false') }}
+          {% endfor %}
+          app_validate.yml is what proves these behave as declared.
+
+          docker compose ps:
+          {{ app_compose_ps.stdout | default('(no output)', true) | indent(2) }}

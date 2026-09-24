@@ -10,6 +10,7 @@ groups so playbooks can target the VMs created by Terraform:
     vms_linux     : Linux guests — os_family "linux" (SSH)
     vms_dc        : Windows domain controllers, role "dc"
     vms_client    : Windows workstations, role "client"
+    vms_app       : application servers, role "app"
     vms_pinned    : VMs with both a pinned MAC and a static IP, i.e. the ones
                     playbooks/opnsense.yml manages as DHCP reservations
 
@@ -30,6 +31,14 @@ Windows hosts additionally expose WinRM connection variables:
 The connection is chosen by os_family, which terraform derives from the VM's
 module (see terraform/locals.tf `module_os`).
 
+Linux connection variables are NOT chosen by os_family, and that asymmetry is
+deliberate. "Linux" is one answer to how Ansible connects only in the sense
+that it is not WinRM: the alpine module's guests carry no credentials at all
+(they are console-installed, and nothing logs into them), so there is no
+connection story to share. Each Linux role that needs one declares its own,
+against the credentials its base image was actually built with. Only role
+"app" does today.
+
 The VM placement itself comes from lab.yaml (via terraform locals); this
 script only reads back what terraform derived from it.
 
@@ -49,6 +58,9 @@ Environment overrides:
     LAB_WIN_ADMIN_PASS   Windows Administrator password for os_family
                          "windows" VMs (default: Admin@123 — lab-only,
                          deliberately weak)
+    LAB_APP_SSH_PASS     Password of the `clayface` local account baked into
+                         the Ubuntu app base image; used for both the SSH
+                         login and sudo on role "app" VMs
 """
 
 import json
@@ -58,9 +70,11 @@ import sys
 
 LAB_DOMAIN = os.environ.get("LAB_DOMAIN", "clayface")
 LAB_WIN_ADMIN_PASS = os.environ.get("LAB_WIN_ADMIN_PASS", "Admin@123")
+LAB_APP_SSH_PASS = os.environ.get("LAB_APP_SSH_PASS", "Admin@123")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TERRAFORM_DIR = os.path.join(BASE_DIR, "..", "..", "terraform")
+
 
 def terraform_output(name):
     """Return a terraform output value, or None on any failure."""
@@ -107,6 +121,7 @@ def build_inventory():
         "vms_windows": {"hosts": []},
         "vms_dc": {"hosts": []},
         "vms_client": {"hosts": []},
+        "vms_app": {"hosts": []},
         "vms_pinned": {"hosts": []},
     }
 
@@ -139,6 +154,8 @@ def build_inventory():
             inventory["vms_dc"]["hosts"].append(name)
         elif role == "client":
             inventory["vms_client"]["hosts"].append(name)
+        elif role == "app":
+            inventory["vms_app"]["hosts"].append(name)
 
         hostvars = {
             "libvirt_hypervisor": hypervisor,
@@ -166,6 +183,19 @@ def build_inventory():
                 # which Kerberos does not.
                 "ansible_winrm_transport": "ntlm",
                 "ansible_winrm_scheme": "http",
+            })
+        elif role == "app":
+            hostvars.update({
+                "ansible_connection": "ssh",
+                "ansible_user": "clayface",
+                "ansible_password": LAB_APP_SSH_PASS,
+                # "ansible_become": True,
+                # "ansible_become_password": LAB_APP_SSH_PASS,
+                # The VM is created by terraform moments before this runs, so
+                # its host key cannot be known yet. accept-new trusts it on
+                # first use but still fails loudly if it ever changes, which
+                # is the useful half of host-key checking for a lab.
+                "ansible_ssh_common_args": "-o StrictHostKeyChecking=accept-new",
             })
 
         inventory["_meta"]["hostvars"][name] = hostvars

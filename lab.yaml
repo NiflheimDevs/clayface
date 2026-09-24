@@ -45,14 +45,18 @@ edge_vm:
 # reservation <name>.clayface never resolves, and the playbook that renames
 # the guest cannot reach it to do the renaming.
 vm_placements:
-  dc01:
-    module: dc
+  # dc01:
+  #   module: dc
+  #   host: host_a
+  #   ip: 10.0.0.10
+  # client01:
+  #   module: client
+  #   host: host_a
+  #   ip: 10.0.0.20
+  app01:
+    module: app
     host: host_a
-    ip: 10.0.0.10
-  client01:
-    module: client
-    host: host_a
-    ip: 10.0.0.20
+    ip: 10.0.0.30
   # alpine01:
   #   module: alpine
   #   host: host_a
@@ -113,6 +117,21 @@ ad:
       ou: ServiceAccounts
       groups: []
       description: Directory bind account for IDP01. Read-only, scoped.
+    svc-app-portal:
+      ou: ServiceAccounts
+      groups: []
+      description: >-
+        Service identity APP01's portal uses. No group memberships, so the
+        account's own rights are the whole of its reach — see
+        docs/app01-design.md, which plants its credential in the app config
+        and in the portal database on purpose.
+      # Name of the environment variable holding this account's password, so
+      # it rotates separately from the human accounts. ad.yml reads it; when
+      # it is unset the account falls back to LAB_USER_PASS like every other
+      # user. playbooks/app.yml reads the same variable for the credential it
+      # plants, which is what keeps the planted copy and the real one in
+      # agreement.
+      password_env: LAB_SVC_APP_PASS
 
   workstation:
     logon_group: GG-Employees
@@ -139,3 +158,44 @@ ad:
     unconstrained_delegation: false
     excessive_idp_directory_permissions: false
     excessive_group_membership: false
+
+# Application server (docs/app01-design.md).
+#
+# One VM running a containerised stack: nginx terminating TLS in front of a Go
+# "Clayface Portal" service backed by PostgreSQL. Only nginx publishes host
+# ports. The account named here is the AD service identity the portal carries;
+# it is defined under ad.users above, and its password comes from
+# LAB_SVC_APP_PASS.
+#
+# Keyed by role, not by VM name: like `ad` above, this is config for one tier
+# of the lab, and the VM that serves it is named in vm_placements.app01.
+app:
+  service_account: svc-app-portal
+
+  # Deliberate weakness toggles. Unlike ad.weaknesses above — which are all
+  # false and read by nothing yet — these default TRUE: the lab exists to be
+  # attacked, and a portal with every weakness switched off is only useful as
+  # the baseline half of a comparison. Each key is rendered into the
+  # container's environment as WEAK_<KEY> by playbooks/app.yml, and
+  # playbooks/app_validate.yml asserts each one both ways, so the map is the
+  # toggle list, the env contract and the assertion list at once.
+  #
+  # Flipping one to false must produce a genuinely safe code path, not a
+  # disabled route: that is what makes "baseline vs weakness" a real
+  # comparison rather than a demo of an off switch.
+  weaknesses:
+    # Injection
+    sqli_login: true
+    sqli_search: true
+    command_injection_diagnostics: true
+    # Broken access control
+    idor_documents: true
+    broken_admin_authz: true
+    path_traversal_download: true
+    # Credential exposure
+    hardcoded_db_credentials: true
+    forgeable_session_token: true
+    service_account_credential_in_db: true
+    # Server-side extras
+    ssrf_url_fetch: true
+    verbose_errors_debug_endpoint: true

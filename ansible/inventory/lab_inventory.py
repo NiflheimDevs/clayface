@@ -90,11 +90,17 @@ def build_inventory(lab):
     # membership are static lab facts and belong in lab.yaml.
     ad = lab.get("ad") or {}
 
+    # Same reasoning for the application server: playbooks/app.yml renders the
+    # weakness toggles into the container environment from this map, and
+    # playbooks/app_validate.yml asserts against them. Both target the VM, so
+    # the map rides on `all` rather than on the hypervisor that hosts it.
+    app = lab.get("app") or {}
+
     return {
         "_meta": {"hostvars": {**hypervisor_hosts, **edge_hosts}},
         "all": {
             "children": ["hypervisors", "edge"],
-            "vars": {"lab_ad": ad},
+            "vars": {"lab_ad": ad, "lab_app": app},
         },
         "hypervisors": {"hosts": list(hypervisor_hosts)},
         "edge": {"hosts": list(edge_hosts)},

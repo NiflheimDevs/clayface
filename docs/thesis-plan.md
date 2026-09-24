@@ -150,14 +150,23 @@ Ansible dynamic inventories; the Terraform→Ansible `vms` output link;
 (`client.yml`); the pinned-MAC → DHCP reservation → DNS A-record chain;
 documented base-image builds (`base-image/` with unattend files + README).
 
-**Not built:** APP01 / DMZ Linux host / containers / PostgreSQL; IDP01 /
-SSO; DMZ vs internal network segmentation (still one flat L2); an attacker
-machine; planted misconfigurations; planted sensitive data; any executed
-attack; any telemetry / SIEM.
+**Built since this line was written:** **APP01** — a containerized
+application tier on its own VM (`terraform/modules/app`, `app01` in
+`lab.yaml`, deployed by `ansible/playbooks/app.yml`, design in
+`docs/app01-design.md`). It runs nginx (TLS) → a Go portal → PostgreSQL,
+all as containers, with a documented set of deliberate weakness toggles.
+
+**Not built:** IDP01 / SSO; DMZ vs internal network segmentation (still one
+flat L2 — APP01 is on it, so APP01 is not yet in a DMZ); an attacker
+machine; the remaining planted misconfigurations; planted sensitive data
+outside APP01's own seed; any executed attack; any telemetry / SIEM.
 
 Note: the supervisor email describes a DMZ Ubuntu host running
-containerized apps — that is the **finalized target topology, not the
-current state.** Do not describe it as built in Ch4/Ch5.
+containerized apps. The containerized Ubuntu host now **exists**, but the
+DMZ **does not** — APP01 sits on the same flat `vm-br0` as DC01 and
+CLIENT01, so it is a DMZ host without a DMZ. Say "containerized
+application host", not "DMZ host", until segmentation lands
+(`docs/TODO.md`).
 
 ## Chapter-by-chapter readiness
 
@@ -228,17 +237,22 @@ Writable now:
   exist (the three email images).
 - 4-4 details, for what exists: `lab.yaml` schema; Terraform root module +
   per-host provider blocks; the `alpine` / `opnsense` / `domaincontroller`
-  / `client` modules; the `edge.host` guard; the two dynamic inventories;
-  the pinned-MAC → DHCP → DNS chain; WinRM/NTLM Windows connection; `dc.yml`
-  forest promotion; `client.yml` domain join; `deploy.sh`.
+  / `client` / `app` modules; the `edge.host` guard; the two dynamic
+  inventories; the pinned-MAC → DHCP → DNS chain; WinRM/NTLM Windows
+  connection; `dc.yml` forest promotion; `client.yml` domain join;
+  `app.yml` container deployment + `app_validate.yml`; `deploy.sh`.
+- 4-4 the application tier: `docs/app01-design.md` (container topology,
+  the weakness toggle table, the AD service-account contract).
 
-Not writable yet (not built): APP01 + containers + PostgreSQL; IDP01/SSO;
-DMZ/internal segmentation; the attacker machine; and the **design of the
-planted weaknesses** (proposal says they are documented as part of the
-design — a substantial section that does not exist yet: per weakness, what
-it is, why a real org would have it, which attack it enables, the correct
-config). `redclay.yaml` `attack_surface` / `technique_coverage` are the
-raw list to build it from.
+Not writable yet (not built): IDP01/SSO; DMZ/internal segmentation; the
+attacker machine; and the **design of the planted weaknesses** (proposal
+says they are documented as part of the design — a substantial section
+that does not exist yet: per weakness, what it is, why a real org would
+have it, which attack it enables, the correct config). `redclay.yaml`
+`attack_surface` / `technique_coverage` are the raw list to build it from.
+APP01's own weaknesses are the one exception already documented, in
+`docs/app01-design.md` — cite them as the worked example of the pattern,
+and note none of them has been exercised by an actual attack yet.
 
 ### فصل 5 — ارزيابي · split; infra half startable now, ~25%, not completable
 
@@ -296,7 +310,12 @@ deferred scenario engine, `docs/TODO.md`). 6-1 blocked on Ch5.
   an external break-in needs something reachable from the WAN to attack —
   i.e. the DMZ web app (APP01), exposed through an OPNsense port-forward.
   This puts APP01/DMZ on the critical path for the Ch5 engagement; it is no
-  longer optional. Neither the attacker VM nor APP01 is built yet.
+  longer optional. **APP01 is now built** (containerized, with the vulnerable
+  portal and the SQLi/credential attack paths the chain needs) and the
+  OPNsense port-forward that would publish it exists but is **opt-in and
+  unverified** (`LAB_WAN_EXPOSE_APP`; see `docs/app01-verification-pending.md`).
+  The DMZ half is still missing: APP01 is on the flat internal L2. The
+  attacker VM is not built.
   *Known fallback lever if the timeline tightens:* placing Kali inside the
   internal L2 instead (assumed-insider foothold) removes the APP01
   dependency and still clears the supervisor's attack bar — but it changes
@@ -471,9 +490,9 @@ overstate the built state, which is exactly the error the corrections file
 flagged in the GPT research:
 
 - `Infrastructure.md:14` styles **client01 and app01 as built on host_b**.
-  Reality (`lab.yaml`): `dc01` *and* `client01` are both on **host_a**,
-  `host_b` is commented out, and **app01 does not exist**. Re-place and
-  re-style before use, or the figure contradicts the text.
+  Reality (`lab.yaml`): `dc01`, `client01` *and* `app01` are all on
+  **host_a**, and `host_b` is commented out. Re-place and re-style before
+  use, or the figure contradicts the text.
 - `Overview.md:22` shows **three separate zone subnets** (10.0.10/20/30) and
   a **VPN pool**. Reality is one flat L2 on 10.0.0.0/24 and no VPN. The
   figure is the *target* topology — label it as such (it is the

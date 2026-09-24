@@ -1,5 +1,5 @@
 output "vms" {
-  description = "Map of VM name to { hypervisor, role, os_family, mac, ip }. hypervisor is the libvirt host alias from lab.yaml; role is the terraform module that built the VM ('gateway' for the OPNsense edge VM, otherwise the `module:` value from lab.yaml - 'dc', 'client', 'alpine') and names the Ansible playbook that owns it; os_family is 'windows' or 'linux' and decides how Ansible connects; mac is the pinned NIC MAC for modules that derive one; ip is the optional static address declared in lab.yaml. Consumed by the Ansible dynamic inventory."
+  description = "Map of VM name to { hypervisor, role, os_family, mac, ip }. hypervisor is the libvirt host alias from lab.yaml; role is the terraform module that built the VM ('gateway' for the OPNsense edge VM, otherwise the `module:` value from lab.yaml - 'dc', 'client', 'alpine', 'app') and names the Ansible playbook that owns it; os_family is 'windows' or 'linux' and decides how Ansible connects; mac is the pinned NIC MAC for modules that derive one; ip is the optional static address declared in lab.yaml. Consumed by the Ansible dynamic inventory."
 
   value = merge(
     {
@@ -27,7 +27,7 @@ output "vms" {
         # guard for `module:` in lab.yaml.
         os_family = local.module_os[p["module"]]
 
-        # Pinned MAC, dc/client only — extend the merge below when another
+        # Pinned MAC, dc/client/app — extend the merge below when another
         # module needs a DHCP reservation.
         mac = try(
           merge(
@@ -35,6 +35,8 @@ output "vms" {
             { for n, m in module.dc_host_b : n => m.mac },
             { for n, m in module.client_host_a : n => m.mac },
             { for n, m in module.client_host_b : n => m.mac },
+            { for n, m in module.app_host_a : n => m.mac },
+            { for n, m in module.app_host_b : n => m.mac },
           )[name],
           null
         )

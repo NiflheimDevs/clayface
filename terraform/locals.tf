@@ -17,6 +17,7 @@ locals {
   # the guest OS family it produces.
   module_os = {
     alpine = "linux"
+    app    = "linux"
     dc     = "windows"
     client = "windows"
   }

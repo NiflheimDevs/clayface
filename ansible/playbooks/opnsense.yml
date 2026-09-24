@@ -9,6 +9,8 @@
 #   4. reconfigures dnsmasq and verifies the name resolves
 #   5. OPTIONALLY hands out a DC as the lab's DNS server (DHCP option 6) —
 #      off unless LAB_DHCP_DNS_SERVER is set, see the env overrides
+#   6. OPTIONALLY publishes the application server to the WAN side with a
+#      destination-NAT port forward — off unless LAB_WAN_EXPOSE_APP is set.
 #
 # Where the two halves of a binding come from:
 #   - the MAC is terraform's, because the VM is created with it (each module
@@ -40,6 +42,13 @@
 #                    verification passes -> re-run this play with the
 #                    variable set. Recovery is deleting the option row and
 #                    reconfiguring; IP connectivity is never lost.
+#   LAB_WAN_EXPOSE_APP
+#                    Empty (the default) = no port forward, app01 stays
+#                    internal-only. Set it to the WAN port to forward, e.g.
+#                    LAB_WAN_EXPOSE_APP=443, to also publish the portal on
+#                    the OPNsense WAN address so an attacker outside the lab
+#                    can reach it. Untested against a running OPNsense — read
+#                    the section comment before enabling it.
 
 - name: Pin VMs with a static address in OPNsense DHCP/DNS
   hosts: localhost
@@ -59,6 +68,9 @@
     # play) once that DC actually answers DNS:
     #   LAB_DHCP_DNS_SERVER=10.0.0.10
     lab_dhcp_dns_server: "{{ lookup('env', 'LAB_DHCP_DNS_SERVER') | default('', true) }}"
+    # WAN port to publish the portal on. EMPTY = disabled, which is the
+    # default. See section 4d below before setting it.
+    lab_wan_expose_app: "{{ lookup('env', 'LAB_WAN_EXPOSE_APP') | default('', true) }}"
 
   module_defaults:
     ansible.builtin.uri:
@@ -420,6 +432,130 @@
       register: option_reconf
       changed_when: option_reconf.status == 200
       when: option_add is changed or option_update is changed
+
+    # ------------------------------------------------------------
+    # 4d. WAN port forward to the application server. OPT-IN: runs only
+    #     when LAB_WAN_EXPOSE_APP is set (see the header).
+    #
+    #     Two things to know before enabling it:
+    #       - searchRule only returns rules the API itself created. A rule
+    #         made by hand in the GUI is invisible here, so this play cannot
+    #         tell you a duplicate exists — it identifies its own rule by the
+    #         descr marker below and only ever adds or updates that one. If
+    #         you also made one in the GUI, delete one of them by hand.
+    #       - it exposes the portal on the WAN address. In a home LAN that is
+    #         the host's own network, which is the point of the exercise
+    #         (the Ch5 engagement starts from outside), but it is a real
+    #         change to the edge firewall and not something to leave on
+    #         unattended.
+    # ------------------------------------------------------------
+    - name: Assert there is exactly one app VM to forward to
+      ansible.builtin.assert:
+        that:
+          - groups['vms_app'] | default([]) | length == 1
+          - hostvars[groups['vms_app'][0]].libvirt_ip is defined
+        fail_msg: >-
+          LAB_WAN_EXPOSE_APP is set, so a port forward needs one application
+          VM with a static address — found
+          {{ groups['vms_app'] | default([]) | length }} in vms_app. Add
+          `ip:` to its entry in lab.yaml `vm_placements` and apply terraform.
+        quiet: true
+      when: lab_wan_expose_app | length > 0
+
+    - name: Read the app VM's static address
+      ansible.builtin.set_fact:
+        lab_app_ip: "{{ hostvars[groups['vms_app'][0]].libvirt_ip }}"
+      when: lab_wan_expose_app | length > 0
+
+    - name: Search the existing Destination NAT rules
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/firewall/d_nat/searchRule"
+        method: GET
+      register: dnat_search
+      when: lab_wan_expose_app | length > 0
+
+    # Matched on the marker rather than on the port: a hand-made rule for the
+    # same port is invisible to searchRule (see above), so matching on the
+    # port would silently adopt or fight with it.
+    - name: Find our own port-forward rule
+      ansible.builtin.set_fact:
+        existing_dnat: >-
+          {{ dnat_search.json.rows | default([])
+            | selectattr('descr', 'defined')
+            | selectattr('descr', 'equalto', 'clayface lab portal (terraform/ansible managed)')
+            | list }}
+      when: lab_wan_expose_app | length > 0
+
+    - name: Create the port forward (WAN -> the app VM)
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/firewall/d_nat/addRule"
+        method: POST
+        body_format: json
+        body:
+          rule:
+            enabled: "1"
+            sequence: "1"
+            interface: "wan"
+            ipprotocol: "inet"
+            protocol: "tcp"
+            source:
+              any: "1"
+            destination:
+              network: "any"
+              port: "{{ lab_wan_expose_app }}"
+            target: "{{ lab_app_ip }}"
+            local-port: "{{ lab_wan_expose_app }}"
+            natreflection: "purenat"
+            log: "0"
+            descr: "clayface lab portal (terraform/ansible managed)"
+      register: dnat_add
+      changed_when: dnat_add.status == 200
+      when: lab_wan_expose_app | length > 0 and existing_dnat | length == 0
+
+    - name: Update the port forward when the port or target changed
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/firewall/d_nat/setRule/{{ existing_dnat[0].uuid }}"
+        method: POST
+        body_format: json
+        body:
+          rule:
+            enabled: "1"
+            sequence: "{{ existing_dnat[0].sequence | default('1') }}"
+            interface: "wan"
+            ipprotocol: "inet"
+            protocol: "tcp"
+            source:
+              any: "1"
+            destination:
+              network: "any"
+              port: "{{ lab_wan_expose_app }}"
+            target: "{{ lab_app_ip }}"
+            local-port: "{{ lab_wan_expose_app }}"
+            natreflection: "purenat"
+            log: "0"
+            descr: "clayface lab portal (terraform/ansible managed)"
+      register: dnat_update
+      changed_when: dnat_update.status == 200
+      when: >-
+        lab_wan_expose_app | length > 0 and existing_dnat | length > 0
+        and ((existing_dnat[0].target | default('', true) | string) != lab_app_ip
+             or (existing_dnat[0]['local-port'] | default('', true) | string) != lab_wan_expose_app)
+
+    - name: Apply the firewall rules
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/firewall/filter/apply"
+        method: POST
+      register: filter_apply
+      changed_when: filter_apply.status == 200
+      when: dnat_add is changed or dnat_update is changed
+
+    - name: Report the port forward
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Not publishing the portal: LAB_WAN_EXPOSE_APP is unset.' if lab_wan_expose_app | length == 0 else
+             'Portal published on the OPNsense WAN address, port ' ~ lab_wan_expose_app
+             ~ ' -> ' ~ lab_app_ip ~ ':' ~ lab_wan_expose_app ~ '. UNVERIFIED rule: '
+             ~ 'check it in the OPNsense UI under Firewall -> NAT -> Destination NAT.' }}
 
     - name: Verify every pinned name resolves via OPNsense
       ansible.builtin.command:
