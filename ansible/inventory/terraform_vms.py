@@ -22,6 +22,9 @@ server would be a third role that is still os_family "windows".
 Each VM host exposes:
     libvirt_hypervisor : hypervisor alias (matches a host in lab_inventory.py)
     ansible_host       : <name>.<domain> (resolved via OPNsense DNS)
+    libvirt_bridge     : the bridge this VM's NIC is attached to, from the
+                         terraform `vms` output (the edge VM additionally
+                         carries libvirt_bridges, listing every leg it holds)
     libvirt_mac        : pinned NIC MAC (when the module derives one)
     libvirt_ip         : static address from lab.yaml `ip:` (when set)
 
@@ -161,6 +164,17 @@ def build_inventory():
             "libvirt_hypervisor": hypervisor,
             "ansible_host": f"{name}.{LAB_DOMAIN}",
         }
+        # The bridge this VM's NIC is attached to, and where it came from:
+        # lab.yaml `networks:` -> terraform locals -> the module's `bridge`
+        # argument -> this output. Playbooks precheck it before starting a
+        # domain, because starting one whose bridge does not exist yet fails
+        # with "Network bridge <name> not found" and leaves the domain
+        # undefined and stopped.
+        if attrs.get("bridge"):
+            hostvars["libvirt_bridge"] = attrs["bridge"]
+        # Only the edge VM has more than one leg, so only it carries a list.
+        if attrs.get("bridges"):
+            hostvars["libvirt_bridges"] = attrs["bridges"]
         # Pinned MAC — lets playbooks/opnsense.yml tie name -> MAC -> DHCP
         # lease without hardcoding IPs.
         if attrs.get("mac"):

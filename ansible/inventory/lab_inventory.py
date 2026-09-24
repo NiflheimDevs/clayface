@@ -2,8 +2,8 @@
 """Dynamic Ansible inventory built from lab.yaml (single source of truth).
 
 lab.yaml at the repo root holds every static lab fact: hypervisor
-addresses/users, the single edge host, shared network settings, VM
-placement. This script turns it into inventory groups:
+addresses/users, the single edge host, the network segments, VM placement.
+This script turns it into inventory groups:
 
     hypervisors : every lab host (target of playbooks/hosts.yml)
     edge        : the single host named by the top-level `edge.host` key in
@@ -32,16 +32,6 @@ import yaml
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LAB_YAML = os.path.join(BASE_DIR, "..", "..", "lab.yaml")
 
-# Network settings shared by every host (top-level `network` in lab.yaml).
-NETWORK_VARS = (
-    "bridge_name",
-    "wan_name",
-    "vxlan_name",
-    "vxlan_id",
-    "vxlan_port",
-    "vxlan_parent_interface",
-)
-
 
 def load_lab():
     with open(LAB_YAML, "r", encoding="utf-8") as fh:
@@ -50,7 +40,13 @@ def load_lab():
 
 def build_inventory(lab):
     hosts = lab.get("hosts", {})
-    network = lab.get("network", {})
+    networks = lab.get("networks", {})
+
+    # Overlay settings shared by every segment, declared once at the top
+    # level. `vxlan_port` is the standard; `vxlan_parent_interface` is a
+    # property of the host NIC. Both ride on the hypervisor host vars below.
+    vxlan_port = lab.get("vxlan_port")
+    vxlan_parent_interface = lab.get("vxlan_parent_interface")
 
     hypervisor_hosts = {}
 
@@ -61,13 +57,29 @@ def build_inventory(lab):
         host_vars = {
             "ansible_host": attrs["address"],
             "ansible_user": attrs["user"],
+            # The whole segment map, so a playbook can loop over it rather
+            # than over a set of flattening keys that had to be kept in sync
+            # with lab.yaml by hand.
+            #
+            # Each entry is {bridge, subnet, gateway, dns, monitor,
+            # vxlan_id}; only `bridge` is required, because the WAN leg has
+            # none of the others. A segment WITHOUT a `vxlan_id` is the
+            # statement "this leg has no overlay" - that is what makes `wan`
+            # self-describing and what keeps an attacker VM on the WAN pinned
+            # to the host that holds OPNsense.
+            "lab_networks": networks,
+            "vxlan_port": vxlan_port,
+            "vxlan_parent_interface": vxlan_parent_interface,
             # Single VXLAN peer: fine while the lab has exactly two hosts.
             # More hosts need a mesh (multiple FDB entries) - see the
             # "more than two hosts" note in red-clay/Report/Journal.md.
+            # `vxlan_peers` carries the whole list so the eventual mesh work
+            # has it; `vxlan_remote_ip` stays the "can a two-host overlay be
+            # built, and to whom" answer that hosts.yml guards on, and is ""
+            # whenever the peer count is not exactly one.
             "vxlan_remote_ip": peers[0] if len(peers) == 1 else "",
-            "vxlan_peer_ips": peers,
+            "vxlan_peers": peers,
         }
-        host_vars.update({k: network[k] for k in NETWORK_VARS if k in network})
 
         hypervisor_hosts[name] = host_vars
 
@@ -96,11 +108,34 @@ def build_inventory(lab):
     # the map rides on `all` rather than on the hypervisor that hosts it.
     app = lab.get("app") or {}
 
+    # The remote-access VPN pool. Published so the fact has a home in the
+    # machine-read data, exactly as the target topology describes it.
+    #
+    # NOTHING READ IT YET, and nothing answers on it: there is no VPN server
+    # in this lab, no WireGuard config, and no OPNsense VPN instance. It is
+    # declared so that no document can quietly imply the lab supports VPN
+    # initial access when it does not.
+    vpn = lab.get("vpn") or {}
+
     return {
         "_meta": {"hostvars": {**hypervisor_hosts, **edge_hosts}},
         "all": {
             "children": ["hypervisors", "edge"],
-            "vars": {"lab_ad": ad, "lab_app": app},
+            # `lab_networks` rides on `all` as well as on each hypervisor,
+            # because it is a lab-wide fact and two of its consumers are not
+            # hypervisors: start_vms.yml waits for the LAN segment's DNS
+            # address, and that play targets VMs, which come from the
+            # terraform inventory and would not otherwise see the map.
+            #
+            # The overlay transport facts stay on the hypervisors: a VXLAN
+            # parent interface is a property of a host NIC and means nothing
+            # to a guest.
+            "vars": {
+                "lab_ad": ad,
+                "lab_app": app,
+                "lab_vpn": vpn,
+                "lab_networks": networks,
+            },
         },
         "hypervisors": {"hosts": list(hypervisor_hosts)},
         "edge": {"hosts": list(edge_hosts)},

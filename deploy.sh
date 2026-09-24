@@ -16,6 +16,12 @@ else
     exit 1
 fi
 
+# These addresses stay literals rather than being read from lab.yaml, on
+# purpose. Teaching a bash prelude to parse YAML adds a new failure mode to
+# the one script that must work before anything else does, in exchange for
+# one duplicated address that is already a documented mirrored constant (see
+# the exceptions list in CLAUDE.md). If you move the OPNsense LAN address,
+# change it here and in lab.yaml `networks.lan`.
 export no_proxy="clayface,10.0.0.1,localhost,127.0.0.1${no_proxy:+,$no_proxy}"
 export NO_PROXY="$no_proxy"
 
@@ -78,21 +84,32 @@ if [ "$PLAN_ONLY" = true ]; then
     exit 0
 fi
 
+# ---------- ansible: the part that must run before the apply ----------
+
+# hosts.yml and edge.yml run BEFORE `terraform apply`, and this ordering is
+# load-bearing rather than stylistic. They read lab.yaml through the dynamic
+# inventory and need nothing from terraform, while terraform needs THEM: a VM
+# whose bridge does not exist yet fails at domain start with "Network bridge
+# <name> not found", which leaves the domain undefined and stopped. On a
+# fresh host this also installs libvirt and starts libvirtd before terraform
+# tries to reach it over qemu+ssh.
+if [ "$SKIP_ANSIBLE" = false ]; then
+    step "Ansible: configure hypervisors (hosts.yml)"
+    ansible-playbook -i "$ANSIBLE_DIR/inventory/lab_inventory.py" "$ANSIBLE_DIR/playbooks/hosts.yml" --ask-become-pass
+
+    step "Ansible: configure edge (edge.yml)"
+    ansible-playbook -i "$ANSIBLE_DIR/inventory/lab_inventory.py" "$ANSIBLE_DIR/playbooks/edge.yml" --ask-become-pass
+fi
+
 step "Terraform apply"
 terraform -chdir="$TERRAFORM_DIR" apply -auto-approve -input=false
 
-# ---------- ansible ----------
+# ---------- ansible: the rest ----------
 
 if [ "$SKIP_ANSIBLE" = true ]; then
     step "Done. Skipping ansible."
     exit 0
 fi
-
-step "Ansible: configure hypervisors (hosts.yml)"
-ansible-playbook -i "$ANSIBLE_DIR/inventory/lab_inventory.py" "$ANSIBLE_DIR/playbooks/hosts.yml" --ask-become-pass
-
-step "Ansible: configure edge (edge.yml)"
-ansible-playbook -i "$ANSIBLE_DIR/inventory/lab_inventory.py" "$ANSIBLE_DIR/playbooks/edge.yml" --ask-become-pass
 
 step "Ansible: start the edge VM (start_vms.yml --tags gateway)"
 ansible-playbook \

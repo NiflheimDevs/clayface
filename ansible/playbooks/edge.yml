@@ -1,27 +1,35 @@
 ---
+# The WAN leg is the one segment that exists as nothing but a bridge: a NAT
+# leg with no subnet, no gateway and no overlay, which is why `wan` in
+# lab.yaml declares only `bridge`. Its name is read from there rather than
+# repeated here, so renaming it is a lab.yaml edit.
 - name: Configure Edge
   hosts: edge
   become: true
+
+  vars:
+    wan_bridge: "{{ lab_networks['wan']['bridge'] }}"
+
   tasks:
     - name: Check whether wan bridge exists
       ansible.builtin.command:
-        cmd: ip link show "{{ wan_name }}"
+        cmd: ip link show "{{ wan_bridge }}"
       register: bridge_check
       changed_when: false
       failed_when: false
 
     - name: Create wan bridge
       ansible.builtin.command:
-        cmd: ip link add name "{{ wan_name }}" type bridge
+        cmd: ip link add name "{{ wan_bridge }}" type bridge
       when: bridge_check.rc != 0
 
     - name: Check wan bridge state
       ansible.builtin.command:
-        cmd: ip link show "{{ wan_name }}"
+        cmd: ip link show "{{ wan_bridge }}"
       register: wan_bridge_state
       changed_when: false
 
     - name: Bring wan bridge up
       ansible.builtin.command:
-        cmd: ip link set dev "{{ wan_name }}" up
+        cmd: ip link set dev "{{ wan_bridge }}" up
       when: "'state DOWN' in wan_bridge_state.stdout"

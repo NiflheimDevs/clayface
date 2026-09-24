@@ -6,9 +6,9 @@
 #   - terraform:  locals (see terraform/locals.tf) via yamldecode()
 #   - ansible:   inventory/lab_inventory.py (dynamic inventory)
 #
-# What belongs here: hypervisor addresses/users, the single edge host,
-# shared network settings, and the VM placement map (which VM runs on which
-# host, built from which terraform module).
+# What belongs here: hypervisor addresses/users, the single edge host, the
+# network segments, and the VM placement map (which VM runs on which host,
+# built from which terraform module).
 hosts:
   host_a:
     address: 192.168.1.161
@@ -21,13 +21,55 @@ hosts:
 edge:
   host: host_a
 
-network:
-  bridge_name: vm-br0
-  wan_name: vm-wan0
-  vxlan_name: vxlan100
-  vxlan_id: 100
-  vxlan_port: 4789
-  vxlan_parent_interface: wlan0
+# Network segments, one entry per L2 domain. Read by terraform
+# (locals.tf -> each module's `bridge` variable) and by Ansible
+# (inventory/lab_inventory.py -> `lab_networks` on every host).
+#
+# `bridge` is the only required key: the WAN leg is a NAT leg with no subnet,
+# no gateway and no overlay. The rest earn their place by displacing a literal
+# that used to live in a playbook — `subnet` the 10.0.0.0/24 written in prose
+# across four documents, `monitor` the control node's address in hosts.yml,
+# `dns` four copies of OPNsense's address.
+#
+# `vxlan_id` is what makes a segment an overlay: declaring one is the
+# statement that this leg is carried between hosts. A segment without one is
+# host-local by definition, which is what makes `wan` self-describing.
+networks:
+  lan:
+    bridge: vm-br0
+    subnet: 10.0.0.0/24
+    gateway: 10.0.0.1
+    dns: 10.0.0.1                 # OPNsense Unbound, on this leg
+    monitor: 10.0.0.2/24          # the control node's address on this leg
+    vxlan_id: 100
+  dmz:
+    bridge: vm-dmz0
+    subnet: 10.0.10.0/24
+    gateway: 10.0.10.1
+    dns: 10.0.10.1
+    monitor: 10.0.10.2/24
+    vxlan_id: 101
+  wan:
+    bridge: vm-wan0               # NAT leg: no subnet, no gateway, no overlay
+
+# Shared by every overlay, declared once. Both are properties of the host NIC
+# and of the standard rather than of any one segment, which is why they stay
+# top-level after `vxlan_id` moved under the segments above. The interface
+# name is derived from the id (`vxlan<id>`), so it is deliberately not a knob
+# here — a separate name could only ever disagree with the id it belongs to.
+vxlan_port: 4789
+vxlan_parent_interface: wlan0
+
+# Remote-access VPN pool — DECLARED, NOT IMPLEMENTED.
+#
+# There is no VPN server anywhere in this lab. No WireGuard config exists, no
+# OPNsense VPN instance is configured, and nothing answers on this range. This
+# key exists so the pool the target topology describes has a home in the
+# machine-read facts, and so no document can quietly imply the lab supports
+# VPN initial access when it does not.
+vpn:
+  pool: 10.0.100.0/24
+  server: none
 
 # deployed on edge
 edge_vm:
@@ -35,7 +77,12 @@ edge_vm:
 
 # VM placement map for everything except the gateway: vm name ->
 # { module: terraform module under terraform/modules/, host: hypervisor
-# alias from `hosts` above, ip: optional static address }.
+# alias from `hosts` above, ip: optional static address, network: optional
+# segment name from `networks` above }.
+#
+# `network:` defaults to `lan`, so only a VM that is deliberately placed
+# somewhere else carries it. A typo'd value fails the terraform plan rather
+# than silently putting the VM on no bridge (see the guard in locals.tf).
 #
 # `ip:` is what turns a VM into a DHCP reservation + DNS record in OPNsense
 # (playbooks/opnsense.yml, driven by the module's pinned MAC). Required for

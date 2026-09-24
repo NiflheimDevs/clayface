@@ -38,6 +38,11 @@ resource "libvirt_domain" "opnsense" {
       }
     ]
 
+    # NIC order is device order, and the guest names its interfaces by it
+    # (vtnet0, vtnet1, ...): disks and interfaces share the ordering space, so
+    # anything added here must be APPENDED, never inserted ahead of an
+    # existing NIC. Inserting one renumbers the WAN and quietly points the
+    # firewall rules at the wrong interface.
     interfaces = [
       {
         type = "bridge"
@@ -48,7 +53,7 @@ resource "libvirt_domain" "opnsense" {
 
         source = {
           bridge = {
-            bridge = "vm-br0"
+            bridge = var.bridge
           }
         }
       },
@@ -61,7 +66,7 @@ resource "libvirt_domain" "opnsense" {
 
         source = {
           bridge = {
-            bridge = "vm-wan0"
+            bridge = var.wan_bridge
           }
         }
       },

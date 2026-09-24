@@ -1,7 +1,8 @@
 ---
-# Starts the VMs created by Terraform. VM names and hypervisor placement
-# come from the terraform `vms` output, read by the dynamic inventory
-# (inventory/terraform_vms.py). Run it with both inventories:
+# Starts the VMs created by Terraform. VM names, hypervisor placement and the
+# bridge each NIC sits on come from the terraform `vms` output, read by the
+# dynamic inventory (inventory/terraform_vms.py) - which derived them from
+# lab.yaml in the first place. Run it with both inventories:
 #
 #   ansible-playbook \
 #       -i inventory/lab_inventory.py \
@@ -18,28 +19,42 @@
 
   vars:
     libvirt_uri: qemu:///system
-    vm_bridge_name: vm-br0
-    lab_dns_ip: 10.0.0.1
+    # The LAN segment's resolver, read from lab.yaml rather than repeated
+    # here. The edge VM is what provides it, so this waits for OPNsense's own
+    # LAN address to start answering.
+    lab_dns_ip: "{{ lab_networks['lan']['dns'] }}"
     lab_dns_port: 53
     gateway_wait_timeout: 600
 
   pre_tasks:
-    - name: Verify the VM bridge exists on the hypervisor
+    # Prechecked because `virsh start` on a domain whose bridge does not
+    # exist fails with "Network bridge <name> not found" and leaves the
+    # domain undefined and stopped. The edge VM is the only guest with more
+    # than one leg, so it carries a list; everyone else has a single bridge.
+    - name: Verify every bridge this VM attaches to exists on the hypervisor
       ansible.builtin.command:
-        cmd: "ip link show {{ vm_bridge_name }}"
+        cmd: "ip link show {{ item }}"
+      loop: "{{ libvirt_bridges | default([libvirt_bridge]) }}"
+      loop_control:
+        label: "{{ item }}"
       delegate_to: "{{ libvirt_hypervisor }}"
       register: bridge_check
       changed_when: false
       failed_when: false
 
-    - name: Fail with a hint if the bridge is missing
+    - name: Fail with a hint if a bridge is missing
       ansible.builtin.fail:
         msg: >-
-          Bridge '{{ vm_bridge_name }}' does not exist on {{ libvirt_hypervisor }}.
-          Run 'ansible-playbook -i inventory/lab_inventory.py playbooks/hosts.yml' first
-          (it creates vm-br0 and the VXLAN), or use ./deploy.sh which runs
+          Bridge '{{ item.item }}' does not exist on {{ libvirt_hypervisor }}.
+          Run 'ansible-playbook -i inventory/lab_inventory.py playbooks/hosts.yml'
+          (it creates every segment bridge from lab.yaml) and
+          'ansible-playbook -i inventory/lab_inventory.py playbooks/edge.yml'
+          (it creates the WAN bridge), or use ./deploy.sh which runs
           everything in the right order.
-      when: bridge_check.rc != 0
+      loop: "{{ bridge_check.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.rc != 0
 
   tasks:
     - name: Get current domain state
@@ -89,25 +104,32 @@
 
   vars:
     libvirt_uri: qemu:///system
-    vm_bridge_name: vm-br0
 
   pre_tasks:
-    - name: Verify the VM bridge exists on the hypervisor
+    - name: Verify every bridge this VM attaches to exists on the hypervisor
       ansible.builtin.command:
-        cmd: "ip link show {{ vm_bridge_name }}"
+        cmd: "ip link show {{ item }}"
+      loop: "{{ libvirt_bridges | default([libvirt_bridge]) }}"
+      loop_control:
+        label: "{{ item }}"
       delegate_to: "{{ libvirt_hypervisor }}"
       register: bridge_check
       changed_when: false
       failed_when: false
 
-    - name: Fail with a hint if the bridge is missing
+    - name: Fail with a hint if a bridge is missing
       ansible.builtin.fail:
         msg: >-
-          Bridge '{{ vm_bridge_name }}' does not exist on {{ libvirt_hypervisor }}.
-          Run 'ansible-playbook -i inventory/lab_inventory.py playbooks/hosts.yml' first
-          (it creates vm-br0 and the VXLAN), or use ./deploy.sh which runs
+          Bridge '{{ item.item }}' does not exist on {{ libvirt_hypervisor }}.
+          Run 'ansible-playbook -i inventory/lab_inventory.py playbooks/hosts.yml'
+          (it creates every segment bridge from lab.yaml) and
+          'ansible-playbook -i inventory/lab_inventory.py playbooks/edge.yml'
+          (it creates the WAN bridge), or use ./deploy.sh which runs
           everything in the right order.
-      when: bridge_check.rc != 0
+      loop: "{{ bridge_check.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.rc != 0
 
   tasks:
     - name: Get current domain state

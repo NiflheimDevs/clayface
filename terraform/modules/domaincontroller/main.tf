@@ -80,7 +80,7 @@ resource "libvirt_domain" "dc" {
 
         source = {
           bridge = {
-            bridge = "vm-br0"
+            bridge = var.bridge
           }
         }
 

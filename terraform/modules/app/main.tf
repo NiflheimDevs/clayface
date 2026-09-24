@@ -95,7 +95,7 @@ resource "libvirt_domain" "app" {
 
         source = {
           bridge = {
-            bridge = "vm-br0"
+            bridge = var.bridge
           }
         }
 

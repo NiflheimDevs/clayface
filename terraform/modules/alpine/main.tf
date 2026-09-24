@@ -47,7 +47,7 @@ resource "libvirt_domain" "alpine" {
 
         source = {
           bridge = {
-            bridge = "vm-br0"
+            bridge = var.bridge
           }
         }
       }

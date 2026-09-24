@@ -5,6 +5,29 @@ locals {
   # being absent, the ternary covers it being null.
   vm_placements = try(local.lab["vm_placements"] != null ? local.lab["vm_placements"] : {}, {})
 
+  # The network segments, one entry per L2 domain (`networks:` in lab.yaml).
+  networks = local.lab["networks"]
+
+  # Segment name -> bridge device name. This is what main.tf hands to each
+  # module's `bridge` variable; before it existed the bridge name was a
+  # literal repeated in all five modules, with nothing linking the copies to
+  # lab.yaml.
+  network_bridges = { for k, v in local.networks : k => v["bridge"] }
+
+  # VM name -> segment name, defaulting to `lan`, so only a VM that is
+  # deliberately elsewhere carries a `network:` key. Indexing network_bridges
+  # with the result is also the guard: a typo'd `network:` in lab.yaml names a
+  # key that does not exist, which is an error, so the plan fails loudly
+  # instead of attaching the VM to no bridge. Same trick as module_os.
+  placement_network = {
+    for name, p in local.vm_placements : name => try(p["network"], "lan")
+  }
+
+  # The edge VM is the only guest with more than one leg: `lan` inside and
+  # `wan` outside. Not a lab.yaml fact because it is a property of what
+  # OPNsense IS here, not a placement choice someone makes.
+  gateway_networks = ["lan", "wan"]
+
   edge_host = local.lab["edge"]["host"]
 
   # This is the guard for `edge.host`, not dead code. Indexing a map with a

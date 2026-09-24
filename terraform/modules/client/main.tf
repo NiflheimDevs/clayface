@@ -8,8 +8,8 @@ locals {
 }
 
 resource "libvirt_volume" "client" {
-  name = "${upper(var.name)}.qcow2"
-  pool = "default"
+  name     = "${upper(var.name)}.qcow2"
+  pool     = "default"
   capacity = 30 * 1024 * 1024 * 1024
 
   target = {
@@ -58,7 +58,7 @@ resource "libvirt_domain" "client" {
       template        = var.uefi_nvram_template_path
       template_format = "raw"
       format          = "raw"
-      nv_ram = "/var/lib/libvirt/qemu/nvram/${var.name}_VARS.fd"
+      nv_ram          = "/var/lib/libvirt/qemu/nvram/${var.name}_VARS.fd"
     }
   }
 
@@ -102,7 +102,7 @@ resource "libvirt_domain" "client" {
 
         source = {
           bridge = {
-            bridge = "vm-br0"
+            bridge = var.bridge
           }
         }
 
