@@ -240,12 +240,19 @@ ad:
   workstation:
     logon_group: GG-Employees
     admin_group: GG-IT-Admins
-    # The account weakness W7 adds to the logon group. It is the portal's
-    # service account: the credential the Chapter 5 chain recovers from the
-    # portal database, and W7 is what makes that credential useful for
-    # something beyond a bind — it is the step that moves the attacker from
-    # the DMZ into the LAN, because the DMZ boundary allows tcp 389/636 to
-    # dc01 and nothing else.
+    # The account weakness W7 adds to the logon group. It is the portal's own
+    # service identity — the credential the portal's config and its
+    # service-credential row carry, alongside the bind account's row in
+    # `api_keys`.
+    #
+    # W7 is an authorization, not a way out of the DMZ. Nothing in
+    # `networks.dmz.allow` reaches this workstation, so the escalation half of
+    # the Chapter 5 chain runs from a LAN foothold, and this weakness decides
+    # what a portal credential can do once the attacker has one: with W2 on as
+    # well, it is a local administrator here. The logon right it also picks up
+    # is a console right — `SeRemoteInteractiveLogonRight` on this host is
+    # GG-IT-Admins only — so it is W2's membership, over the workstation
+    # baseline's WinRM path, that a remote attacker uses.
     #
     # Named here rather than inline in ad.yml because ad_validate.yml asserts
     # the same account, and a typo'd name in one place would be a silent

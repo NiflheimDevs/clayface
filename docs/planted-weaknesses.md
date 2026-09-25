@@ -18,7 +18,7 @@ to it rather than duplicating the table.
 | W4 | `weak_gpo_permission` | `ad_gpo.yml` | `GG-Employees` holds `GpoEditDeleteModifySecurity` on `WS - Security Baseline` | Edit the baseline's settings and security filtering — arbitrary configuration on every workstation at once | 5136 on the GPO's `nTSecurityDescriptor` |
 | W5 | `unconstrained_delegation` | `ad.yml` | `TRUSTED_FOR_DELEGATION` set on `svc-idp-ldap` | Capture a forwardable TGT from any host the account authenticates to, then impersonate it forest-wide | 4769 for the account from an unexpected source; 4624 type 3 on the delegation host |
 | W6 | `excessive_idp_directory_permissions` | `ad.yml` | `svc-idp-ldap` holds `Replicating Directory Changes` and `Replicating Directory Changes All` on the domain root | DCSync: replicate `krbtgt`'s hash, forge a golden ticket, become Domain Admin | 4662 with the DRSUAPI control-access rights; 4728/4732 if the grant was made by group |
-| W7 | `excessive_group_membership` | `ad.yml` | `svc-app-portal` is a member of `GG-Employees`, the group carrying interactive logon on the workstations | The credential recovered from the portal database becomes an interactive logon on `client01` instead of a credential that can only bind LDAP | 4728 (member added to a security-enabled global group) on `GG-Employees` |
+| W7 | `excessive_group_membership` | `ad.yml` | `svc-app-portal` is a member of `GG-Employees`, the group carrying the workstation's console logon right and, with W2, its local admin rights | The portal's own credential becomes a workstation administrator instead of a credential with no rights at all — usable once the attacker has LAN reach | 4728 (member added to a security-enabled global group) on `GG-Employees` |
 
 One note on the row for W2. Section 13 names 4732 — a member was added to a
 security-enabled local group — and not 4733, a member was removed from one.
@@ -32,16 +32,35 @@ The Chapter 5 engagement reaches Domain Admin through one clean path. It is
 worth stating which toggles it needs, because the others are not decoration —
 they are separate, individually documented findings.
 
-**The escalation (W7, W1 and W6).** The attacker recovers `svc-app-portal`'s
-credential from the portal's database, and the DMZ boundary permits that
-credential to bind LDAP on `dc01` (tcp 389/636, the documented pivot). What
-that credential *cannot* do is reach the LAN: the boundary allows nothing else,
-and Kerberos (88) and the RPC traffic DCSync needs do not cross it. So the
-attacker needs a foothold inside, and W7 is what provides one: `svc-app-portal`
-is a member of `GG-Employees`, which carries `SeInteractiveLogonRight` on
-`client01`, so the recovered credential becomes a workstation logon. From there:
-W1's SPN makes `svc-idp-ldap` Kerberoastable, the ticket cracks offline, and
-W6's replication rights turn that credential into `krbtgt` — Domain Admin.
+**The escalation (W1 and W6) runs from inside the LAN.** The DMZ half of the
+engagement ends with a domain credential — `api_keys` carries `svc-idp-ldap`'s
+password in clear text — and the boundary permits that credential exactly one
+thing: a bind on `dc01`, tcp 389/636, the documented pivot. It cannot carry the
+attack any further. The boundary allows nothing else, and Kerberos (88) and the
+RPC traffic DCSync needs do not cross it, so the escalation half needs a
+foothold inside the LAN that the DMZ cannot supply. The lab does not model how
+that foothold is taken, and this document does not claim one: a compromised
+employee workstation is the intended route — it is what W2 and W3 supply, and
+it is section 13's first-wave narrative — and making it an explicit step is
+Phase 6 planning, not a firewall change. From that foothold: W1's SPN makes
+`svc-idp-ldap` Kerberoastable, the ticket cracks offline, and W6's replication
+rights turn that credential into `krbtgt` — Domain Admin. W1 and the `api_keys`
+row yield the same shared password by different routes; the reuse is deliberate
+(`docs/app01-design.md` section 8.4), so the DMZ route reaches the bind
+credential and W1 is the route an attacker who starts inside takes.
+
+**What W7 adds: an authorization, not a way in.** W7 puts `svc-app-portal` —
+the other credential the portal tier plants — into `GG-Employees`. It is not
+the hop out of the DMZ, and reading it as one is wrong: a logon right on a host
+the attacker cannot reach grants nothing. The effects are real once LAN reach
+exists. The group carries `SeInteractiveLogonRight` on `client01`, and that is
+a console right — `SeRemoteInteractiveLogonRight` on the same host is
+`GG-IT-Admins` only, so no remote attacker uses it. What a remote attacker uses
+is W2's local `Administrators` membership, reached over the WinRM path the
+workstation baseline permits from `10.0.0.0/24`: with W7 and W2 both on,
+`svc-app-portal` is a local administrator on `client01` and can execute code
+there. W7 is what makes a credential the DMZ already yielded worth more than a
+bind, and 4728 on `GG-Employees` is what makes that grant visible.
 
 **The local-privilege branch (W2 and W3).** Local admin on the workstation, and
 the LAPS password that gets there, are what make the planted shares on

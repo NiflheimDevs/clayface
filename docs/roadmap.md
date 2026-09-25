@@ -161,9 +161,18 @@ Outstanding in this phase:
   it indistinguishable from a broken LAPS deployment.
 - W5 is wired and asserted but is not load-bearing. Unconstrained delegation on
   `svc-idp-ldap` is a real finding with a real detection, but the Chapter 5
-  chain reaches Domain Admin through W7, W1 and W6; W5 is offered as an adjacent
-  path, and `docs/planted-weaknesses.md` says so rather than implying the chain
-  needs it.
+  chain reaches Domain Admin through W1 and W6, from a LAN foothold; W5 is
+  offered as an adjacent path, and `docs/planted-weaknesses.md` says so rather
+  than implying the chain needs it.
+- Two documentation sharpenings deferred from the Phase 4 review, both in
+  `docs/planted-weaknesses.md`: W2's row and the local-privilege paragraph say
+  local admin is what makes the planted shares reachable, when the shipped read
+  grant is to `GG-Employees` (so the accurate statement is that DC01's Finance
+  share is network-readable by any employee credential and CLIENT01's Projects
+  share is a local-session target); and W3's read right is redundant with W2 for
+  reaching local admin, its independent value being the `lapsadmin` credential
+  that survives W2 being turned off. Wording only — the code and the ACLs are
+  what they should be.
 
 ### Phase 5 — IDP01 / SSO build
 
@@ -181,9 +190,17 @@ Outstanding in this phase:
 ### Phase 6 — Run the engagement and capture all evidence
 
 - Execute the attack chain to Domain Admin: Kali → WAN → APP01 (one SQLi
-  toggle) → dump the database → recover the `svc-app-portal` credential →
-  authenticate to the domain → enumerate AD → escalate via the Phase 4
-  weakness → Domain Admin → exfiltrate the planted data.
+  toggle) → dump the database → recover the bind credential from `api_keys`
+  and bind LDAP on `dc01` → **a LAN foothold** → enumerate AD → escalate via
+  the Phase 4 weaknesses → Domain Admin → exfiltrate the planted data.
+- Plan and document the LAN foothold the escalation runs from. The DMZ
+  boundary permits DMZ → `dc01` tcp 389/636, DNS and DHCP, and nothing else, so
+  no rule carries the attack out of the DMZ into the LAN; `app01` has one NIC
+  and no second path. Phase 4 stated this gap and deliberately did not close
+  it, because closing it means widening the boundary — a design change, not a
+  fix. The intended route is a compromised employee workstation, which is what
+  W2 and W3 supply, and it needs to be a planned, evidenced step like any
+  other rather than an implied one.
 - Map every step to a MITRE ATT&CK technique ID.
 - Capture the four infrastructure metrics:
   1. reproducibility — N clean `deploy.sh` runs all converge, and a second
