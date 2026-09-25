@@ -325,3 +325,30 @@ app:
     # Server-side extras
     ssrf_url_fetch: true
     verbose_errors_debug_endpoint: true
+
+# Exfiltration targets for the Chapter 5 impact analysis (roadmap Phase 4).
+#
+# The engagement's last step is that the attacker takes something, and an
+# impact claim with nothing to take is an assertion rather than a result. These
+# are fake but realistic business files, planted beyond APP01's own seed.
+#
+# Placement is a static fact about the lab and lives here; the file CONTENT is
+# prose and lives in playbooks/lab_data.yml, which is the same split app01
+# uses — paths in lab.yaml, seed material beside the code that plants it.
+#
+# Shares are reachable from the LAN only. The baseline workstation GPO blocks
+# inbound by default except for WinRM from 10.0.0.0/24, and dc01 is not in
+# OU=Workstations so the GPO does not apply to it — the DC's own AD DS firewall
+# rules permit 445, which is what makes \\dc01.clayface reachable from a
+# workstation and a share on a workstation reachable only by someone already
+# logged on to it.
+data:
+  shares:
+    dc01:
+      - name: Finance
+        path: C:\Shares\Finance
+        description: Finance department working files
+    client01:
+      - name: Projects
+        path: C:\Shares\Projects
+        description: Developer project files

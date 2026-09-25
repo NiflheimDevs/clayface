@@ -198,6 +198,16 @@ ansible-playbook \
     -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
     "$ANSIBLE_DIR/playbooks/client.yml"
 
+# The exfiltration subject for the Chapter 5 impact analysis: the corporate
+# SMB shares declared under `data.shares` in lab.yaml. After client.yml
+# because the shares live on the joined workstations and on the domain
+# controller. Windows-only (WinRM, no become), and idempotent.
+step "Ansible: plant the lab's share data (lab_data.yml)"
+ansible-playbook \
+    -i "$ANSIBLE_DIR/inventory/lab_inventory.py" \
+    -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
+    "$ANSIBLE_DIR/playbooks/lab_data.yml"
+
 # Builds the application tier: the container images are built here on the
 # control node, shipped to app01 as a docker-save tarball, loaded and brought
 # up with docker compose. Needs a running docker daemon on this machine, and

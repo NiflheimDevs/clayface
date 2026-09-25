@@ -1,0 +1,171 @@
+---
+# The lab's planted data: the corporate files the Chapter 5 impact analysis
+# exfiltrates. Driven entirely by lab.yaml's `data.shares` map, so adding a
+# share is one lab.yaml entry and no playbook edit.
+#
+# Run after client.yml: the shares live on the joined workstations and on the
+# domain controller, and the DC's own share is what the attacker reaches after
+# escalation.
+#
+# What it does (idempotent):
+#   1. creates each declared share's directory
+#   2. writes the documents for that share, from the content map below
+#   3. creates the SMB share with the declared path
+#   4. asserts the share exists and the documents are readable
+#
+# Run:
+#   ansible-playbook -i inventory/lab_inventory.py \
+#                    -i inventory/terraform_vms.py playbooks/lab_data.yml
+
+- name: Plant the lab's share data
+  hosts: vms_windows
+  gather_facts: false
+
+  vars:
+    lab_data_shares: "{{ (lab_data | default({}, true)).shares | default({}, true) }}"
+
+    # The AD domain and its NetBIOS name, both derived here rather than read
+    # from an inventory var, because lab_inventory.py does not publish either:
+    # the DNS domain is owned by the OPNsense image and the NetBIOS name is
+    # derived from it. Mirrors client.yml, so LAB_DOMAIN moves the forest name
+    # and the share grant together.
+    lab_domain: "{{ lookup('env', 'LAB_DOMAIN') | default('clayface', true) }}"
+    lab_ad_netbios: "{{ lab_domain | upper }}"
+
+    # The content map. Keys are the share names declared in lab.yaml, so a
+    # share with no entry here plants an empty directory — which is a
+    # legitimate outcome (the directory is the finding) but is reported.
+    lab_data_documents:
+      Finance:
+        - name: 2026-q3-forecast.csv
+          content: |
+            period,account,amount_eur,confidence
+            2026-Q3,Consulting,412500,high
+            2026-Q3,Licensing,1180000,high
+            2026-Q3,Support,264300,medium
+            2026-Q3,Hardware,91800,low
+        - name: headcount-plan.txt
+          content: |
+            Clayface Industries — FY2026 headcount plan (DRAFT, do not circulate)
+
+            Engineering      42 -> 51
+            Sales            18 -> 24
+            Finance           7 ->  7
+            IT                4 ->  6
+
+            Backfill approved for two SRE roles after the March incident.
+            Offer band for senior engineers: 78k-92k. Not to be shared with
+            candidates before the final round.
+        - name: board-minutes-2026-08.txt
+          content: |
+            Clayface Industries — board minutes, 2026-08-14
+
+            Present: chair, CEO, CFO, two non-executive directors.
+            Apologies: CTO.
+
+            1. The Q3 revenue shortfall against the licensing line was
+               discussed. Management attributed it to two renewals slipping
+               into Q4 and expects no revision to the full-year guidance.
+            2. Legal confirmed the supplier dispute is expected to settle
+               before the year end. Provision unchanged.
+            3. The board approved the acquisition of a small consultancy
+               subject to due diligence. Name withheld in this minute.
+      Projects:
+        - name: portal-roadmap.md
+          content: |
+            # Portal roadmap
+
+            ## Next
+            - Move the customer portal behind the new identity provider
+            - Retire the shared service account the batch jobs use
+            - Certificate rotation, currently manual
+
+            ## Known issues
+            - The reporting query is slow on large accounts
+            - Two customers still on the legacy export format
+        - name: deployment-runbook.txt
+          content: |
+            Deployment runbook (internal)
+
+            1. Build the image on the build host
+            2. Copy the tarball to the application server
+            3. docker compose up --detach
+            4. Verify both published ports answer
+
+            Credentials for the database are in the environment file on the
+            application server. Ask the platform team before changing them —
+            the reporting job uses the same account.
+
+  pre_tasks:
+    - name: Fail if lab.yaml has no usable `data.shares` map
+      ansible.builtin.assert:
+        that: lab_data_shares | length > 0
+        fail_msg: >-
+          lab.yaml has no `data.shares` map, so there is nothing to plant.
+          The exfiltration subject belongs in lab.yaml: it is a static fact
+          about the lab, not a property of this playbook.
+
+    - name: Note hosts with no declared shares
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} has no entry under lab.yaml `data.shares`,
+          so nothing is planted here. That is legitimate (not every VM holds
+          data) but it is worth seeing, because a typo'd host key looks
+          exactly like this.
+      when: lab_data_shares[inventory_hostname] is not defined
+
+    - name: Note shares declared for hosts that are not in the inventory
+      ansible.builtin.debug:
+        msg: >-
+          lab.yaml `data.shares` names {{ item }} but no such host is in the
+          inventory. Is it commented out of vm_placements, or did terraform
+          apply not run?
+      loop: "{{ lab_data_shares.keys() | list }}"
+      when: item not in groups['vms_windows'] | default([])
+
+  tasks:
+    - name: Create the declared share directories
+      ansible.windows.win_file:
+        path: "{{ item.path }}"
+        state: directory
+      loop: "{{ lab_data_shares[inventory_hostname] | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Plant this host's documents
+      ansible.windows.win_copy:
+        dest: "{{ (lab_data_shares[inventory_hostname] | selectattr('name', 'eq', item.0.key) | first).path }}/{{ item.1.name }}"
+        content: "{{ item.1.content }}"
+      loop: >-
+        {{ lab_data_documents | dict2items
+           | selectattr('key', 'in', lab_data_shares[inventory_hostname] | default([]) | map(attribute='name') | list)
+           | subelements('value') | list }}
+      loop_control:
+        label: "{{ item.0.key }}/{{ item.1.name }}"
+
+    - name: Create the SMB shares
+      ansible.windows.win_share:
+        name: "{{ item.name }}"
+        path: "{{ item.path }}"
+        description: "{{ item.description }}"
+        full: Administrators
+        read: "{{ lab_ad_netbios }}\\{{ lab_ad.workstation.logon_group }}"
+      loop: "{{ lab_data_shares[inventory_hostname] | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Assert the declared shares exist and hold their documents
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $bad = @()
+          $dirs = @({% for s in lab_data_shares.get(inventory_hostname, []) %}'{{ s.name }}'{% if not loop.last %}, {% endif %}{% endfor %})
+          foreach ($n in $dirs) {
+              $s = Get-SmbShare -Name $n -ErrorAction SilentlyContinue
+              if (-not $s) { $bad += "share $n is missing"; continue }
+              $files = @(Get-ChildItem -LiteralPath $s.Path -File -ErrorAction SilentlyContinue)
+              if ($files.Count -eq 0) { $bad += "share $n holds no documents" }
+          }
+          if ($bad.Count) { throw ($bad -join '; ') }
+          "OK: $($dirs.Count) share(s) present and populated on {{ inventory_hostname }}"
+      changed_when: false

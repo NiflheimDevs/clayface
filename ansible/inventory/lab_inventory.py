@@ -117,6 +117,14 @@ def build_inventory(lab):
     # initial access when it does not.
     vpn = lab.get("vpn") or {}
 
+    # The exfiltration targets: the SMB shares playbooks/lab_data.yml plants
+    # on the Windows hosts. Placement (host, share name, path, description) is
+    # a static fact about the lab, so it lives in lab.yaml and is published
+    # here; only the file CONTENT is prose, and it lives beside the code that
+    # plants it. Same split as `app` above. The consumer targets the VMs
+    # themselves, so this rides on `all` rather than on a hypervisor.
+    data = lab.get("data") or {}
+
     return {
         "_meta": {"hostvars": {**hypervisor_hosts, **edge_hosts}},
         "all": {
@@ -133,6 +141,7 @@ def build_inventory(lab):
             "vars": {
                 "lab_ad": ad,
                 "lab_app": app,
+                "lab_data": data,
                 "lab_vpn": vpn,
                 "lab_networks": networks,
             },
