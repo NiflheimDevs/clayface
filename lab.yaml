@@ -271,19 +271,17 @@ ad:
     managed_account: lapsadmin
 
   # Deliberate weakness toggles (docs/ad-identity-design.md section 13).
-  # All off, and read by the playbooks as `lab_ad_weak.<key>`: ad.yml,
-  # client.yml and ad_gpo.yml each declare the toggles they implement and
-  # assert they are present here, and ad_validate.yml asserts all seven and
-  # warns about a key no play knows. A typo therefore fails loudly instead of
-  # reading as `false` and leaving the lab quietly at its baseline.
+  # Read by ad.yml (W1/W3/W5/W6/W7), client.yml (W2) and ad_gpo.yml (W4);
+  # asserted in both postures by ad_validate.yml. On is the lab's default
+  # posture, matching `app.weaknesses`.
   weaknesses:
-    kerberoastable_idp_bind: false
+    kerberoastable_idp_bind: true
     excessive_local_admin: true
-    excessive_laps_read: false
-    weak_gpo_permission: false
-    unconstrained_delegation: false
-    excessive_idp_directory_permissions: false
-    excessive_group_membership: false
+    excessive_laps_read: true
+    weak_gpo_permission: true
+    unconstrained_delegation: true
+    excessive_idp_directory_permissions: true
+    excessive_group_membership: true
 
 # Application server (docs/app01-design.md).
 #
@@ -298,8 +296,8 @@ ad:
 app:
   service_account: svc-app-portal
 
-  # Deliberate weakness toggles. Unlike ad.weaknesses above — which are all
-  # false and read by nothing yet — these default TRUE: the lab exists to be
+  # Deliberate weakness toggles. Like ad.weaknesses above — all seven wired
+  # and asserted in both postures — these default TRUE: the lab exists to be
   # attacked, and a portal with every weakness switched off is only useful as
   # the baseline half of a comparison. Each key is rendered into the
   # container's environment as WEAK_<KEY> by playbooks/app.yml, and

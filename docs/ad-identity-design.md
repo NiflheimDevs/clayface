@@ -778,7 +778,8 @@ Two different things, kept separate on purpose:
 - **Baseline** — what this design builds by default. Reasonably secure, and
   realistic. Sections 3 through 10.
 - **Planted weakness** — a deliberate, documented degradation of the baseline,
-  enabled by a configuration toggle. Section 13. **None of these exist yet.**
+  enabled by a configuration toggle. Section 13. **All seven exist as of
+  2026-09-25**, each applied by the playbook that owns the object it changes.
 
 A third category also exists and is worth distinguishing from both:
 
@@ -796,9 +797,15 @@ scope. Conflating them would overstate the lab's intentionality.
 
 ## 13. Deliberate weakness candidates
 
-Designed, **not built**. Each maps to one of the seven categories in the brief,
-and each is expressible as a var-gated overlay on the baseline rather than a
-second code path — which is what makes "enable it later with Ansible" cheap.
+**Built, 2026-09-25.** All seven are wired, each by the playbook that owns the
+object it changes — `ad.yml` (W1, W3, W5, W6, W7), `client.yml` (W2) and
+`ad_gpo.yml` (W4) — and each is asserted in both postures by
+`ansible/playbooks/ad_validate.yml`. On is the lab's default posture, matching
+`app.weaknesses`. Each maps to one of the seven categories in the brief, and
+each is expressible as a var-gated overlay on the baseline rather than a second
+code path — which is what made "enable it later with Ansible" cheap. The
+Chapter 4 expansion is `docs/planted-weaknesses.md`. **The table below is
+unchanged: it is the specification these toggles implement.**
 
 The enabling mechanism: `microsoft.ad.user` and `microsoft.ad.computer` already
 expose `spn`, `delegates` (the `msDS-AllowedToActOnBehalfOfOtherIdentity`

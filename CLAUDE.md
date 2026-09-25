@@ -167,8 +167,8 @@ VM, a Windows `dc01` VM (from the Windows Server base image) that
 `playbooks/dc.yml` promotes to the forest root, an `app01` VM in the DMZ
 (from the Ubuntu app base image) that `playbooks/app.yml` deploys the
 containerized portal to, and a `client01` Windows 11 workstation (from the
-client base image) that `playbooks/client.yml` joins to the DC — currently
-commented out of `lab.yaml`. The two Alpine placements are commented out too.
+client base image) that `playbooks/client.yml` joins to the DC — active in
+`lab.yaml` at `ip: 10.0.0.20`. The two Alpine placements are commented out too.
 The **internal** user/server split (`10.0.20.0/24` / `10.0.30.0/24`) is not
 built: `dc01`, `client01` and IDP01 are one flat segment. Don't assume
 components exist; check first.

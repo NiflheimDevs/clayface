@@ -136,24 +136,34 @@ Outstanding in this phase:
 
 ### Phase 4 — Plant and wire the remaining weaknesses (AD privesc to DA)
 
-The `ad.weaknesses` toggles in `lab.yaml` are all `false` and read by
-nothing. For the chain to reach Domain Admin they have to become real.
+**Done** (2026-09-25). All seven `ad.weaknesses` toggles in `lab.yaml` are wired
+and asserted in both postures. The design is `docs/ad-identity-design.md`
+section 13 — its normal-to-vulnerable table is the specification, and the
+toggles now implement it — and the Chapter 4 section is
+`docs/planted-weaknesses.md` (what each weakness is, the attack it enables, its
+detection signal, and which route in the chain leans on it). The seven are split
+across **three** playbooks, not the one this bullet named: `ad.yml` owns W1, W3,
+W5, W6 and W7, `client.yml` owns W2 (a local group membership, so it has no
+domain-side owner) and `ad_gpo.yml` owns W4. Each play asserts the toggles it
+implements and `ad_validate.yml` asserts all seven, in both postures: with every
+toggle on the validator is green, with every toggle off it is green again, so
+"off" is a real configuration change that restores the baseline rather than a
+skipped task. On is the lab's default posture, matching `app.weaknesses`. The
+exfiltration subject exists too: `data.shares` in `lab.yaml` (the Finance share
+on DC01, the Projects share on CLIENT01), planted by `lab_data.yml`.
 
-- Wire the toggles into `ad.yml`. Each `true` must produce a genuine
-  misconfiguration — a configuration delta where both states run, per
-  `ignoreme/scenario-design.md`, not a disabled route. Candidates: a
-  Kerberoastable SPN account, an ACL edge (GenericAll / WriteDACL),
-  unconstrained or constrained delegation, excessive group membership,
-  excessive IDP directory permissions.
-- Pick one clean `svc-app-portal` → Domain Admin path — for example, the
-  recovered account is Kerberoastable, or holds an ACL edge to a privileged
-  group. One chain, not all of them.
-- Plant data to exfiltrate. The proposal's impact analysis needs a subject:
-  fake shares and documents on CLIENT01 / DC01 beyond APP01's own seed.
-- Document each planted weakness — what it is, why a real organization would
-  have it, which attack it enables, and the correct configuration. This is
-  the Chapter 4 planted-weakness section that does not exist yet; APP01's
-  toggle table is the worked example of the pattern.
+Outstanding in this phase:
+
+- W3's second gate is deliberately not opened. W3 is the LAPS read right on
+  `OU=Workstations`, and the LAPS GPO has a second gate: the decryption
+  principal, which stays `GG-IT-Admins` rather than being widened to a broader
+  group. Opening one gate is enough for the finding, and opening both would make
+  it indistinguishable from a broken LAPS deployment.
+- W5 is wired and asserted but is not load-bearing. Unconstrained delegation on
+  `svc-idp-ldap` is a real finding with a real detection, but the Chapter 5
+  chain reaches Domain Admin through W7, W1 and W6; W5 is offered as an adjacent
+  path, and `docs/planted-weaknesses.md` says so rather than implying the chain
+  needs it.
 
 ### Phase 5 — IDP01 / SSO build
 
