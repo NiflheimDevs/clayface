@@ -240,6 +240,17 @@ ad:
   workstation:
     logon_group: GG-Employees
     admin_group: GG-IT-Admins
+    # The account weakness W7 adds to the logon group. It is the portal's
+    # service account: the credential the Chapter 5 chain recovers from the
+    # portal database, and W7 is what makes that credential useful for
+    # something beyond a bind — it is the step that moves the attacker from
+    # the DMZ into the LAN, because the DMZ boundary allows tcp 389/636 to
+    # dc01 and nothing else.
+    #
+    # Named here rather than inline in ad.yml because ad_validate.yml asserts
+    # the same account, and a typo'd name in one place would be a silent
+    # no-op in the other.
+    weak_logon_member: svc-app-portal
 
   idp:
     bind_account: svc-idp-ldap

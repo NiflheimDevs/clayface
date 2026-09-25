@@ -146,6 +146,16 @@
           $ErrorActionPreference = 'Stop'
           Import-Module ActiveDirectory
           $want = @({% for entry in lab_ad.users | dict2items | selectattr('value.groups', 'contains', item) %}'{{ entry.key }}'{% if not loop.last %}, {% endif %}{% endfor %})
+          {% if lab_ad_weak.excessive_group_membership | bool and item == lab_ad.workstation.logon_group %}
+          # --- DELIBERATE WEAKNESS: W7, excessive_group_membership ---
+          #
+          # While the flag is on, this account is a member of the logon group
+          # on purpose and it appears in no lab.yaml `groups` list, so it is
+          # appended here rather than derived from the users map. The
+          # `item == ...` guard is what keeps it out of the role groups'
+          # expectations.
+          $want += '{{ lab_ad.workstation.weak_logon_member }}'
+          {% endif %}
           $have = @(Get-ADGroupMember '{{ item }}' |
                       Select-Object -ExpandProperty SamAccountName)
           # The logon group also holds the role groups nested inside it, so

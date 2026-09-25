@@ -216,6 +216,49 @@
       register: idp_spn
       changed_when: "'CHANGED' in (idp_spn.output | join(' '))"
 
+    # --- DELIBERATE WEAKNESS: W7, excessive_group_membership ---
+    #
+    # The portal's service account is a member of the all-employees group,
+    # which is the group that carries SeInteractiveLogonRight on the
+    # workstations (client.yml). The consequence is the chain's hinge: the
+    # credential the portal database hands over becomes an interactive logon
+    # on a domain workstation instead of a credential that can only bind
+    # LDAP. Without W7 the recovered credential cannot log on anywhere, and
+    # the DMZ boundary — tcp 389/636 to dc01 and nothing else — stops the
+    # attacker there.
+    #
+    # The finding, as an administrator would have made it: the account was
+    # added to the group so it could reach a share, and nobody revisited it.
+    #
+    # Explicit membership rather than microsoft.ad.user's `groups.add`, because
+    # the flag-off branch has to REMOVE: `add` is additive and a skipped task
+    # would leave the account in the group forever. The existence check runs
+    # first so a typo'd name fails with the name in the message instead of
+    # adding nothing and reporting success.
+    - name: Set the service account's membership of the logon group
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ActiveDirectory
+
+          $group  = '{{ lab_ad.workstation.logon_group }}'
+          $member = '{{ lab_ad.workstation.weak_logon_member }}'
+          $want   = [bool]${{ lab_ad_weak.excessive_group_membership | bool | ternary('true', 'false') }}
+
+          if (-not (Get-ADUser $member -ErrorAction SilentlyContinue)) {
+              throw "lab.yaml names '$member' as the W7 logon-group member, but no such account exists. Check ad.workstation.weak_logon_member and ad.users."
+          }
+
+          $have = @(Get-ADGroupMember $group | Select-Object -ExpandProperty SamAccountName)
+          $is   = $have -contains $member
+          if ($is -eq $want) { 'OK'; return }
+
+          if ($want) { Add-ADGroupMember -Identity $group -Members $member }
+          else       { Remove-ADGroupMember -Identity $group -Members $member -Confirm:$false }
+          "CHANGED: $group member '$member' -> $want"
+      register: ad_weak_logon_member
+      changed_when: "'CHANGED' in (ad_weak_logon_member.output | join(' '))"
+
     # Read-compare-write in one script: the cmdlet has no idempotency of its
     # own, and this is the same "the read is the idempotency key" idiom
     # dc.yml uses for the DNS forwarder.
