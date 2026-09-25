@@ -271,6 +271,61 @@
           "OK: LAPS schema present ($($a.Count) attributes)"
       changed_when: false
 
+    # --- DELIBERATE WEAKNESS: W3, excessive_laps_read ---
+    #
+    # Asserted on the ACL rather than by reading a password: the read ACE on
+    # OU=Workstations is the grant W3 makes, and the other gate (the
+    # decryption principal in the LAPS GPO) is unchanged by this weakness.
+    # Find-LapsADExtendedRights is the cmdlet-shaped answer, but it reports
+    # trustees as display names and several of the lab's principals do not
+    # resolve consistently that way; the SID comparison is exact.
+    #
+    # The OU DN is built from this play's own anchor var rather than from a
+    # registered fact: `ad_ou_dn` is registered inside ad.yml and does not
+    # exist here, and the anchor renders to the same string ad.yml computes.
+    - name: Assert the LAPS read delegation matches the declared weakness
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ActiveDirectory
+
+          $ou   = 'OU=Workstations,{{ ad_anchor_dn }}'
+          $sid  = (New-Object System.Security.Principal.NTAccount(
+                     '{{ lab_ad_netbios }}', '{{ lab_ad.workstation.logon_group }}')
+                  ).Translate([System.Security.Principal.SecurityIdentifier])
+          $want = [bool]${{ lab_ad_weak.excessive_laps_read | bool | ternary('true', 'false') }}
+
+          $has = @((Get-Acl -Path "AD:\$ou").Access | Where-Object {
+              if ($_.IsInherited) { return $false }
+              try {
+                  $_.IdentityReference.Translate(
+                      [System.Security.Principal.SecurityIdentifier]).Value -eq $sid.Value
+              } catch { return $false }
+          }).Count -gt 0
+
+          if ($has -ne $want) {
+              throw "{{ lab_ad.workstation.logon_group }} holds $($has) explicit ACE(s) on $ou; the declared weakness W3 says $want"
+          }
+
+          # The baseline ACE must survive in both postures: removing it would
+          # take LAPS away from the people whose job it is.
+          $admin = (New-Object System.Security.Principal.NTAccount(
+                      '{{ lab_ad_netbios }}', '{{ lab_ad.workstation.admin_group }}')
+                   ).Translate([System.Security.Principal.SecurityIdentifier])
+          $adminHas = @((Get-Acl -Path "AD:\$ou").Access | Where-Object {
+              if ($_.IsInherited) { return $false }
+              try {
+                  $_.IdentityReference.Translate(
+                      [System.Security.Principal.SecurityIdentifier]).Value -eq $admin.Value
+              } catch { return $false }
+          }).Count -gt 0
+          if (-not $adminHas) {
+              throw "{{ lab_ad.workstation.admin_group }} lost its LAPS read ACE on $ou — the baseline was removed"
+          }
+
+          "OK: LAPS read for {{ lab_ad.workstation.logon_group }} present=$has, baseline ACE intact"
+      changed_when: false
+
     # Two halves, and the second is the one that matters.
     #
     # Scoping is asserted on the ACL, not by a search: every authenticated

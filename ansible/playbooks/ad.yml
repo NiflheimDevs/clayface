@@ -405,6 +405,61 @@
       register: laps_read
       changed_when: "'CHANGED' in (laps_read.output | join(' '))"
 
+    # --- DELIBERATE WEAKNESS: W3, excessive_laps_read ---
+    #
+    # Every employee can read the local administrator password LAPS manages on
+    # every workstation. LAPS has two gates and this opens the first: the read
+    # right on OU=Workstations. That is enough, because a principal holding the
+    # read right reads the plaintext through the LAPS cmdlet — the second gate
+    # (the decryption principal in the LAPS GPO) only matters to someone
+    # reading the encrypted attribute directly.
+    #
+    # Why a real organization has this: the read right is what an administrator
+    # hands out when helpdesk asks to "look up a workstation password", and it
+    # is on an OU rather than on a person, so nobody sees it again.
+    #
+    # There is no Remove-LapsADReadPasswordPermission cmdlet, so the flag-off
+    # branch goes through the ACL directly — the same Get-Acl/Set-Acl idiom the
+    # IDP delegation task below uses. Only NON-INHERITED ACEs for this exact
+    # SID are removed, which is what leaves the GG-IT-Admins ACE the baseline
+    # grants on the same OU untouched. RemoveAccessRuleSpecific demands an
+    # exact match; the ACE objects are read from the live ACL, so they are.
+    - name: Let the logon group read LAPS passwords on OU=Workstations
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ActiveDirectory
+          Add-Type -AssemblyName System.DirectoryServices
+
+          $ou   = '{{ ad_ou_dn.Workstations }}'
+          $who  = '{{ lab_ad_netbios }}\{{ lab_ad.workstation.logon_group }}'
+          $sid  = (New-Object System.Security.Principal.NTAccount(
+                     '{{ lab_ad_netbios }}', '{{ lab_ad.workstation.logon_group }}')
+                  ).Translate([System.Security.Principal.SecurityIdentifier])
+          $want = [bool]${{ lab_ad_weak.excessive_laps_read | bool | ternary('true', 'false') }}
+
+          $acl  = Get-Acl -Path "AD:\$ou"
+          $mine = @($acl.Access | Where-Object {
+              if ($_.IsInherited) { return $false }
+              try {
+                  $_.IdentityReference.Translate(
+                      [System.Security.Principal.SecurityIdentifier]).Value -eq $sid.Value
+              } catch { return $false }
+          })
+
+          if ($want) {
+              if ($mine.Count -gt 0) { 'OK'; return }
+              Set-LapsADReadPasswordPermission -Identity $ou -AllowedPrincipals $who -Confirm:$false
+              'CHANGED: granted'
+          } else {
+              if ($mine.Count -eq 0) { 'OK'; return }
+              foreach ($ace in $mine) { $acl.RemoveAccessRuleSpecific($ace) | Out-Null }
+              Set-Acl -Path "AD:\$ou" -AclObject $acl
+              "CHANGED: removed $($mine.Count) ACE(s)"
+          }
+      register: laps_read_weak
+      changed_when: "'CHANGED' in (laps_read_weak.output | join(' '))"
+
     # Read-only, scoped to exactly the OUs named in lab.yaml, inherited to
     # their descendants. Everything outside that scope is denied by
     # omission — OU=Workstations (where the confidential LAPS attributes
