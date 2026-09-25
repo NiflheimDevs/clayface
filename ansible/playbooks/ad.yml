@@ -456,3 +456,85 @@
           else { "CHANGED: $($changed -join '; ')" }
       register: idp_delegation
       changed_when: "'CHANGED' in (idp_delegation.output | join(' '))"
+
+    # --- DELIBERATE WEAKNESS: W6, excessive_idp_directory_permissions ---
+    #
+    # The two extended rights that together are DCSync, granted on the DOMAIN
+    # ROOT: Replicating Directory Changes and Replicating Directory Changes
+    # All. A principal holding both can ask a domain controller to replicate
+    # the password hashes over DRSUAPI — including krbtgt's, which is a
+    # Domain Admin by way of a forged golden ticket. This is the escalation
+    # half of the Chapter 5 chain.
+    #
+    # The rights are matched by their schema GUIDs rather than by name because
+    # that is what the ACE stores and what a reader of the ACL has to look
+    # for. Both are needed: the first alone replicates non-secret attributes.
+    #
+    # Why a real organization has this: directory-sync products (Azure AD
+    # Connect, backup agents, monitoring) genuinely need it, the vendor's
+    # install guide says to grant it, and nobody narrows it afterwards.
+    #
+    # The flag-off branch builds the SAME rule object and removes it with
+    # RemoveAccessRuleSpecific, which requires an exact match — including
+    # inheritance flags — so it cannot strip an unrelated delegation.
+    # RemoveAccessRule is the looser variant and deliberately not used.
+    #
+    # This is deliberately NOT scoped to the read OUs the way the ACE above
+    # is. Replication rights are a property of the naming context, not of a
+    # subtree, so a grant that looked scoped would not replicate anything and
+    # would be a weakness in appearance only.
+    - name: Grant the IDP bind account the DCSync replication rights
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ActiveDirectory
+          Add-Type -AssemblyName System.DirectoryServices
+
+          $who  = '{{ lab_ad.idp.bind_account }}'
+          $sid  = (New-Object System.Security.Principal.NTAccount(
+                    '{{ lab_ad_netbios }}', $who)
+                 ).Translate([System.Security.Principal.SecurityIdentifier])
+          $want = [bool]${{ lab_ad_weak.excessive_idp_directory_permissions | bool | ternary('true', 'false') }}
+
+          # Replicating Directory Changes (1131f6aa-...) and Replicating
+          # Directory Changes All (1131f6ad-...).
+          $guids = @(
+              [Guid]'1131f6aa-9c07-11d1-f79f-00c04fc2dcd2',
+              [Guid]'1131f6ad-9c07-11d1-f79f-00c04fc2dcd2'
+          )
+
+          $acl  = Get-Acl -Path 'AD:\{{ ad_base_dn }}'
+          $mine = @($acl.Access | Where-Object {
+              if ($_.IsInherited) { return $false }
+              try {
+                  $_.IdentityReference.Translate(
+                      [System.Security.Principal.SecurityIdentifier]).Value -eq $sid.Value
+              } catch { return $false }
+          })
+          $changed = @()
+
+          foreach ($g in $guids) {
+              $has = @($mine | Where-Object {
+                  $_.AccessControlType -eq 'Allow' -and
+                  $_.ActiveDirectoryRights -match 'ExtendedRight' -and
+                  $_.ObjectType -eq $g
+              }).Count -gt 0
+              if ($has -eq $want) { continue }
+
+              $rule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+                  $sid,
+                  [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
+                  [System.Security.AccessControl.AccessControlType]::Allow,
+                  $g)
+              if ($want) { $acl.AddAccessRule($rule) }
+              else       { $acl.RemoveAccessRuleSpecific($rule) | Out-Null }
+              $changed += "$g=$want"
+          }
+
+          if ($changed.Count -eq 0) { 'OK' }
+          else {
+              Set-Acl -Path 'AD:\{{ ad_base_dn }}' -AclObject $acl
+              "CHANGED: $($changed -join ', ')"
+          }
+      register: ad_dcsync
+      changed_when: "'CHANGED' in (ad_dcsync.output | join(' '))"

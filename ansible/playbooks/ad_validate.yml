@@ -279,8 +279,13 @@
     # lab actually controls is which OUs the bind account holds an EXPLICIT
     # ACE on, and that is what is checked — exactly one explicit GenericRead
     # Allow on each read OU, and zero explicit ACEs anywhere else in the
-    # anchor OU, the child OUs, or the domain root. An explicit ACE on the
-    # domain root is the DCSync-shaped W6 this test exists to catch.
+    # anchor OU or the child OUs.
+    #
+    # The DOMAIN ROOT is the exception, and it is the W6 assertion: while
+    # `excessive_idp_directory_permissions` is on the account holds exactly
+    # two explicit extended-right ACEs there (the DCSync pair), and while it
+    # is off it holds none. Asserting the count rather than merely allowing
+    # "up to two" is what makes a half-restored baseline fail.
     #
     # Then the functional half: bind as the account and actually read.
     - name: Assert the IDP delegation is scoped
@@ -306,6 +311,8 @@
 
           $scope   = @({% for dn in ad_scope_dns %}'{{ dn }}'{% if not loop.last %}, {% endif %}{% endfor %})
           $allowed = @({% for dn in ad_read_ous_dn %}'{{ dn }}'{% if not loop.last %}, {% endif %}{% endfor %})
+          $root    = '{{ ad_base_dn }}'
+          $rootWant = if ([bool]${{ lab_ad_weak.excessive_idp_directory_permissions | bool | ternary('true', 'false') }}) { 2 } else { 0 }
 
           foreach ($dn in $scope) {
               $explicit = @((Get-Acl -Path "AD:\$dn").Access |
@@ -316,8 +323,12 @@
                       $explicit[0].ActiveDirectoryRights -notmatch 'GenericRead') {
                       throw "$dn should carry exactly one explicit GenericRead Allow ACE for the bind account, found $($explicit.Count)"
                   }
+              } elseif ($dn -eq $root) {
+                  if ($explicit.Count -ne $rootWant) {
+                      throw "$dn carries $($explicit.Count) explicit ACE(s) for the bind account; the declared weakness W6 says $rootWant"
+                  }
               } elseif ($explicit.Count -ne 0) {
-                  throw "$dn carries $($explicit.Count) explicit ACE(s) for the bind account — the delegation is too broad (this is what weakness W6 looks like)"
+                  throw "$dn carries $($explicit.Count) explicit ACE(s) for the bind account — the delegation is too broad, and it is not the domain-root grant W6 declares"
               }
           }
 
