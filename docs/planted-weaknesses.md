@@ -32,7 +32,7 @@ The Chapter 5 engagement reaches Domain Admin through one clean path. It is
 worth stating which toggles it needs, because the others are not decoration —
 they are separate, individually documented findings.
 
-**The escalation (W1 and W6).** The attacker recovers `svc-app-portal`'s
+**The escalation (W7, W1 and W6).** The attacker recovers `svc-app-portal`'s
 credential from the portal's database, and the DMZ boundary permits that
 credential to bind LDAP on `dc01` (tcp 389/636, the documented pivot). What
 that credential *cannot* do is reach the LAN: the boundary allows nothing else,
