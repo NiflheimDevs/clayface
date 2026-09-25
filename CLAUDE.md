@@ -21,6 +21,10 @@ Docs hierarchy:
   and is not read by any tooling. Machine-consumed facts live in `lab.yaml`
   (see the data flow rule below); if the knowledge base contradicts
   `lab.yaml` or the code, `lab.yaml`/code wins.
+- `docs/planted-weaknesses.md` — the Chapter 4 planted-weakness section: every
+  `ad.weaknesses` toggle, its owning playbook, the attack it enables, the
+  correct configuration, and the detection signal. Section 13 of the design doc
+  is the authoritative table; this is its expansion.
 - `red-clay/` — Obsidian vault: personal notes, learning courses, and a work
   journal. **They can be outdated or aspirational** — if a doc contradicts
   the actual code/config in `terraform/` or `ansible/`, trust the code, and
