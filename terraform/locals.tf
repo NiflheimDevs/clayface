@@ -23,10 +23,12 @@ locals {
     for name, p in local.vm_placements : name => try(p["network"], "lan")
   }
 
-  # The edge VM is the only guest with more than one leg: `lan` inside and
-  # `wan` outside. Not a lab.yaml fact because it is a property of what
-  # OPNsense IS here, not a placement choice someone makes.
-  gateway_networks = ["lan", "wan"]
+  # The edge VM is the only guest with more than one leg: `lan` inside, `wan`
+  # outside, `dmz` for the segment the attacker lands in. Not a lab.yaml fact
+  # because it is a property of what OPNsense IS here, not a placement choice
+  # someone makes. Order is NIC order — see the append-only note in the
+  # opnsense module.
+  gateway_networks = ["lan", "wan", "dmz"]
 
   edge_host = local.lab["edge"]["host"]
 

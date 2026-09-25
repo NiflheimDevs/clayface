@@ -60,9 +60,12 @@ The authoritative worklist is `docs/app01-verification-pending.md`.
 - Re-enable `dc01` and `client01` in `lab.yaml` — they are currently
   commented out, so the lab as committed builds only `app01`. The domain
   needs both back.
-- Host prep: `systemctl enable --now sshd docker`; recreate the `vm-br0`
+- Host prep: `systemctl enable --now sshd docker`; recreate the `vm-lan0`
   bridge (`playbooks/hosts.yml`); point the control node's resolver at the
-  lab DNS (`resolvectl dns vm-br0 10.0.0.1`).
+  lab DNS (`resolvectl dns vm-lan0 10.0.0.1`). Note that `hosts.yml` sets
+  this at runtime only — it is lost on reboot. To make it persist:
+  `sudo nmcli con mod vm-lan0 ipv4.dns 10.0.0.1 ipv4.ignore-auto-dns yes`
+  then `sudo nmcli con up vm-lan0` (which bounces the lab interface).
 - APP01 base-image hazards, all before anything boots: back up
   `ubuntu24.04-base`; `chown` it to `libvirt-qemu`; and
   `virsh undefine ubuntu-base --nvram`. This last one is the highest-risk
@@ -71,7 +74,7 @@ The authoritative worklist is `docs/app01-verification-pending.md`.
 - Run `terraform plan` (the first time ever for the `app` module), read it
   carefully — it must not propose replacing `dc01` or `client01` — then
   `apply`.
-- Verify the guest contract: SSH to `clayface@10.0.0.30`; confirm the docker
+- Verify the guest contract: SSH to `clayface@10.0.10.10`; confirm the docker
   CLI, the compose v2 plugin, docker-group membership, and sudo are all
   present in the image.
 - Run `app.yml` (the first Docker build ever), then `app_validate.yml` — it
@@ -92,17 +95,28 @@ The authoritative worklist is `docs/app01-verification-pending.md`.
 
 ### Phase 2 — Multi-host and DMZ segmentation
 
+**The DMZ half is done** (2026-09-25, `docs/network-plan.md` Part B); the
+design is `docs/network-design.md`. What landed: the `dmz` segment
+(`10.0.10.0/24`, bridge `vm-dmz0`, VXLAN 101), a third NIC on OPNsense, APP01
+moved to `10.0.10.10`, and `ansible/playbooks/opnsense_dmz.yml` building the
+boundary — five filter rules from `networks.dmz.allow` in lab.yaml, two logged
+denies, a dnsmasq range so APP01 gets a lease at all, and Unbound on the new
+leg. A pivot from APP01 to dc01 now crosses a filtered, logged boundary, which
+closes the `docs/TODO.md` caveat that a DMZ compromise used to be equivalent to
+an internal foothold.
+
+Outstanding in this phase:
+
 - Re-enable `host_b` in `lab.yaml` plus its provider block and per-module
-  blocks in `terraform/main.tf`, and bring up the VXLAN single-peer mesh.
+  blocks in `terraform/main.tf`, and bring up the VXLAN single-peer mesh. The
+  DMZ's VXLAN 101 is declared and will follow automatically — the segment/VNI
+  pairing is data now, not a second code path.
 - Record the connectivity matrix — every VM reaching every other VM across
-  both hosts. This is a Chapter 5 metric; capture it as you verify it.
-- Build the DMZ: a second bridge/VLAN + VXLAN (the `hosts.yml` pattern
-  repeats); a second OPNsense interface; a second NIC on APP01 in its module;
-  OPNsense filter rules for the DMZ↔internal boundary.
-- Re-place the VMs: APP01 in the DMZ; DC01, CLIENT01, and IDP01 internal.
-  Verify that a pivot from APP01 to the internal zone now crosses a filtered
-  boundary — this closes the `docs/TODO.md` caveat that a DMZ compromise is
-  currently equivalent to an internal foothold.
+  both hosts, **and per zone**, since the DMZ makes "reachable" a two-part
+  answer. This is a Chapter 5 metric; capture it as you verify it.
+- Split the internal zone itself (`10.0.20.0/24` / `10.0.30.0/24`, the
+  user/server split). DC01, CLIENT01 and IDP01 currently share one flat
+  segment, which is honest but is not the topology the proposal draws.
 
 ### Phase 3 — External attacker entry (WAN)
 
@@ -114,7 +128,7 @@ The authoritative worklist is `docs/app01-verification-pending.md`.
   unset.
 - Build the Kali attacker VM on the WAN side. Prefer a Terraform module over
   a hand-made VM, for consistency and to keep the reproducibility metric
-  honest. Place it on the OPNsense WAN leg, outside `vm-br0`.
+  honest. Place it on the OPNsense WAN leg, outside `vm-lan0`.
 - Prove the entry: Kali reaches APP01 through the WAN port-forward, and
   nothing else internal is reachable from the WAN.
 

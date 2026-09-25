@@ -1,5 +1,5 @@
 output "vms" {
-  description = "Map of VM name to { hypervisor, role, os_family, network, bridge, mac, ip }. hypervisor is the libvirt host alias from lab.yaml; role is the terraform module that built the VM ('gateway' for the OPNsense edge VM, otherwise the `module:` value from lab.yaml - 'dc', 'client', 'alpine', 'app') and names the Ansible playbook that owns it; os_family is 'windows' or 'linux' and decides how Ansible connects; network is the lab.yaml segment the VM sits on; bridge is that segment's bridge device, and the gateway additionally carries `bridges`, the list of every leg it is attached to; mac is the pinned NIC MAC for modules that derive one; ip is the optional static address declared in lab.yaml. Consumed by the Ansible dynamic inventory."
+  description = "Map of VM name to { hypervisor, role, os_family, network, bridge, mac, ip }. hypervisor is the libvirt host alias from lab.yaml; role is the terraform module that built the VM ('gateway' for the OPNsense edge VM, otherwise the `module:` value from lab.yaml - 'dc', 'client', 'alpine', 'app') and names the Ansible playbook that owns it; os_family is 'windows' or 'linux' and decides how Ansible connects; network is the lab.yaml segment the VM sits on; bridge is that segment's bridge device, and the gateway additionally carries `bridges`, the list of every leg it is attached to, and `dmz_mac`, the pinned MAC of its DMZ NIC; mac is the pinned NIC MAC for modules that derive one; ip is the optional static address declared in lab.yaml. Consumed by the Ansible dynamic inventory."
 
   value = merge(
     {
@@ -9,12 +9,21 @@ output "vms" {
         os_family  = "linux"
         # The edge VM has no `vm_placements` entry, so it has no `network:`
         # either. Its inside leg is the LAN segment; `bridges` names every leg
-        # it holds, which is what lets start_vms.yml precheck both of them.
+        # it holds, in NIC order, which is what lets start_vms.yml precheck
+        # all of them.
         network = "lan"
         bridge  = local.network_bridges["lan"]
         bridges = [for k in local.gateway_networks : local.network_bridges[k]]
         mac     = null
         ip      = null
+        # The DMZ NIC's pinned MAC, so the DMZ playbook can assert that the
+        # interface it is configuring is the device terraform attached.
+        # See modules/opnsense/outputs.tf.
+        dmz_mac = local.edge_host == "host_a" ? try(
+          module.opnsense_host_a[local.edge_vm_name].dmz_mac, null
+          ) : try(
+          module.opnsense_host_b[local.edge_vm_name].dmz_mac, null
+        )
       }
     },
     {

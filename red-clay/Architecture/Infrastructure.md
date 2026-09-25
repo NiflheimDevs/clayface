@@ -24,7 +24,7 @@ flowchart TB
         APP01["app01<br/><i>Ubuntu — Docker host</i>"]
     end
 
-    HA <-->|"VXLAN 100 over wlan0<br/>bridge vm-br0"| HB
+    HA <-->|"VXLAN 100 (lan) + 101 (dmz) over wlan0<br/>bridges vm-lan0 / vm-dmz0 / vm-wan0"| HB
 
     class OPN,DC01,CLIENT01,APP01 built
     classDef built fill:#dff5e1,stroke:#2f9e44,color:#111827

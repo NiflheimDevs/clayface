@@ -156,17 +156,19 @@ application tier on its own VM (`terraform/modules/app`, `app01` in
 `docs/app01-design.md`). It runs nginx (TLS) → a Go portal → PostgreSQL,
 all as containers, with a documented set of deliberate weakness toggles.
 
-**Not built:** IDP01 / SSO; DMZ vs internal network segmentation (still one
-flat L2 — APP01 is on it, so APP01 is not yet in a DMZ); an attacker
-machine; the remaining planted misconfigurations; planted sensitive data
-outside APP01's own seed; any executed attack; any telemetry / SIEM.
+**Not built:** IDP01 / SSO; the internal user/server split (DC01, CLIENT01
+and IDP01 still share one flat internal segment); an attacker machine; the
+remaining planted misconfigurations; planted sensitive data outside APP01's
+own seed; any executed attack; any telemetry / SIEM.
 
-Note: the supervisor email describes a DMZ Ubuntu host running
-containerized apps. The containerized Ubuntu host now **exists**, but the
-DMZ **does not** — APP01 sits on the same flat `vm-br0` as DC01 and
-CLIENT01, so it is a DMZ host without a DMZ. Say "containerized
-application host", not "DMZ host", until segmentation lands
-(`docs/TODO.md`).
+Note: the supervisor email describes a DMZ Ubuntu host running containerized
+apps. **Both halves now exist.** APP01 runs the containerized stack at
+`10.0.10.10` on `vm-dmz0`, behind a default-deny boundary on OPNsense; DC01
+and CLIENT01 are on the internal LAN at `10.0.0.0/24`. "DMZ host" is
+accurate — say it — and say *which* zone the Windows VMs are in, because the
+distinction is now load-bearing rather than aspirational. The design is
+`docs/network-design.md`; the boundary's one deliberate allowance (DMZ → dc01
+on LDAP) is what makes the Chapter 5 pivot a crossing rather than a walk.
 
 ## Chapter-by-chapter readiness
 
@@ -480,7 +482,7 @@ convention.
 | Source | Diagram | Use in thesis |
 |---|---|---|
 | `red-clay/Overview.md:22` | Full zone topology: External (KALI01, Internet, VPN pool 10.0.100.0/24) → OPNsense boundary → DMZ 10.0.10.0/24 (APP01) / user zone 10.0.20.0/24 (CLIENT01) / server-identity zone 10.0.30.0/24 (DC01, IDP01, optional modules) | **Ch4-3** — the primary topology figure |
-| `red-clay/Architecture/Infrastructure.md:14` | Physical layer: host_a / host_b, VM placement, VXLAN 100 over wlan0, bridge vm-br0 | **Ch4-3** and **Ch5** (multi-host result) |
+| `red-clay/Architecture/Infrastructure.md:14` | Physical layer: host_a / host_b, VM placement, VXLAN 100 (lan) + 101 (dmz) over wlan0, bridges vm-lan0 / vm-dmz0 / vm-wan0 | **Ch4-3** and **Ch5** (multi-host result). Note `host_b` is commented out, so the multi-host half of this figure is target, not current |
 | `red-clay/Architecture/Infrastructure.md:43` | IaC toolchain pipeline: `lab.yaml` → (yamldecode) Terraform + (dynamic inventory) Ansible, Packer → base images, `vms` output → inventory, both → running VMs | **Ch4-2 / 4-4** — this *is* the tooling-pipeline figure; it already exists |
 | `red-clay/Architecture/Identity.md:11` | Traditional AD identity (DC01 ← Kerberos/NTLM ← CLIENT01) vs modern app identity (portal → OIDC/SAML → IDP01), with planned federation | **Ch4-4** identity design; also the figure that visualises the `[PENDING]` IDP01 decision |
 | `red-clay/Attacker/Attack Paths.md:8` | Two numbered attack chains: (1) stolen creds → VPN tunnel → user zone → CLIENT01 → AD enum/privesc → DC01; (2) public web/API exploit → APP01 → SQLi/creds → PostgreSQL, plus service identity → DC01 | **Ch5** engagement — split into one figure per chain |
@@ -490,14 +492,19 @@ overstate the built state, which is exactly the error the corrections file
 flagged in the GPT research:
 
 - `Infrastructure.md:14` styles **client01 and app01 as built on host_b**.
-  Reality (`lab.yaml`): `dc01`, `client01` *and* `app01` are all on
-  **host_a**, and `host_b` is commented out. Re-place and re-style before
-  use, or the figure contradicts the text.
+  Reality (`lab.yaml`): `dc01` *and* `app01` are both on **host_a**, and
+  `host_b` is commented out (`client01` is commented out entirely). The
+  two-bridge label is now correct, but the two-host split is not —
+  re-place and re-style before use, or the figure contradicts the text.
 - `Overview.md:22` shows **three separate zone subnets** (10.0.10/20/30) and
-  a **VPN pool**. Reality is one flat L2 on 10.0.0.0/24 and no VPN. The
-  figure is the *target* topology — label it as such (it is the
-  supervisor-approved design, so this is legitimate in Ch4-3), and do not
-  reuse it as evidence in Ch5.
+  a **VPN pool**. As of 2026-09-25 reality is **two** of those three: a DMZ at
+  `10.0.10.0/24` and an internal zone at `10.0.0.0/24` (not `10.0.20.0/24`),
+  with the internal user/server split still unbuilt and the VPN pool declared
+  but unimplemented. The figure remains the *target* topology — label it as
+  such (it is the supervisor-approved design, so this is legitimate in Ch4-3),
+  and do not reuse it as evidence in Ch5. The zone that is real is real: the
+  DMZ and its boundary can be cited, with `docs/network-design.md` as the
+  source.
 - `Attack Paths.md:8` chain 1 begins with **stolen VPN credentials**, which
   is a different entry premise from the confirmed attacker model
   (external, no prior foothold, in through the edge). **Chain 2 —

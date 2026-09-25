@@ -49,6 +49,62 @@ networks:
     dns: 10.0.10.1
     monitor: 10.0.10.2/24
     vxlan_id: 101
+
+    # The dynamic pool dnsmasq serves on this leg. Needed because a guest
+    # whose MAC has no reservation gets *nothing* otherwise, and because the
+    # range is what makes dnsmasq serve DHCP here at all. app01 is not in it:
+    # it has a reservation (its `ip:` above, joined to terraform's pinned MAC
+    # by opnsense.yml). `subnet_mask` is deliberately not repeated — dnsmasq
+    # takes it from the interface address, and a second copy could only
+    # disagree with `subnet`.
+    dhcp_start: 10.0.10.100
+    dhcp_end: 10.0.10.200
+
+    # THE BOUNDARY, as data. Every pass rule the DMZ firewall gets, and
+    # nothing else: anything not listed here is denied by the default-deny
+    # that follows these rules, and the two logged deny rules the playbook
+    # adds make an attempted pivot visible rather than silent.
+    #
+    # It lives here, rather than inside the playbook, because "what may the
+    # zone the attacker lands in reach?" is the single most consequential
+    # decision in this wave. As a lab.yaml list it is a diff a supervisor can
+    # read; buried in Ansible it would only be discoverable by reading a
+    # playbook. `app.weaknesses` is the same pattern: a design decision
+    # expressed as data, read by a playbook, asserted by a validator.
+    #
+    # The first entry is the deliberate allowance and it is load-bearing: the
+    # documented Chapter 5 chain loots the svc-idp-ldap credential out of the
+    # portal database and binds to LDAP on dc01 with it. app01 is not
+    # domain-joined, so that bind is the only pivot there is. Deny it and the
+    # chain dies. It stays narrow (a bind on 389/636, not a forest search —
+    # 3268/3269 are closed, and that difference is noticed by an attacker and
+    # intended by the design), and it is logged.
+    #
+    # `ports:` is a list, but a firewall rule carries exactly one port (or one
+    # range, or an alias — never a list), so an entry naming several becomes
+    # several rules. The firewall's rule count is therefore not this list's
+    # length; opnsense_dmz.yml has the long version.
+    allow:
+      - descr: LDAP bind to the domain controller (the documented pivot)
+        proto: tcp
+        ports: [389, 636]
+        from: dmz
+        to: 10.0.0.10
+      - descr: DNS, so dc01.clayface resolves and the pivot is a hostname
+        proto: tcp/udp
+        ports: [53]
+        from: dmz
+        to: 10.0.10.1
+      - descr: DHCP from the firewall's own DMZ address
+        proto: udp
+        ports: [67]
+        from: dmz
+        to: 10.0.10.1
+      - descr: Internal users browsing the portal
+        proto: tcp
+        ports: [443]
+        from: lan
+        to: 10.0.10.10
   wan:
     bridge: vm-wan0               # NAT leg: no subnet, no gateway, no overlay
 
@@ -103,7 +159,8 @@ vm_placements:
   app01:
     module: app
     host: host_a
-    ip: 10.0.0.30
+    network: dmz
+    ip: 10.0.10.10
   # alpine01:
   #   module: alpine
   #   host: host_a

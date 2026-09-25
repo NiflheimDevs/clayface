@@ -351,7 +351,53 @@ Result: `virsh domiflist app01` shows exactly **one** interface, on `vm-dmz0`.
 
 ### B2. OPNsense — what is baked vs what is automated
 
-**The finding, stated with its confidence.** OPNsense's public API documentation
+> **Amended 2026-09-25, from the live box.** The paragraphs below were written
+> from documentation and end in "attempt it and see". That attempt has now been
+> made, and the answer is **no**: there is no REST API for an interface's IPv4
+> address on the OPNsense release this lab runs. The original text is kept
+> underneath as the record of what was known before the attempt; the finding
+> that replaces it is this:
+>
+> - **The assignment *is* API-settable.** `/api/interfaces/assignment/`
+>   (`searchItem`, `addItem`, `delItem`, `reconfigure`) exists and works: it is
+>   what creates the `opt1 → vtnet2` row. This is the `assignments` controller
+>   the original text could not find in the published docs.
+> - **The address is not.** On this release the assignment model carries seven
+>   fields — `descr`, `identifier`, `icon`, `optgroup`, `if`, `lock` — and
+>   covers assignment **only**. `setItem` accepts `type4`, `ipaddr`, `subnet`
+>   and `enable` without complaint, answers `{"result":"saved"}`, and writes
+>   **none** of them: the config gains `<if>`, `<descr>` and `<lock>` and
+>   nothing else. Silent and inert. `interfaces/assignment/pending` (the
+>   pending-action endpoint the newer UI drives) **404s** on this box —
+>   `{"errorMessage":"Endpoint not found"}` — which was the first signal that
+>   its controller is not the one the current docs describe.
+> - The address lives in `config.xml`, written by the **legacy
+>   `src/www/interfaces.php` form**. That path needs a GUI session
+>   (`guiconfig.inc` → `authgui.inc`) plus a CSRF token (`csrf.inc`,
+>   `LegacyCSRF::checkToken()`, from `$_POST[$securityTokenKey]` or the
+>   `X-CSRFToken` header). There is **no HTTP Basic or API-key route into
+>   legacy pages**, so it is not reachable with the credentials `deploy.sh`
+>   already has.
+> - **Only 27.1 (master) has the rich model** — `type4`/`ipaddr`/`subnet`/
+>   `enable`/`pending_action` on the assignment item, plus a working
+>   `pendingAction`. Tags 26.7.1 through 26.7.4 all still carry the thin one.
+>   Verified by reading the release tags' sources, not the docs site.
+>
+> **Therefore:** the address is a **one-time hand step**, exactly as the
+> fallback below anticipated, and `opnsense_dmz.yml` **asserts** it rather than
+> setting it — it reads the interface back and stops with the UI steps if the
+> address is missing. It is a mirrored constant of the same class as the LAN IP
+> and the DNS domain, and `docs/opnsense-image.md` records it.
+>
+> Asserting rather than scraping the legacy form was a deliberate choice. The
+> form is reachable only with a session cookie plus CSRF, which would mean a
+> **new** `LAB_OPNSENSE_PASS` credential in the user's `deploy.env` and a pile
+> of untestable session plumbing, to automate a step that happens once per lab
+> build and that fail-closed makes harmless to defer. The offer stands if the
+> manual step ever becomes a nuisance — 27.1's model is the cleaner fix.
+
+**The finding as it stood before the attempt, stated with its confidence.**
+OPNsense's public API documentation
 (`docs.opnsense.org/development/api/`) for the `interfaces` controller shows
 `settings` (`get` / `set` / `reconfigure`) and `overview`, plus sub-controllers
 for bridge / gif / gre / lagg / loopback / neighbor / vip / vlan / vxlan.
@@ -364,25 +410,16 @@ Endpoints that **are** documented:
 
 | Purpose | Endpoint | Status |
 |---|---|---|
-| Search filter rules | `GET /api/firewall/filter/searchRule` | endpoint confirmed, body unverified |
-| Add / update rule | `POST .../addRule`, `.../setRule/<uuid>` | endpoint confirmed, body unverified |
+| Search filter rules | `GET /api/firewall/filter/searchRule` | **confirmed; returns the full generated ruleset (36 rows on this box), config rules under `Firewall -> Filter -> rules`** |
+| Add / update rule | `POST .../addRule`, `.../setRule/<uuid>` | **confirmed. Returns HTTP 200 with `{"result":"failed","validations":{...}}` on rejection — the status code proves nothing, so callers must assert `result`.** |
 | Apply ruleset | `POST /api/firewall/filter/apply` | endpoint confirmed |
 | Interface list for rules | `GET /api/firewall/filter/getInterfaceList` | endpoint confirmed |
 | Unbound ACL | `/api/unbound/settings/{search_acl,add_acl,set_acl}` | endpoint confirmed, body unverified |
 | DHCP range | `/api/dnsmasq/settings/{search_range,add_range,set_range}` + `service/reconfigure` | endpoint confirmed, body unverified |
+| Config read-back | `GET /api/core/backup/download/this` | **confirmed — returns `config.xml`, which is how the playbook verifies what it wrote** |
 
 No page documents request-body field names for any of them. Read them off a
 live system (`/conf/config.xml`) — same remedy as the `d_nat` rule.
-
-**Therefore:** attempt the assignment over the API (the pre-flight recon in
-Prerequisites settles whether it is possible). If it is not, the fallback is a
-**one-time hand assignment** — assign the third NIC as `opt1`, name it `dmz`,
-give it `10.0.10.1/24` — documented in a new `docs/opnsense-image.md`. That
-file does not exist yet; there is **no** build documentation for
-`opnsense.qcow2` anywhere (`base-image/` holds only Windows files). Writing it
-is required either way, and if the assignment does end up hand-made it becomes
-a mirrored constant of the same class as the LAN IP and the DNS domain
-(`CLAUDE.md:66-78`).
 
 **The DHCP range is a hard prerequisite, not a nicety.** app01 gets its address
 from dnsmasq, so unless `opnsense_dmz.yml` enables DHCP on the DMZ interface
@@ -409,12 +446,43 @@ the never-delete design and belongs in the commit message.
 
 ### B3. The hazard that would silently void the whole change
 
-**A newly assigned OPNsense interface comes with automatic rules** — in the
-common case a pass-any-from-this-interface and a pass-any-to-this-interface.
-A freshly assigned DMZ interface is therefore **wide open in both directions
-before a single rule is written.**
+> **Amended 2026-09-25, from the live box. The premise below is false, and the
+> real property is better.** There is no pass-any-per-interface automatic rule.
+> OPNsense's generated system ruleset contains **no** rule that passes traffic
+> merely because it arrived on an interface; the automatic rules are narrow and
+> named — DHCP (68→67, 67→68), `sshlockout`, `virusprot`, IPv6 ICMP, and a
+> LAN-only anti-lockout. Everything else falls through to the default deny.
+>
+> So **a newly assigned interface is fail-closed**, not wide open: with no pass
+> rule written for it, the DMZ is denied from the moment it comes up. There is
+> no `disable_automation` field to set (confirmed absent, not merely unset) and
+> no window to close.
+>
+> This inverts the section's conclusion in a useful direction. The hazard was
+> never "the interface might be open"; it was "the deploy might *look* finished
+> while the DMZ is unreachable" — which is why the DHCP range and the address
+> are prerequisites (B2), and why the playbook fails loudly on a missing
+> address instead of quietly leaving app01 off the network. It also makes the
+> one manual step in B2 safe to defer: while the address is unset, the segment
+> is unreachable rather than unfiltered. An attacker cannot land in a zone that
+> has no route to it.
+>
+> The ordering constraint below therefore **ceases to be a safety constraint**.
+> The playbook still assigns, then writes rules, then applies — but that is
+> because a rule cannot name an interface that does not exist yet, not because
+> a window has to be closed.
+>
+> The assertion that survives, and is now the load-bearing one, is different:
+> **no rule on the DMZ interface may be an unrestricted pass.** That is checked
+> after the ruleset is written, against the interface's own rows, and catches
+> the real failure mode — a rule that is wider than it reads (a missing
+> destination port, a source of `any`) — rather than an automatic rule that
+> does not exist.
 
-If those are left on:
+**The hazard as originally written.** A newly assigned OPNsense interface comes
+with automatic rules — in the common case a pass-any-from-this-interface and a
+pass-any-to-this-interface. A freshly assigned DMZ interface is therefore wide
+open in both directions before a single rule is written. If those are left on:
 
 - the boundary is fake;
 - every check in Part D's Layer 3 fails, looking like a rule problem rather
@@ -453,7 +521,10 @@ And add an assertion, so the state is provable rather than assumed:
 ```
 
 This assertion is the most valuable part of the playbook: it converts "the
-boundary exists" from a claim into a checked precondition.
+boundary exists" from a claim into a checked precondition. **(Kept as the
+record of the intent. The assertion that was actually built checks the
+unrestricted-pass property described above — same purpose, aimed at the failure
+that exists.)**
 
 ### B4. The boundary policy
 
@@ -461,12 +532,36 @@ Rules on interface `dmz`, in order:
 
 | # | Action | Proto / port | Source | Destination | Why |
 |---|---|---|---|---|---|
-| 1 | pass | tcp 389, 636 | DMZ net | `10.0.0.10` (dc01) | **The deliberate allowance.** See below. |
-| 2 | pass | tcp+udp 53 | DMZ net | `10.0.10.1` | So `dc01.clayface` resolves and the pivot is expressible as a hostname. Narrow to the resolver, not "any". |
-| 3 | pass | udp 67 | DMZ net | `10.0.10.1` | DHCP. Normally implied by the auto-rules, so once those are off it must be written explicitly. |
+| 1 | pass | tcp 389 | DMZ net | `10.0.0.10` (dc01) | **The deliberate allowance.** See below. |
+| 1b | pass | tcp 636 | DMZ net | `10.0.0.10` (dc01) | Same rule, LDAPS. A pf rule carries one port, so 389 and 636 are two rules. |
+| 2 | pass | tcp/udp 53 | DMZ net | `10.0.10.1` | So `dc01.clayface` resolves and the pivot is expressible as a hostname. Narrow to the resolver, not "any". |
+| 3 | pass | udp 67 | DMZ net | `10.0.10.1` | DHCP. Not implied by anything once the interface is filtered, so it must be written explicitly. |
 | 4 | block (log) | any | DMZ net | `10.0.0.0/24` | The explicit deny, logged. This is the rule that produces the Ch5 evidence. |
-| 5 | block (log) | any | DMZ net | any | Catch-all, last. With auto-rules off there is an implicit deny, but an explicit logged one makes an attempted pivot *visible*. |
+| 5 | block (log) | any | DMZ net | any | Catch-all, last. There is an implicit deny, but an explicit logged one makes an attempted pivot *visible*. |
 | 6 | pass | tcp 443 | `10.0.0.0/24` | `10.0.10.10` | Optional: internal users browsing the portal. |
+
+> **Two corrections to the table above, 2026-09-25, from the live box.** Both
+> change what the table means for anyone reading it later.
+>
+> 1. **`389, 636` is not one rule.** OPNsense's `destination_port` field
+>    (`PortField`) takes **one port, one range, or an alias — never a comma
+>    list**. `addRule` answers HTTP 200 with
+>    `{"result":"failed","validations":{"rule.destination_port":"Please
+>    specify a valid portnumber, name, alias or range."}}`. Row 1 is therefore
+>    **two pf rules**, and the playbook builds it as such — `networks.dmz.allow`
+>    gives a `ports:` **list** per entry, and the playbook expands it one rule
+>    per port, suffixing `[port N]` onto the description only when an entry
+>    names more than one (so the description-keyed ownership index stays
+>    unique). **The firewall's rule count is not the length of the `allow`
+>    list** — 4 entries on this box become 5 rules.
+> 2. **`tcp+udp` is one rule, but it is spelled `tcp/udp`.** `protocol`
+>    (`ProtocolField`) does support a combined value via `<AddOptions>`; the
+>    API canonicalises it to `TCP/UDP`. Row 2 is unchanged in meaning — worth
+>    recording because it is the one place the two fields behave differently.
+>
+> The `result` assertion this implies is in B2's amended table: `addRule` and
+> `setRule` report rejection in the body, not the status code, so a playbook
+> that only checks the HTTP status silently loses rules.
 
 Rules 2 and 3 reach the firewall's own address on 53/67, which is normal and
 not a hole. **Deliberately absent: `10.0.10.1:443`.** The firewall's management
@@ -589,7 +684,7 @@ ansible edge.yml             # idempotent no-op for vm-wan0
 terraform apply              # app01 gains bridge vm-dmz0; opnsense01 gains NIC3
 ansible start_vms.yml --tags gateway
 ansible opnsense.yml         # existing DHCP/DNS pinning (app01 row -> 10.0.10.10)
-ansible opnsense_dmz.yml     # NEW: assign opt1, disable auto-rules, IP, DHCP range, filter rules
+ansible opnsense_dmz.yml     # NEW: assign opt1, DHCP range, filter rules, Unbound; assert the address
 ansible start_vms.yml --tags members
 dc.yml / ad.yml / ad_gpo.yml / client.yml / app.yml / app_validate.yml / ad_validate.yml
 ```
@@ -598,7 +693,7 @@ The two constraints, both satisfied above:
 
 1. `hosts.yml` and `edge.yml` move **above** `terraform apply` (see A4).
 2. The DMZ interface must be **assigned, DHCP-serving and filtered before app01
-   boots**, or app01 either gets no lease or sits on an unfiltered segment.
+   boots**, or app01 either gets no lease or sits on a segment with no policy.
    Both are before `--tags members`.
 
 **Failure behaviour of the intermediate states, stated plainly because it is
@@ -606,8 +701,18 @@ reassuring and non-obvious:**
 
 | State | Result |
 |---|---|
-| `opnsense_dmz.yml` never runs | app01 gets **no DHCP lease** (dnsmasq is not serving the DMZ), so `app.yml` fails loudly at `wait_for_connection`. Fails closed by accident. |
-| Interface assigned, auto-rules on, no filter rules yet | app01 has its lease and can reach **everything routable**. **This is the dangerous state**, prevented by B3's assertion and by ordering the rules before `--tags members`. |
+| `opnsense_dmz.yml` never runs | app01 gets **no DHCP lease** (dnsmasq is not serving the DMZ), so `app.yml` fails loudly at `wait_for_connection`. Fails closed. |
+| Interface assigned, no filter rules yet | app01 has no address at all (the address is the manual step) and, once it does, **denied by default** — there is no pass-any-per-interface automatic rule to leave on. Safe; see B3. |
+| Rules written but not applied | The running ruleset is still the previous one, so the DMZ is still denied. The window is between the write and the `apply`, and it closes on the next task. |
+
+`opnsense_dmz.yml` holds a third state, and it is the one `deploy.sh` must not
+swallow: on a fresh lab it **stops the deploy on purpose** at the address
+assert. Everything else it configures has already been configured by then, the
+DMZ is fail-closed in the meantime, and the alternative is a deploy that reports
+success and leaves app01 unreachable. Set the address (the play prints the exact
+UI steps), re-run the playbook, carry on from the next step. **Do not add
+`|| true` to that step** — it converts the one honest failure into a fifteen
+minute timeout inside `app.yml`, which is strictly worse to debug.
 
 ---
 

@@ -148,13 +148,22 @@ core:
           lab_yaml_key: app01
           playbook: ansible/playbooks/app.yml
           validator: ansible/playbooks/app_validate.yml
-        address: 10.0.0.30
+        address: 10.0.10.10
+        network: dmz
+        network_bridge: vm-dmz0
+        boundary: >-
+          Default-deny on OPNsense, built by
+          ansible/playbooks/opnsense_dmz.yml from networks.dmz.allow in
+          lab.yaml. Allows DMZ -> dc01 tcp 389/636 (the documented pivot),
+          DMZ -> 10.0.10.1 tcp/udp 53 and udp 67, and LAN -> app01 tcp 443;
+          denies and logs everything else. See docs/network-design.md.
         containers:
           - nginx (TLS termination, the only published port)
           - portal (Go, the deliberately vulnerable application)
           - postgres (the portal's own database)
         not_yet:
-          - DMZ segmentation (still on the flat vm-br0 L2)
+          - Internal user/server split (10.0.20.0/24, 10.0.30.0/24) - dc01,
+            client01 and IDP01 still share one flat internal segment
           - IDP01-backed authentication (the portal carries a service
             account as a credential; it does not federate)
 
@@ -656,7 +665,6 @@ attack_surface:
 technique_coverage:
   core_supports_well:
     - network_scanning
-    - VPN_initial_access
     - web_exploitation
     - API_attacks
     - SQL_injection
@@ -712,6 +720,20 @@ technique_coverage:
     "All attack techniques" is not treated as a literal requirement for
     one topology. The architecture instead aims for broad coverage
     through a lightweight core and modular extensions.
+
+  # Correction, 2026-09-25. VPN initial access used to be listed under
+  # core_supports_well, which was wrong: there is no VPN server anywhere in
+  # this lab. lab.yaml declares the pool (vpn.pool, 10.0.100.0/24) with
+  # server: none, and nothing answers on that range. It was removed from the
+  # list above rather than left in with a caveat, because a technique-coverage
+  # entry is read as "the lab can demonstrate this".
+  removed_from_core_supports_well:
+    VPN_initial_access: >-
+      No VPN server exists or is planned. The pool is declared in lab.yaml so
+      the address range has a home in the machine-read facts and no document
+      can imply the lab supports VPN initial access when it does not. The
+      confirmed attacker model is external, through the edge, against the
+      public web/API surface.
 
 # ============================================================
 # GRAPH MODEL

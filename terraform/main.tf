@@ -24,6 +24,7 @@ module "opnsense_host_a" {
   # instead — so its segments are named explicitly rather than derived.
   bridge     = local.network_bridges["lan"]
   wan_bridge = local.network_bridges["wan"]
+  dmz_bridge = local.network_bridges["dmz"]
 }
 
 module "opnsense_host_b" {
@@ -39,6 +40,7 @@ module "opnsense_host_b" {
 
   bridge     = local.network_bridges["lan"]
   wan_bridge = local.network_bridges["wan"]
+  dmz_bridge = local.network_bridges["dmz"]
 }
 
 module "alpine_host_a" {

@@ -293,12 +293,20 @@ func (s *Server) handleAPIKeys(w http.ResponseWriter, r *http.Request) {
 // With the toggle on, any URL the caller supplies is fetched from inside the
 // container network. That is server-side request forgery: the caller cannot
 // reach the internal services directly, but the portal can, so the portal
-// becomes the proxy. Reaching http://10.0.0.1/ (the edge router's management
-// interface), http://postgres:5432/ or a cloud metadata address at
-// 169.254.169.254/ are the usual first moves, and the response body is
-// returned verbatim, so a service that answers with data answers the attacker.
-// It demonstrates why an outbound fetch built from user input needs an
-// allow-list, not a deny-list.
+// becomes the proxy. Reaching http://postgres:5432/ or a cloud metadata
+// address at 169.254.169.254/ are the usual first moves, and the response body
+// is returned verbatim, so a service that answers with data answers the
+// attacker. It demonstrates why an outbound fetch built from user input needs
+// an allow-list, not a deny-list.
+//
+// http://10.0.0.1/ is NOT one of those moves, and this container is why. The
+// portal runs on app01 in the DMZ, and 10.0.0.1 is the edge router's address
+// on the LAN leg — a different interface, so the fetch does not route there at
+// all. The reachable management address from here is 10.0.10.1, and the DMZ
+// ruleset (networks.dmz.allow in lab.yaml) deliberately does not open :443 on
+// it: the segment gets LDAP, DNS and DHCP and nothing else. So a caller who
+// swaps the URL for either address gets a timeout, not an admin console, and
+// that refusal is the boundary working rather than the weakness failing.
 //
 // With the toggle off the scheme must be https and the host must not be a
 // loopback, private, link-local or unspecified address literal, and redirects

@@ -378,12 +378,12 @@
     ad_workstations_dn: "OU=Workstations,OU={{ lab_ad.ou }},{{ ad_base_dn }}"
 
   tasks:
-    - name: Fail if the inventory has no workstations
-      ansible.builtin.assert:
-        that: (groups['vms_client'] | default([])) | length > 0
-        fail_msg: >-
+    - name: Note that no workstations were joined
+      ansible.builtin.debug:
+        msg: >-
           No workstation in the inventory, so there is no machine account to
           move. Run playbooks/client.yml's first play to join them.
+      when: (groups['vms_client'] | default([])) | length == 0
 
     # microsoft.ad.computer MOVES an object it finds by `identity` when
     # `path` names a different container — no Move-ADObject needed. The `$`
@@ -393,6 +393,7 @@
         identity: "{{ item }}$"
         path: "{{ ad_workstations_dn }}"
         state: present
+      when: (groups['vms_client'] | default([])) | length > 0
       loop: "{{ groups['vms_client'] }}"
       loop_control:
         label: "{{ item }}$"
@@ -415,10 +416,12 @@
           }
       register: machine_ou
       changed_when: false
+      when: (groups['vms_client'] | default([])) | length > 0
 
     - name: Report the machine account placement
       ansible.builtin.debug:
         msg: "{{ machine_ou.output }}"
+      when: (groups['vms_client'] | default([])) | length > 0
 
 # ---------------------------------------------------------------------------
 # Play 3: force a policy refresh and prove the workstation policy landed.

@@ -175,6 +175,12 @@ def build_inventory():
         # Only the edge VM has more than one leg, so only it carries a list.
         if attrs.get("bridges"):
             hostvars["libvirt_bridges"] = attrs["bridges"]
+        # The edge VM's DMZ NIC MAC (vtnet2). opnsense_dmz.yml asserts the
+        # interface it is configuring carries it, which is what turns a NIC
+        # renumbering into a failure with a name instead of firewall rules
+        # pointing quietly at the wrong device.
+        if attrs.get("dmz_mac"):
+            hostvars["libvirt_dmz_mac"] = attrs["dmz_mac"]
         # Pinned MAC — lets playbooks/opnsense.yml tie name -> MAC -> DHCP
         # lease without hardcoding IPs.
         if attrs.get("mac"):

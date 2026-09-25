@@ -54,8 +54,8 @@ flowchart TB
     OPN --- SRV
 
     class KALI,VPN planned
-    class APP01,IDP01,OPT planned
-    class OPN,CLIENT01,DC01 built
+    class IDP01,OPT planned
+    class OPN,APP01,CLIENT01,DC01 built
 
     classDef built fill:#dff5e1,stroke:#2f9e44,color:#111827
     classDef planned fill:#f1f3f5,stroke:#adb5bd,color:#495057,stroke-dasharray:5 5
@@ -65,6 +65,18 @@ flowchart TB
 > Matches the proposal's four zones: internet-facing, DMZ, internal **user**,
 > and internal **server / data-center**. Splitting user from server is what
 > makes the lateral-movement story (`CLIENT01 → DC01`) legible.
+
+### What is real and what is not
+
+The diagram is the **target**. Two of its four zones exist; the internal split
+does not, and neither does the VPN.
+
+| Diagram element | Reality |
+| --- | --- |
+| DMZ `10.0.10.0/24`, APP01 `.10` | **Built.** APP01 is at `10.0.10.10` on `vm-dmz0`, behind a default-deny OPNsense boundary. The one deliberate allowance is APP01 → DC01 on LDAP. |
+| Internal user / server split (`10.0.20.0/24` / `10.0.30.0/24`) | **Not built.** DC01 and CLIENT01 share one flat internal segment, `10.0.0.0/24` on `vm-lan0` — the LAN the diagram does not draw. |
+| VPN pool `10.0.100.0/24` | **Declared, not implemented.** No VPN server exists (`lab.yaml` says `server: none`) and nothing answers on the range. |
+| KALI01, OPT, IDP01 | **Not built.** |
 
 ### Target addressing
 
@@ -80,8 +92,16 @@ Segmentation is enforced at OPNsense: the VPN pool and the DMZ each reach the
 internal zones only through explicit firewall rules, which is what makes
 "attacker starts with no internal trust" a real constraint rather than a claim.
 
-Addresses are the target scheme. The lab currently runs one flat
-`10.0.0.0/24` on `vm-br0` — see [[Infrastructure]].
+**The DMZ half of that sentence is now true**; the VPN half is not, because
+there is no VPN. The DMZ boundary is five pass rules (LDAP to DC01, DNS, DHCP,
+and internal users in on 443) plus two logged denies, declared as data in
+`lab.yaml` and applied by `ansible/playbooks/opnsense_dmz.yml`.
+
+Addresses above are the target scheme. What runs today: the DMZ at
+`10.0.10.0/24` on `vm-dmz0` (real, matching the diagram) and one flat internal
+LAN at `10.0.0.0/24` on `vm-lan0` (the diagram's two internal zones collapsed
+into one). `host_b` is commented out, so the lab is single-host. See
+[[Infrastructure]].
 
 ## Target stack
 

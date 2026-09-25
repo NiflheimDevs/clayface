@@ -96,6 +96,36 @@ had been written off as unavailable; an earlier conclusion of mine to that
 effect was retracted after the source was read. Treat §B2's endpoint table as
 worth re-checking the same way before relying on its "unverified" column.
 
+> **Amendment, 2026-09-25, after the DMZ was actually built.** The correction
+> above is right about **assignment** and wrong about the step after it, and
+> the gap between the two is what makes the DMZ need a hand step anyway.
+>
+> - **Assignment is playbook-settable. Confirmed in production.** The DMZ NIC
+>   is found by its terraform-pinned MAC and assigned as `opt1` by
+>   `interfaces/assignment/addItem` + `reconfigure`.
+> - **The interface's IPv4 address is not.** On 26.7 the assignment model
+>   carries seven fields (`descr`, `identifier`, `icon`, `optgroup`, `if`,
+>   `lock`) and covers assignment only. `setItem` with `type4`/`ipaddr`/
+>   `subnet`/`enable` answers `{"result":"saved"}` and writes **none** of them
+>   — success-looking and inert, which is worse than a rejection.
+>   `interfaces/assignment/pending` 404s on this release. The address lives in
+>   `config.xml`, written by the legacy `src/www/interfaces.php` form, which
+>   authenticates by GUI session plus CSRF and has no HTTP Basic or API-key
+>   route in. **Only 27.1 (master) has the model that makes the address
+>   settable**; every 26.7.x point release still has the thin one.
+>
+> **So the sentence above needs one word changed.** Interface *assignment* does
+> not need a hand-assignment fallback. The interface **address** does — and a
+> hand-set address is exactly the mirrored constant the paragraph was arguing
+> against. `ansible/playbooks/opnsense_dmz.yml` asserts it and stops with the
+> UI steps; `docs/network-design.md` §8 has the reasoning, and
+> `docs/opnsense-image.md` records it as the image's one non-automatable fact.
+>
+> Practical consequence for **this** plan: if the image migration is taken up,
+> the DMZ address is a candidate for baking (like the LAN IP and the DNS
+> domain) rather than for API-setting. Moving to 27.1 would remove the
+> question instead, at the cost of an OPNsense major upgrade mid-project.
+
 ## 2. What the base image must contain
 
 The image must be a **stock OPNsense 26.7 install on ZFS** plus exactly four

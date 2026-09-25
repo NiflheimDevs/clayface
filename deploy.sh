@@ -21,8 +21,10 @@ fi
 # the one script that must work before anything else does, in exchange for
 # one duplicated address that is already a documented mirrored constant (see
 # the exceptions list in CLAUDE.md). If you move the OPNsense LAN address,
-# change it here and in lab.yaml `networks.lan`.
-export no_proxy="clayface,10.0.0.1,localhost,127.0.0.1${no_proxy:+,$no_proxy}"
+# change it here and in lab.yaml `networks.lan`. The DMZ address is listed
+# for the same reason: opnsense_dmz.yml talks to it over the DMZ bridge, and
+# that call must not go through a proxy either.
+export no_proxy="clayface,10.0.0.1,10.0.10.1,localhost,127.0.0.1${no_proxy:+,$no_proxy}"
 export NO_PROXY="$no_proxy"
 
 TERRAFORM_DIR="$SCRIPT_DIR/terraform"
@@ -132,6 +134,30 @@ ansible-playbook \
     -i "$ANSIBLE_DIR/inventory/lab_inventory.py" \
     -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
     "$ANSIBLE_DIR/playbooks/opnsense.yml"
+
+# Builds the DMZ boundary on the edge VM: assigns the DMZ NIC as an OPNsense
+# interface, writes the filter rules (networks.dmz.allow in lab.yaml plus two
+# logged denies) and applies them, gives dnsmasq a range on that leg, and
+# points Unbound at it. Runs BEFORE the members boot, and both halves of that
+# matter: app01 gets no lease at all until dnsmasq serves the DMZ, and the
+# segment must be filtered before anything lands on it.
+#
+# One step in it is manual, and it fails loudly rather than pretending:
+# OPNsense 26.7 has no API for an interface's IPv4 address, so this playbook
+# asserts the address and stops with the UI steps if it is not set. So on a
+# fresh lab this step stops the deploy once, deliberately — everything else it
+# configures has already been configured by then, the DMZ is fail-closed in
+# the meantime (an interface with no pass rule is denied), and the alternative
+# is a deploy that "succeeds" and leaves app01 unreachable. Set the address,
+# re-run this playbook, and carry on from the next step. Failing here is
+# better than not catching it until app.yml times out at
+# wait_for_connection fifteen minutes later. See the playbook header for why
+# 27.1 does not have this problem.
+step "Ansible: build the DMZ boundary (opnsense_dmz.yml)"
+ansible-playbook \
+    -i "$ANSIBLE_DIR/inventory/lab_inventory.py" \
+    -i "$ANSIBLE_DIR/inventory/terraform_vms.py" \
+    "$ANSIBLE_DIR/playbooks/opnsense_dmz.yml"
 
 step "Ansible: start the remaining VMs (start_vms.yml --tags members)"
 ansible-playbook \

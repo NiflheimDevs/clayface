@@ -54,8 +54,11 @@
 #                             proves nothing (default 8,10,12)
 #   LAB_APP_SSRF_TARGETS      internal URLs the SSRF probe fetches, comma
 #                             separated (default http://127.0.0.1:8080/healthz
-#                             and http://10.0.0.1/ - both IP literals, because
-#                             those are what the hardened check refuses)
+#                             - an IP literal, because that is what the
+#                             hardened check refuses, and loopback, because
+#                             nothing about the DMZ boundary can change its
+#                             outcome). Set it to http://10.0.0.1/ to watch
+#                             the boundary refuse the same request instead.
 #   LAB_APP_SQLI_SEARCH_PAYLOAD
 #                             one UNION payload, replacing the default (use it
 #                             if the search query's shape is ever changed)
@@ -174,17 +177,32 @@
       {{ (lookup('env', 'LAB_APP_ORDER_IDS') | default('8,10,12', true)).split(',')
          | map('trim') | select | list }}
 
-    # SSRF targets: internal addresses only. Both are IP literals on purpose,
-    # so that they are refused for the same reason the hardened check refuses
-    # them - a hostname that resolves into the private range still passes that
-    # check, which would make the OFF assertion below fail for a reason that is
-    # not the toggle. 127.0.0.1:8080 is the portal's own listener (loopback),
-    # and /healthz answers `ok`; 10.0.0.1 is OPNsense's LAN address (mirrored
-    # constant, see opnsense.yml `opnsense_host`). A target that answers with a
-    # body is the evidence that the request was made server-side.
+    # SSRF target: an internal address, and an IP literal on purpose, so that
+    # it is refused for the same reason the hardened check refuses it - a
+    # hostname that resolves into the private range still passes that check,
+    # which would make the OFF assertion below fail for a reason that is not
+    # the toggle. 127.0.0.1:8080 is the portal's own listener (loopback) and
+    # /healthz answers `ok`, which is the evidence that the request was made
+    # server-side.
+    #
+    # 10.0.0.1 (OPNsense's LAN address) was the second default until the DMZ
+    # landed, and it was removed rather than retargeted. The portal runs on
+    # app01, in the DMZ, and the DMZ boundary refuses it the LAN - so that
+    # target's outcome is now decided by a firewall rule, and the ON assertion
+    # below would fail for a reason that is not the toggle either. Loopback is
+    # boundary-independent: no rule on any interface can change whether
+    # 127.0.0.1:8080 answers, which makes it strictly better evidence for the
+    # toggle than the LAN address ever was.
+    #
+    # The LAN address is still reachable through LAB_APP_SSRF_TARGETS, and
+    # that is now the interesting run rather than a redundant one: with the
+    # toggle ON it returns nothing, and that absence is evidence of the
+    # *boundary*. This is worth stating plainly in Chapter 4/5 rather than
+    # filing as a validator limitation - the firewall now bounds the SSRF
+    # weakness, so what that weakness can reach is a network control's doing
+    # as much as the application's.
     app_ssrf_targets_default:
       - "http://127.0.0.1:8080/healthz"
-      - "http://10.0.0.1/"
     app_ssrf_targets: >-
       {{ (lookup('env', 'LAB_APP_SSRF_TARGETS') | default('', true)).split(',')
          | map('trim') | select | list

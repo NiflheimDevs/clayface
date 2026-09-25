@@ -73,8 +73,17 @@ Exceptions to the rule — values owned elsewhere, mirrored here:
   separate knob could only ever disagree with it. Setting `LAB_DOMAIN`
   moves the inventory addresses and the forest name together.
 - **OPNsense LAN IP** (`10.0.0.1`): mirrored constant, baked into the
-  OPNsense image. Appears as `opnsense_host` in `opnsense.yml`, `lab_dns_ip`
-  in `start_vms.yml`, and `lab_dns_forwarder` in `dc.yml`.
+  OPNsense image. Appears as `opnsense_host` in `opnsense.yml` and
+  `opnsense_dmz.yml`, `lab_dns_forwarder` in `dc.yml`, the `no_proxy` list
+  in `deploy.sh`, and the default of `LAB_DNS_URL`. (`start_vms.yml`'s
+  `lab_dns_ip` is no longer a copy — it reads `networks.lan.dns` from
+  lab.yaml.)
+- **OPNsense DMZ IP** (`10.0.10.1`): mirrored constant of the same class, and
+  for a harder reason — the address is **not API-settable** on OPNsense 26.7,
+  so it is set once by hand and asserted by `opnsense_dmz.yml`. Appears as
+  the DMZ interface address (the UI step), the `no_proxy` list in
+  `deploy.sh`, and — via lab.yaml — as `networks.dmz.gateway`/`dns`, which is
+  where terraform and the rule sources read it. `docs/opnsense-image.md` §4.
 - **Gateway VM host**: the top-level `edge.host` scalar in lab.yaml, not
   listed as a placement. Exactly one edge host holds BY CONSTRUCTION (single
   scalar) — no count check. A guard local in `terraform/locals.tf` fails the
@@ -88,21 +97,37 @@ Exceptions to the rule — values owned elsewhere, mirrored here:
   `host_b` is currently commented out in `lab.yaml`, so the lab runs
   single-host; `hosts.yml` skips the VXLAN tasks when there is no peer
   (`vxlan_remote_ip` is empty).
-- Hosts are joined by a **VXLAN overlay** (vxlan100, port 4789, over `wlan0`)
-  and a bridge (`vm-br0`) — configured by the Ansible hypervisor playbook.
-- **OPNsense** VM acts as the edge (DHCP/DNS) — DNS resolves VM names so
+- Hosts are joined by a **VXLAN overlay** per segment (one `vxlan<id>` per
+  `networks` entry, port 4789, over `wlan0`) and one bridge per segment
+  (`vm-lan0`, `vm-dmz0`, `vm-wan0`) — configured by the Ansible hypervisor
+  playbook, which loops `lab_networks`.
+- **OPNsense** VM acts as the edge (DHCP/DNS/filter) — DNS resolves VM names so
   Ansible reaches VMs as `<name>.clayface` (domain owned by the OPNsense
   image, mirrored in `terraform_vms.py`).
+- **Two segments, one boundary.** `lan` (`vm-lan0`, `10.0.0.0/24`, VXLAN 100)
+  and `dmz` (`vm-dmz0`, `10.0.10.0/24`, VXLAN 101) are separate L2 domains;
+  `wan` (`vm-wan0`) is a NAT leg with no subnet and no overlay. OPNsense holds
+  one NIC per leg (LAN, WAN, then DMZ **appended third**, because NIC order is
+  device order — inserting one renumbers the rest and repoints the firewall
+  rules at the wrong interface). Design: `docs/network-design.md`.
+- **The DMZ boundary** is default-deny filter rules on OPNsense, built by
+  `playbooks/opnsense_dmz.yml` from `networks.dmz.allow` in lab.yaml, plus two
+  logged denies. The one deliberate allowance is DMZ → `dc01` on tcp 389/636:
+  it is the only pivot from the DMZ, and denying it kills the documented
+  Chapter 5 chain. Widening it (SMB, WinRM, the firewall's own `:443`) is a
+  design change, not a fix. OPNsense's generated ruleset has **no
+  pass-any-per-interface rule**, so an interface with no pass rule is denied —
+  the DMZ is fail-closed, not open.
 - **Terraform → Ansible link**: terraform's `vms` output (VM name →
-  hypervisor, role, os_family, mac, ip) feeds
+  hypervisor, role, os_family, mac, ip, network, bridge[s], dmz_mac) feeds
   `ansible/inventory/terraform_vms.py`, which groups VMs into
   `terraform_vms` (every VM, direct membership), `vms_gateway` (started
   first — it provides DHCP/DNS), `vms_windows` / `vms_linux`, the role groups
-  `vms_dc` and `vms_client`, and `vms_pinned` (VMs with both a MAC and an
-  `ip:`, i.e. the ones `opnsense.yml` manages).
+  `vms_dc`, `vms_client` and `vms_app`, and `vms_pinned` (VMs with both a MAC
+  and an `ip:`, i.e. the ones `opnsense.yml` manages).
   - **`role` IS the terraform module name** (`gateway`, `dc`, `client`,
-    `alpine`) and answers "which playbook owns this VM" — role groups are
-    deliberately narrow, so `dc.yml` never sees a workstation.
+    `app`, `alpine`) and answers "which playbook owns this VM" — role groups
+    are deliberately narrow, so `dc.yml` never sees a workstation.
   - **`os_family`** (`windows` / `linux`) answers "how does Ansible
     connect", and is the only thing that gates the WinRM connection vars.
     Orthogonal to role on purpose: a future member server would be a third
@@ -113,14 +138,21 @@ Exceptions to the rule — values owned elsewhere, mirrored here:
     `vms_linux`. `vms_linux` now honestly means Linux; the old arrangement
     put Windows VMs in it to fake "everything that needs starting", which
     only held while `dc` was the sole Windows role.
+  - **Linux connection vars are not chosen by `os_family`.** "Linux" is an
+    answer to how Ansible connects only in the sense that it is not WinRM;
+    the alpine guests carry no credentials at all. Each Linux role that needs
+    one declares its own — only `app` does today.
 - **Gateway VM** (`opnsense01`): exactly one, always on the host named by
   `edge.host` in lab.yaml. Per-host module blocks instantiate it only on
   that host; because `edge.host` is a single scalar, zero-or-two-edge states
   are impossible by construction (a typo'd name fails the plan via the
   locals.tf guard).
-- Adding a VM = one entry in `lab.yaml` under `vm_placements` (a Windows VM
-  also needs `ip:` — see the DC section). Adding a host
-  = an entry under `hosts` + one provider block + per-module blocks in
+- **Adding a segment** = one entry under `networks` in lab.yaml. No new
+  module, no new playbook, no `hosts.yml` edit: the map drives the bridges,
+  the monitor addresses, the resolvers and the VXLANs. **Adding a VM** = one
+  entry in `lab.yaml` under `vm_placements` (a Windows VM also needs `ip:`,
+  and a VM outside the LAN needs `network:` — see the DC section). **Adding a
+  host** = an entry under `hosts` + one provider block + per-module blocks in
   `terraform/main.tf` (providers can't be selected dynamically).
 
 The end goal (per the Overview and proposal): Proxmox/KVM + Terraform + Packer
@@ -128,9 +160,13 @@ The end goal (per the Overview and proposal): Proxmox/KVM + Terraform + Packer
 accounts, bad ACLs, NTLM relay targets), plus detection via Wazuh/SIEM.
 Much of this is **not built yet** — the lab currently has an OPNsense edge
 VM, a Windows `dc01` VM (from the Windows Server base image) that
-`playbooks/dc.yml` promotes to the forest root, and a `client01` Windows 11
-workstation (from the client base image) that `playbooks/client.yml` joins to
-it. The two Alpine placements are commented out in `lab.yaml`. Don't assume
+`playbooks/dc.yml` promotes to the forest root, an `app01` VM in the DMZ
+(from the Ubuntu app base image) that `playbooks/app.yml` deploys the
+containerized portal to, and a `client01` Windows 11 workstation (from the
+client base image) that `playbooks/client.yml` joins to the DC — currently
+commented out of `lab.yaml`. The two Alpine placements are commented out too.
+The **internal** user/server split (`10.0.20.0/24` / `10.0.30.0/24`) is not
+built: `dc01`, `client01` and IDP01 are one flat segment. Don't assume
 components exist; check first.
 
 ## Windows domain controller (dc01, role "dc")
@@ -166,16 +202,23 @@ components exist; check first.
      `requests.Session()`, which honours `HTTP_PROXY`; a local proxy cannot
      resolve `*.clayface` and answers with HTTP **503**, which looks exactly
      like a broken guest. `deploy.sh` exports `no_proxy` covering
-     `clayface`. Running ansible by hand needs the same variable (or
-     `env -u HTTP_PROXY`).
-  3. **The control node must resolve `<name>.clayface`.** That name is served
-     by OPNsense on the `vm-br0` leg; the machine's other resolvers have
-     never heard of the lab domain. `playbooks/hosts.yml` sets this up while
-     it configures the bridge (`resolvectl dns vm-br0 10.0.0.1`). That is
+     `clayface` and every lab address it talks to (`10.0.0.1`, `10.0.10.1`).
+     Running ansible by hand needs the same variable (or
+     `env -u HTTP_PROXY`). Playbooks that call the OPNsense API set
+     `use_proxy: false` on the `uri` module for the same reason.
+  3. **The control node must resolve `<name>.clayface`.** Those names are
+     served by OPNsense on the `vm-lan0` leg; the machine's other resolvers
+     have never heard of the lab domain. `playbooks/hosts.yml` sets this up
+     while it configures the bridges — one `resolvectl dns <bridge> <dns>`
+     per segment, looped from `lab_networks`, so the DMZ leg gets
+     `10.0.10.1` the same way the LAN leg gets `10.0.0.1`. That is
      runtime-only and lost on reboot, so on a fresh boot run hosts.yml — or
-     make it persistent with `sudo nmcli con mod vm-br0 ipv4.dns 10.0.0.1
-     ipv4.ignore-auto-dns yes` followed by `sudo nmcli con up vm-br0`
-     (bounces the lab interface).
+     make it persistent with `sudo nmcli con mod vm-lan0 ipv4.dns 10.0.0.1
+     ipv4.ignore-auto-dns yes` followed by `sudo nmcli con up vm-lan0`
+     (bounces the lab interface; **the `nmcli` advice covers the LAN leg
+     only** — the DMZ leg's resolver comes from hosts.yml, and a persistent
+     DMZ resolver additionally needs `no_proxy`/`LAB_DNS_URL` to stay
+     consistent with it).
 
   Symptom → cause: `Code 503` = proxy; `credentials were rejected` on
   `plaintext` = transport; `NameResolutionError` = control-node DNS.
@@ -290,6 +333,14 @@ Manual ansible runs follow the same pattern as deploy.sh: combine the
 lab.yaml host inventory with the terraform VM one (`-i
 inventory/lab_inventory.py -i inventory/terraform_vms.py`).
 
+**One step of a fresh deploy stops on purpose.** `opnsense_dmz.yml` asserts
+the DMZ interface's IPv4 address and cannot set it (OPNsense 26.7 has no API
+for it — see `docs/opnsense-image.md` §4 and `docs/network-design.md` §8). On
+a fresh lab the deploy halts there once, with the UI steps printed; set the
+address, re-run that playbook, carry on from the next step. Do **not** add
+`|| true` to it in `deploy.sh` — that turns one honest failure into a
+fifteen-minute `wait_for_connection` timeout inside `app.yml`.
+
 ## Known pain points / open issues
 
 - **Hypervisor addresses come from the home LAN's DHCP and can drift.**
@@ -298,7 +349,7 @@ inventory/lab_inventory.py -i inventory/terraform_vms.py`).
   lease change silently breaks `terraform plan` and `playbooks/hosts.yml`
   with `No route to host` until the new address is written back. Pin the
   lease (DHCP reservation or a static address) before relying on it; the
-  `vm-br0` leg (`10.0.0.2/24`, static in NetworkManager) is not a substitute,
+  `vm-lan0` leg (`10.0.0.2/24`, static in NetworkManager) is not a substitute,
   because hosts.yml is what creates that bridge.
 - **Image management is manual** — ISOs/qcow2 base images are copied to hosts
   by hand into `vm/images/`; provisioning does not fetch them.
@@ -315,7 +366,16 @@ inventory/lab_inventory.py -i inventory/terraform_vms.py`).
   `virsh -c qemu:///system undefine client01 --nvram`.
 - **VXLAN is a single-peer static mesh** (`vxlan_remote_ip`) — fine for two
   hosts, breaks at three. Multi-host needs full-mesh FDB entries (see
-  `vxlan_peer_ips` in lab_inventory.py) or a spine.
+  `vxlan_peer_ips` in lab_inventory.py) or a spine. Every segment now carries
+  its own VNI (`networks.<seg>.vxlan_id`), so the limitation scales with the
+  segment count as well as the host count.
+- **The edge image is hand-built and is the live artifact.** `opnsense.qcow2`
+  has no base image and no overlay; `docs/opnsense-image.md` records what is
+  baked into it, and `docs/opnsense-image-plan.md` plans the migration.
+- **The internal network is still flat.** `dc01`, `client01` and IDP01 share
+  `10.0.0.0/24`; the user/server split (`10.0.20.0/24` / `10.0.30.0/24`) is not
+  built. The DMZ boundary is real, the internal tiering is not — do not write
+  as though the lab has three internal zones.
 - libvirt provider 0.9.x has known bugs (no TTY/monitor on VMs was hit before).
 
 ## Conventions & cautions

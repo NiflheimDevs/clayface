@@ -61,31 +61,53 @@ Windows side — the portal has no dependency on `dc01` at deploy time.
   and the PostgreSQL data directory.
 - **DNS domain `clayface`**, served by OPNsense. `app01.clayface` resolves from
   the guest's first boot because the VM is pinned (section 3.2).
-- **There is no network segmentation.** One flat L2, `vm-br0`, `10.0.0.0/24`.
-  This is the most consequential fact in the whole document and section 3 is
-  about it.
+- **It sits in the DMZ.** `10.0.10.10` on `vm-dmz0`, behind a default-deny
+  boundary on OPNsense that allows exactly five things (LDAP to dc01, DNS,
+  DHCP, and internal users in on 443) and logs everything else. This is the
+  most consequential fact in the whole document and section 3 is about it.
+  The boundary is specified in `docs/network-design.md`.
 
 ---
 
 ## 3. Where APP01 sits in the lab
 
-### 3.1 Not a DMZ host, and the document says so
+### 3.1 APP01 is a DMZ host
 
 `docs/redclay.yaml` and `red-clay/Overview.md` describe a four-zone target
-topology with APP01 in a DMZ at `10.0.10.0/24`. That topology is the
-supervisor-approved design and it is still the target. It is **not** what runs.
+topology with APP01 in a DMZ at `10.0.10.0/24`. As of 2026-09-25 **that is
+what runs**, for this one zone: APP01 is at `10.0.10.10` on `vm-dmz0`, with
+`dc01` (`10.0.0.10`) and `client01` (`10.0.0.20`) on the internal LAN
+(`vm-lan0`), and OPNsense routing and filtering between them.
 
-What runs is one flat L2. APP01 is at `10.0.0.30` alongside `dc01`
-(`10.0.0.10`) and `client01` (`10.0.0.20`), reachable from them and they from
-it, with no firewall between.
+The boundary is **default-deny**, and the allowances are the deliberate part
+(see `docs/network-design.md` for the full policy):
 
-The honest consequence, recorded here because it is easy to write around
-accidentally: **APP01 being compromised is currently equivalent to an internal
-host being compromised.** Any Ch5 narrative that treats "the DMZ web app fell"
-as a weaker position than "an internal host fell" is wrong until segmentation
-lands. The segmentation work is tracked in `docs/TODO.md`, which also records
-that this tier was deliberately built before it — the containerized host is
-useful on its own, and building it first was the decision.
+| Direction | Allowed |
+|---|---|
+| DMZ → dc01 | tcp 389, tcp 636 — the documented Chapter 5 pivot |
+| DMZ → OPNsense | tcp/udp 53, udp 67 |
+| LAN → APP01 | tcp 443 — internal users browsing the portal |
+| everything else | denied, the DMZ→LAN direction logged |
+
+So the honest consequence is now the *opposite* of what this section used to
+say: **APP01 being compromised is a genuinely weaker position than an internal
+host being compromised**, and crossing from it to the domain requires the
+deliberate LDAP allowance. A Chapter 5 narrative may now treat "the DMZ web app
+fell" as a distinct step from "an internal host fell" — and the fact that the
+pivot exists only because of one narrow, logged rule is itself part of the
+story rather than a gap in it.
+
+The segmentation work is closed in `docs/TODO.md`, which keeps the history:
+this tier was deliberately built *before* segmentation, and the paragraph
+above is what that debt cost while it was outstanding.
+
+**What the boundary is not.** The hypervisor is multi-homed into every zone by
+construction — it holds a bridge for each segment and the control node has an
+address on each — so a compromised *hypervisor* is outside this model
+entirely. The boundary constrains APP01, the guest, and nothing else. That is
+a provisioning fact, not a claim about the design, and `docs/network-design.md`
+states it at length so no reader mistakes the diagram for a hypervisor
+boundary.
 
 ### 3.2 How it gets its address
 
@@ -97,7 +119,7 @@ hostname is not something Terraform knows before the VM exists.
 terraform:  mac = 52:54:00:$(sha256("app01")[0:6])   ->  52:54:00:54:e9:bb
             (+ the guest cannot change a MAC)
 
-lab.yaml:   app01: { module: app, host: host_a, ip: 10.0.0.30 }
+lab.yaml:   app01: { module: app, host: host_a, network: dmz, ip: 10.0.10.10 }
 
 opnsense.yml:  one dnsmasq host row = DHCP reservation + DNS A record
 ```
@@ -114,7 +136,7 @@ anyway: the lab has one rule for every VM, and a reservation is what gives
 ```
                     host_a · KVM
   ┌──────────────────────────────────────────────────────────────┐
-  │  app01 · 10.0.0.30 · Ubuntu 24.04 · BIOS · 4 GiB · 2 vCPU    │
+  │  app01 · 10.0.10.10 · Ubuntu 24.04 · BIOS · 4 GiB · 2 vCPU   │
   │                                                              │
   │   nginx:1.27-alpine        ← the only published ports        │
   │     :443 TLS (self-signed) ──┐   :80 redirects to :443       │
@@ -679,8 +701,12 @@ side of the contract. That step is untested — see section 16.
 Recorded so they read as choices rather than oversights. `app/README.md`
 carries the application-level list; these are the design-level ones.
 
-- **No network segmentation.** Section 3.1. The single largest gap between this
-  tier and the topology the proposal describes.
+- **No network segmentation *inside* the internal zone.** Closed for the DMZ
+  on 2026-09-25 (section 3.1): APP01 is behind a default-deny boundary now.
+  What remains unbuilt is the internal split itself — `dc01`, `client01` and
+  IDP01 still share one flat segment, so the boundary this document describes
+  is the DMZ's edge and not an internal tiering. `docs/network-design.md` has
+  the zones that do exist.
 - **The hardened posture keeps the literal in the binary.** "No hardcoded
   credential" cannot be literally true of a file that must contain the literal
   in order to be the weakness. What the toggle removes is the *use* — no
@@ -713,12 +739,18 @@ carries the application-level list; these are the design-level ones.
 
 ## 16. What is not verified
 
-Everything above was written against a lab that is currently **down**: no
-`vm-br0`, no VMs running, no docker daemon on the control node. The offline
+Everything above was written against a lab that was, at the time, **down**: no
+segments built, no VMs running, no docker daemon on the control node. The
+offline
 checks that did run — Terraform `validate` and `fmt`, `gofmt`, `go vet`,
 `go build`, YAML and JSON parsing of every touched file, `--syntax-check` on
 the three playbooks — prove the artifacts are internally consistent. They prove
 nothing about the system.
+
+Note that the *network* half of this section has since moved: the DMZ segment,
+the boundary and the DHCP/DNS the tier needs are built and asserted by
+`ansible/playbooks/opnsense_dmz.yml` (`docs/network-design.md` §10). The tier's
+own behaviour is still what this section is about.
 
 The specific untested items, with the exact command to check each and what to do
 when it fails, are in **`docs/app01-verification-pending.md`**. That file is the
@@ -736,9 +768,11 @@ closed and `app_validate.yml` has run green against a live stack.
   default. It is **unverified** (see `docs/app01-verification-pending.md`). It
   is needed for the external-attacker model the proposal commits to, and it is a
   real change to the edge firewall in the meantime.
-- **When does segmentation land?** Until it does, this tier's contribution to
-  the "no initial trust" claim is limited to the fact that the attacker has to
-  reach port 443 rather than a shell. `docs/TODO.md` has the work.
+- **When does the *internal* segmentation land?** The DMZ boundary is built
+  (section 3.1, `docs/network-design.md`). The internal zone is still flat, so
+  a foothold on `dc01` reaches `client01` without crossing anything. This
+  tier's own contribution to the "no initial trust" claim is now the boundary
+  it sits behind, which is a real one. `docs/TODO.md` records what remains.
 - **Does the tier need a second route group with a different trust story?**
   Section 4.2 argues against splitting the binary. The cost is that no scenario
   demonstrates service-to-service trust; if one is wanted, that is a second
