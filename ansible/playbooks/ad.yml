@@ -593,3 +593,42 @@
           }
       register: ad_dcsync
       changed_when: "'CHANGED' in (ad_dcsync.output | join(' '))"
+
+    # --- DELIBERATE WEAKNESS: W5, unconstrained_delegation ---
+    #
+    # TrustedForDelegation is userAccountControl bit 524288: an account trusted
+    # for UNCONSTRAINED delegation that authenticates to a host hands that host
+    # a forwardable TGT, and anything running there can capture it and
+    # impersonate the account anywhere in the forest. The classic exploitation
+    # pairs it with a coercion primitive against the DC, which is why the
+    # Chapter 4 write-up names the constrained-delegation and RBCD
+    # replacements as the fix rather than a narrower ACL.
+    #
+    # Why a real organization has this: it used to be the documented way to
+    # make a multi-hop Kerberos scenario work, an installer set it, and every
+    # later review reads the account as "expected".
+    #
+    # The unconstrained form was chosen over RBCD on client01 because it is
+    # one attribute on an account this lab already owns and because it does
+    # not require a second machine account. Section 13 lists both as the
+    # weakness's shapes.
+    #
+    # Set-ADAccountControl is idempotent by nature, but the read is still the
+    # guard so the task reports honestly whether anything moved.
+    - name: Set the delegation trust on the IDP bind account
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ActiveDirectory
+
+          $who  = '{{ lab_ad.idp.bind_account }}'
+          $want = [bool]${{ lab_ad_weak.unconstrained_delegation | bool | ternary('true', 'false') }}
+
+          $uac = (Get-ADUser $who -Properties userAccountControl).userAccountControl
+          $has = [bool]($uac -band 524288)
+          if ($has -eq $want) { 'OK'; return }
+
+          Set-ADAccountControl -Identity $who -TrustedForDelegation $want
+          "CHANGED: $who TRUSTED_FOR_DELEGATION -> $want"
+      register: ad_delegation
+      changed_when: "'CHANGED' in (ad_delegation.output | join(' '))"

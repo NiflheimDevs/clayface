@@ -442,6 +442,45 @@
       changed_when: false
       no_log: true
 
+    # --- DELIBERATE WEAKNESS: W5, unconstrained_delegation ---
+    #
+    # Asserted on userAccountControl bit 524288 (TRUSTED_FOR_DELEGATION). The
+    # negative half searches USER objects only: every domain controller is
+    # trusted for unconstrained delegation as part of being a DC, so a filter
+    # that included computer accounts would assert against the forest's normal
+    # shape and fail on a healthy lab.
+    #
+    # Note that this is NOT the load-bearing step of the Chapter 5 chain — that
+    # is W1 then W6, and it is reachable from a LAN foothold because the DMZ
+    # boundary permits tcp 389/636 to dc01 and nothing else. W5 is wired,
+    # asserted and offered as an adjacent path; docs/planted-weaknesses.md
+    # states that scoping decision rather than implying the chain needs it.
+    - name: Assert the delegation trust matches the declared weakness
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ActiveDirectory
+
+          $who  = '{{ lab_ad.idp.bind_account }}'
+          $want = [bool]${{ lab_ad_weak.unconstrained_delegation | bool | ternary('true', 'false') }}
+
+          $uac = (Get-ADUser $who -Properties userAccountControl).userAccountControl
+          $has = [bool]($uac -band 524288)
+          if ($has -ne $want) {
+              throw "$who TRUSTED_FOR_DELEGATION is $has, the declared weakness W5 says $want"
+          }
+
+          $others = @(Get-ADUser -LDAPFilter '(userAccountControl:1.2.840.113556.1.4.803:=524288)' `
+                       -Properties userAccountControl |
+                       Where-Object { $_.SamAccountName -ne $who -and
+                                      $_.SamAccountName -ne 'krbtgt' } |
+                       Select-Object -ExpandProperty SamAccountName)
+          if ($others.Count) {
+              throw "undeclared delegated user accounts: $($others -join ', ')"
+          }
+          "OK: $who TRUSTED_FOR_DELEGATION=$has, no other delegated user accounts"
+      changed_when: false
+
 - name: Validate the workstation side
   hosts: vms_client
   gather_facts: false
