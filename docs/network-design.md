@@ -432,6 +432,45 @@ from `app01`, a bind to `dc01.clayface:389` with the `svc-idp-ldap` credential
 recovered from the portal database succeeds. If this fails, the boundary has
 been drawn through the middle of the project's own attack path.
 
+### 10.1 What was actually measured, 2026-09-25
+
+Layers 1-4 above are no longer a plan. Observed:
+
+```
+opnsense_dmz.yml    ok=56 changed=0 failed=0   (idempotent over two runs)
+app_validate.yml    ok=44 changed=0 failed=0   (11/11 toggles ON, 0 drift)
+                    connected as https://app01.clayface:443
+```
+
+And the boundary probed from **inside** `app01` — the measurement the control
+node cannot make, because it holds an address on every segment and its own
+traffic therefore leaves by the LAN leg:
+
+```
+OPEN   10.0.0.10:389     the one deliberate allowance
+OPEN   10.0.0.10:636     its LDAPS half
+CLOSED 10.0.0.10:445     SMB
+CLOSED 10.0.0.10:88      Kerberos
+CLOSED 10.0.0.10:135     RPC
+CLOSED 10.0.10.1:443     the firewall's own UI, from the DMZ
+CLOSED 10.0.10.1:22      ssh on the firewall, from the DMZ
+OPEN   10.0.10.1:53      the DNS allowance
+CLOSED 8.8.8.8:53        nothing off-segment
+dc01.clayface -> 10.0.0.10
+```
+
+The `app_validate.yml` line is itself a Layer-3 result, not a separate claim:
+`app01.clayface` is a name the control node can only resolve by asking
+`10.0.10.1`, so the run exercises the DNS allowance on the DMZ leg end to end.
+
+**One caveat on the last line of the probe.** `8.8.8.8:53` being closed does
+*not* isolate the deny-any catch-all as the cause. The WAN interface has no IPv4
+address, so the lab has no route off-segment whether or not a deny rule exists.
+The catch-all is present, logged, and read back by the playbook; this probe does
+not independently prove it is what closed that path. The DMZ→LAN results have no
+such confound — those addresses are on-link and reachable from the control node,
+so `CLOSED` there is the filter and nothing else.
+
 The playbook's final report prints the boundary it built and the state of each
 assertion, and it is the fastest read of "what is actually there".
 
