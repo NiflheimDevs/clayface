@@ -438,8 +438,30 @@
     lab_ad_domain: "{{ lab_domain }}.local"
     ad_base_dn: "DC={{ lab_ad_domain | replace('.', ',DC=') }}"
     ad_workstations_dn: "OU=Workstations,OU={{ lab_ad.ou }},{{ ad_base_dn }}"
+    lab_ad_weak: "{{ (lab_ad | default({}, true)).weaknesses | default({}, true) }}"
 
   tasks:
+    # This play exists to move machine accounts, and it runs on the DC because
+    # the workstation play above is scoped to `vms_client`. That scoping is
+    # what makes the note below necessary: with no workstation in the
+    # inventory, the play that applies W2 never runs, and this play would
+    # otherwise finish reporting success with the weakness unaudited. The
+    # assert fires only when W2 is declared, so a LAN-only lab stays runnable;
+    # ad_validate.yml asserts the same condition from the DC.
+    - name: Fail if W2 is declared but no workstation was joined
+      ansible.builtin.assert:
+        that:
+          - (groups['vms_client'] | default([])) | length > 0
+        fail_msg: >-
+          `ad.weaknesses.excessive_local_admin` is on, but no workstation is
+          in the inventory, so the play that applies W2 never ran and this one
+          has nothing to move. Add client01 back under `vm_placements` in
+          lab.yaml (module `client`, with an `ip:`), then re-run this playbook.
+        success_msg: >-
+          W2 audited on {{ groups['vms_client'] | join(', ') }}; moving their
+          machine accounts below.
+      when: lab_ad_weak.excessive_local_admin | bool
+
     - name: Note that no workstations were joined
       ansible.builtin.debug:
         msg: >-

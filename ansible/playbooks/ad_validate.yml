@@ -88,6 +88,29 @@
           toggle reads as `false`, so a dropped line is a silently disabled
           weakness. See docs/ad-identity-design.md section 13 for the list.
 
+    # W2 is the one toggle with no DC-side artefact: it is a local group
+    # membership on the workstation, and its assertion lives in the second
+    # play, which is scoped to `vms_client`. A play with no hosts is skipped,
+    # not failed, so a lab without a workstation makes this playbook exit 0
+    # having asserted six weaknesses and silently skipped the seventh — the
+    # one outcome a validator exists to prevent. This pre_task is what turns
+    # that silence into a failure with a name in it, and it runs here because
+    # THIS play always has a host when the lab is up.
+    - name: Fail if W2 is declared but there is no workstation to assert it on
+      ansible.builtin.assert:
+        that:
+          - (groups['vms_client'] | default([])) | length > 0
+        fail_msg: >-
+          `ad.weaknesses.excessive_local_admin` is on, but no workstation is
+          in the inventory, so the play that asserts W2 has no host to run on
+          and this playbook would report the lab clean without checking it.
+          W2 is applied to every VM in the `client` role: add client01 back
+          under `vm_placements` in lab.yaml (module `client`, with an `ip:`),
+          run client.yml, then re-run this playbook.
+        success_msg: >-
+          W2 will be asserted on {{ groups['vms_client'] | join(', ') }}.
+      when: lab_ad_weak.excessive_local_admin | bool
+
     - name: Note any AD toggle in lab.yaml the playbooks do not know
       ansible.builtin.set_fact:
         lab_ad_weak_unknown: "{{ lab_ad_weak.keys() | reject('in', lab_ad_weak_keys) | list }}"
