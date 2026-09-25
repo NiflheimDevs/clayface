@@ -205,6 +205,47 @@
           'OK: account policy matches the design'
       changed_when: false
 
+    # --- DELIBERATE WEAKNESS: W1, kerberoastable_idp_bind ---
+    #
+    # Asserted in both postures from the toggle: with the flag on the account
+    # must carry the SPN, with it off the SPN must be gone. The second half is
+    # the negative assertion that matters — a kerberoastable account nobody
+    # declared is drift, and drift is what the whole validator exists to catch.
+    #
+    # The lab.yaml `spn` string is read here rather than repeated, so a rename
+    # in one place cannot leave the assertion checking a stale SPN.
+    - name: Assert the Kerberoastable SPN matches the declared weakness
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module ActiveDirectory
+
+          $account = '{{ lab_ad.idp.bind_account }}'
+          $spn     = '{{ lab_ad.idp.spn }}'
+          $want    = [bool]${{ lab_ad_weak.kerberoastable_idp_bind | bool | ternary('true', 'false') }}
+
+          $has     = @((Get-ADUser $account -Properties ServicePrincipalNames).ServicePrincipalNames)
+          $present = $has -contains $spn
+          if ($present -ne $want) {
+              throw "$account SPN '$spn' is $present, the declared weakness W1 says $want"
+          }
+
+          # krbtgt's own SPNs are part of how the forest works; every other
+          # user object holding one is a Kerberoastable target this lab did not
+          # declare. Computer accounts are excluded by using Get-ADUser — a
+          # machine SPN is normal and is not what Kerberoasting attacks.
+          $others = @(Get-ADUser -LDAPFilter '(servicePrincipalName=*)' `
+                        -Properties ServicePrincipalNames |
+                        Where-Object { $_.SamAccountName -ne 'krbtgt' -and
+                                       $_.SamAccountName -ne $account } |
+                        Select-Object -ExpandProperty SamAccountName)
+          if ($others.Count) {
+              throw "undeclared Kerberoastable accounts: $($others -join ', ')"
+          }
+
+          "OK: $account SPN present=$present, no other Kerberoastable user accounts"
+      changed_when: false
+
     # The schema attribute objects use lDAPDisplayName, not name: a
     # `(name=msLAPS-*)` filter matches zero objects and would leave this
     # guard permanently false, re-running a forest-wide one-way schema

@@ -175,6 +175,47 @@
         label: "{{ item.key }}"
       no_log: true
 
+    # --- DELIBERATE WEAKNESS: W1, kerberoastable_idp_bind ---
+    #
+    # A service account holding a Service Principal Name is Kerberoastable: any
+    # authenticated principal in the forest may request a TGS for it, the
+    # ticket is encrypted with the account's own key, and it can be taken away
+    # and cracked offline. No SPN means no ticket to request, which is why the
+    # flag-off branch REMOVES the SPN rather than merely not adding it.
+    #
+    # `setspn -S` refuses to write an SPN that is already held by another
+    # account, so it cannot create a duplicate; `setspn -D` removes one and is
+    # only reached when the SPN is present, which is what keeps both branches
+    # idempotent. The read is the idempotency key.
+    #
+    # The password half of W1 is not a delta and is not created here: the
+    # account is created with LAB_USER_PASS (the single shared human password,
+    # section 14) and the domain policy sets MaxPasswordAge 0, so it never
+    # rotates. That is what makes the captured ticket worth cracking, and it is
+    # why W1 needs no second change to be exploitable.
+    - name: Set the SPN that makes the IDP bind account Kerberoastable
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+
+          $account = '{{ lab_ad.idp.bind_account }}'
+          $spn     = '{{ lab_ad.idp.spn }}'
+          $want    = [bool]${{ lab_ad_weak.kerberoastable_idp_bind | bool | ternary('true', 'false') }}
+
+          $cur = @(setspn -L $account 2>$null |
+                     Select-Object -Skip 1 |
+                     ForEach-Object { $_.Trim() } |
+                     Where-Object { $_ })
+          $has = $cur -contains $spn
+          if ($has -eq $want) { 'OK'; return }
+
+          if ($want) { setspn -S $spn $account | Out-Null }
+          else       { setspn -D $spn $account | Out-Null }
+          if ($LASTEXITCODE -ne 0) { throw "setspn failed ($LASTEXITCODE) for $spn on $account" }
+          "CHANGED: $account SPN '$spn' -> $want"
+      register: idp_spn
+      changed_when: "'CHANGED' in (idp_spn.output | join(' '))"
+
     # Read-compare-write in one script: the cmdlet has no idempotency of its
     # own, and this is the same "the read is the idempotency key" idiom
     # dc.yml uses for the DNS forwarder.

@@ -246,6 +246,15 @@ ad:
     # The OUs the bind account may read. Everything else is out of scope —
     # see the negative assertions in ad_validate.yml.
     read_ous: [Users, Groups]
+    # The SPN weakness W1 gives this account (docs/ad-identity-design.md
+    # section 13). Declared here rather than inline in ad.yml because the
+    # validator asserts the same string, and two copies could disagree.
+    #
+    # The host names IDP01 because IDP01 is the service the account exists
+    # for. IDP01 does not exist yet (roadmap Phase 5 adds it at
+    # 10.0.0.30); nothing resolves an SPN by name, so the string is
+    # forward-consistent rather than broken.
+    spn: HTTP/idp01.clayface
 
   laps:
     managed_account: lapsadmin
