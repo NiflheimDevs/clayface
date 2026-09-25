@@ -823,13 +823,15 @@ object, gated by a toggle in `lab.yaml`'s `ad.weaknesses` map.
 | **W6** | Excessive IDP directory permissions | `svc-idp-ldap` has read-only on two OUs, nothing else | Add it to `Domain Admins`, or grant it *Replicating Directory Changes* / *Replicating Directory Changes All* on the domain root | Compromise IDP01, recover the bind credential, and DCSync every password hash in the domain | **Observe:** 4662 carrying the DRSUAPI control access right — the canonical DCSync detection — or a 4728/4732 group-membership event naming the service account. **Prove:** `lsadump::dcsync` or `Get-ADReplAccount` against `krbtgt` |
 | **W7** | Excessive group membership | `GG-Employees` contains three humans | Add `Domain Users`, or add a stale or contractor account that should have been removed | Every domain account gains the interactive logon right and anything else `GG-Employees` is granted | **Observe:** 4728/4732 on `GG-Employees`, and the members list diverging from `lab.yaml`. **Prove:** log on at CLIENT01 with an account that should have been refused |
 
-**Recommended first wave: W2, W3, W1 — in that order.** They chain into a
-single coherent story (employee credential → local admin on the workstation →
-LSASS → Kerberoast the bind account → directory read), each is a small
-configuration change, and each has a crisp detection. W4, W5, W6 and W7 are
-independent branches that can be added once the spine works; W5 in particular
-is the most involved to demonstrate and is best left until the SIEM phase can
-show the coercion.
+**Recommended first wave: W2, W3, W1 — in that order.** This orders the
+presentation, not the build: all seven are built and switched on, as this
+section's opening records. They chain into a single coherent story (employee
+credential → local admin on the workstation → LSASS → Kerberoast the bind
+account → directory read), each is a small configuration change, and each has a
+crisp detection. W4, W5, W6 and W7 are independent branches rather than steps in
+that spine, which is why they come after it; W5 in particular is the most
+involved to demonstrate and is best presented last, once the SIEM phase can show
+the coercion.
 
 ---
 
@@ -960,12 +962,17 @@ does not:
 
 ### 15.5 The weakness toggles
 
-Each weakness in section 13 is a key under `ad.weaknesses` in `lab.yaml`,
-defaulting to `false`. The playbooks read them and conditionally add the
-offending option to the same declarative object:
+Each weakness in section 13 is a key under `ad.weaknesses` in `lab.yaml`. All
+seven are built and ship `true` — on is the lab's default posture, matching
+`app.weaknesses` — and `ansible/playbooks/ad_validate.yml` asserts each of them
+in both postures. The playbooks read them and conditionally add or remove the
+offending option on the object the baseline already declares:
 
 ```yaml
-# illustrative shape only — not implemented in this cycle
+# The shape this design described, not a verbatim copy of the shipped task.
+# The shipped tasks are `ansible.windows.win_powershell` scripts, because the
+# flag-off branch must actively REMOVE the configuration rather than merely not
+# add it; the shipped W1 task reads the toggle as `lab_ad_weak.<key>`.
 - name: Give the IDP bind account an SPN (weakness W1)
   microsoft.ad.user:
     identity: "{{ lab_ad.idp_bind_account }}"
@@ -976,7 +983,9 @@ offending option to the same declarative object:
 
 This is the reason the candidates were chosen: none of them needs a new code
 path. The baseline object and the weakened object are the same object with
-different keys.
+different keys. The shipped W1 task (`ad.yml`, "Set the SPN that makes the IDP
+bind account Kerberoastable") is the worked example: `setspn -S` and
+`setspn -D` are the two branches of that one toggle.
 
 ---
 
