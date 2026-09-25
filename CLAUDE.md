@@ -212,13 +212,16 @@ components exist; check first.
      while it configures the bridges — one `resolvectl dns <bridge> <dns>`
      per segment, looped from `lab_networks`, so the DMZ leg gets
      `10.0.10.1` the same way the LAN leg gets `10.0.0.1`. That is
-     runtime-only and lost on reboot, so on a fresh boot run hosts.yml — or
-     make it persistent with `sudo nmcli con mod vm-lan0 ipv4.dns 10.0.0.1
-     ipv4.ignore-auto-dns yes` followed by `sudo nmcli con up vm-lan0`
-     (bounces the lab interface; **the `nmcli` advice covers the LAN leg
-     only** — the DMZ leg's resolver comes from hosts.yml, and a persistent
-     DMZ resolver additionally needs `no_proxy`/`LAB_DNS_URL` to stay
-     consistent with it).
+     runtime-only and lost on reboot, so on a fresh boot **re-run hosts.yml**;
+     there is no supported way to make it persistent, because the bridges are
+     created with `ip link add ... type bridge` and NetworkManager does not
+     manage them — `nmcli device status` reports every segment bridge as
+     `connected (externally)`. A profile named `vm-lan0` does exist in NM's
+     store (with `10.0.0.2/24` in it), so `nmcli con mod vm-lan0 ...` edits a
+     real file, but whether `nmcli con up vm-lan0` takes the device over
+     cleanly is untested and the outcome would be a lab-wide outage if it
+     went wrong. `hosts.yml` uses `resolvectl` for exactly this reason, and
+     the same applies to the DMZ leg.
 
   Symptom → cause: `Code 503` = proxy; `credentials were rejected` on
   `plaintext` = transport; `NameResolutionError` = control-node DNS.

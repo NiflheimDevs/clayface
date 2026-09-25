@@ -60,12 +60,14 @@ The authoritative worklist is `docs/app01-verification-pending.md`.
 - Re-enable `dc01` and `client01` in `lab.yaml` — they are currently
   commented out, so the lab as committed builds only `app01`. The domain
   needs both back.
-- Host prep: `systemctl enable --now sshd docker`; recreate the `vm-lan0`
-  bridge (`playbooks/hosts.yml`); point the control node's resolver at the
-  lab DNS (`resolvectl dns vm-lan0 10.0.0.1`). Note that `hosts.yml` sets
-  this at runtime only — it is lost on reboot. To make it persist:
-  `sudo nmcli con mod vm-lan0 ipv4.dns 10.0.0.1 ipv4.ignore-auto-dns yes`
-  then `sudo nmcli con up vm-lan0` (which bounces the lab interface).
+- Host prep: `systemctl enable --now sshd docker`; recreate the segment
+  bridges (`playbooks/hosts.yml`); point the control node's resolver at the
+  lab DNS (`resolvectl dns vm-lan0 10.0.0.1`, and the same for `vm-dmz0` with
+  `10.0.10.1`). Note that `hosts.yml` sets this at runtime only — it is lost
+  on reboot, so re-run hosts.yml after one. It is not made persistent with
+  `nmcli`: the bridges are created with `ip link add ... type bridge`, so
+  NetworkManager reports them `connected (externally)` and does not manage
+  them. `hosts.yml` uses `resolvectl` for that reason.
 - APP01 base-image hazards, all before anything boots: back up
   `ubuntu24.04-base`; `chown` it to `libvirt-qemu`; and
   `virsh undefine ubuntu-base --nvram`. This last one is the highest-risk

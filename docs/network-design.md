@@ -161,17 +161,34 @@ read; buried in Ansible it would only be discoverable by reading a playbook.
 The precedent is `app.weaknesses` — a design decision expressed as data, read by
 a playbook, asserted by a validator.
 
-Rules on the DMZ interface, in order:
+Rules, in the order the firewall actually holds them — this is the sequence
+`opnsense_dmz.yml` reports at the end of a run, and the numbers below are the
+live `sequence` values, not a reading order someone chose:
 
-| # | Action | Proto / port | Source | Destination | Why |
-|---|---|---|---|---|---|
-| 1 | pass | tcp 389 | DMZ net | `10.0.0.10` (dc01) | **The one deliberate allowance.** Section 5.1. |
-| 2 | pass | tcp 636 | DMZ net | `10.0.0.10` (dc01) | Same allowance, LDAPS. |
-| 3 | pass | tcp/udp 53 | DMZ net | `10.0.10.1` | So `dc01.clayface` resolves and the pivot is expressible as a hostname. |
-| 4 | pass | udp 67 | DMZ net | `10.0.10.1` | DHCP. Must be written explicitly — nothing else provides it. |
-| 5 | block (log) | any | DMZ net | `10.0.0.0/24` | The explicit deny. This is the rule the Chapter 5 evidence comes from. |
-| 6 | block (log) | any | DMZ net | any | Catch-all, last. An attempt to pivot is *visible*, not merely dropped. |
-| 7 | pass | tcp 443 | `10.0.0.0/24` | `10.0.10.10` | Internal users browsing the portal. |
+| # | Action | Proto / port | On | Source | Destination | Why |
+|---|---|---|---|---|---|---|
+| 1 | pass | tcp 389 | `opt1` | DMZ net | `10.0.0.10` (dc01) | **The one deliberate allowance.** Section 5.1. |
+| 2 | pass | tcp 636 | `opt1` | DMZ net | `10.0.0.10` (dc01) | Same allowance, LDAPS. |
+| 3 | pass | tcp/udp 53 | `opt1` | DMZ net | `10.0.10.1` | So `dc01.clayface` resolves and the pivot is expressible as a hostname. |
+| 4 | pass | udp 67 | `opt1` | DMZ net | `10.0.10.1` | DHCP. Must be written explicitly — nothing else provides it. |
+| 5 | pass | tcp 443 | `lan` | `10.0.0.0/24` | `10.0.10.10` | Internal users browsing the portal. The only row not on the DMZ leg. |
+| 6 | block (log) | any | `opt1` | DMZ net | `10.0.0.0/24` | The explicit deny. This is the rule the Chapter 5 evidence comes from. |
+| 7 | block (log) | any | `opt1` | DMZ net | any | Catch-all, last. An attempt to pivot is *visible*, not merely dropped. |
+
+The `On` column is not decoration: row 5 is a rule on the **LAN** interface
+about DMZ traffic, and reading the table without it invites the conclusion that
+the DMZ leg carries a pass rule into `10.0.10.10`, which it does not. The two
+blocks come after it so that the DMZ leg's own list ends with its catch-all —
+which is what makes the denies the last thing the DMZ leg evaluates.
+
+**The table is a one-way ratchet, and that is deliberate.** `allow` is applied
+by creating and updating rules, never by deleting them, so *adding* an entry
+converges on the next run but *removing* one does not: the rule stays on the
+firewall and simply stops being one lab.yaml asks for. The playbook fails the
+run when it finds such a rule rather than deleting it — it cannot tell "lab.yaml
+no longer wants this" from "something else put this here", and guessing wrong
+deletes a rule someone depends on. So a shrinking boundary is a two-step
+change: edit `lab.yaml`, re-run, delete the named rule in the UI, re-run.
 
 Two facts about the table that a reader would otherwise mis-derive:
 
@@ -396,11 +413,19 @@ GET /api/firewall/filter/searchRule   # filter rows by interface == opt1
 # a rule lab.yaml asks for is missing: must be empty
 # (description-keyed comparison against networks.dmz.allow)
 
-# the DMZ is not routable to the LAN:  dc01:389 must fail from app01,
-#                                        dc01:445 must fail from app01
+# a rule lab.yaml does NOT ask for is present: must be empty
+# (same read, the other direction — shape checks alone would pass a
+#  port-scoped rule this lab never wrote down)
+
+# the DMZ is not routable to the LAN:  dc01:445 must fail from app01,
+#                                      dc01:88  must fail from app01
 # the DMZ is routable to LDAP:         dc01:389 must succeed from app01
 # the firewall's UI is not reachable:  10.0.10.1:443 must fail from app01
 ```
+
+Port 389 appears exactly once above, and on the succeed side. It is the one
+deliberate allowance; listing it as a must-fail too would describe a boundary
+that denies the project's own attack path.
 
 **Layer 4 — the boundary is not *too* tight.** The documented chain survives:
 from `app01`, a bind to `dc01.clayface:389` with the `svc-idp-ldap` credential

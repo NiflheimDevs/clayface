@@ -83,3 +83,30 @@ position than an internal foothold. The Chapter 5 chain that loots the
 `svc-idp-ldap` credential and binds to LDAP on dc01 works through a single
 deliberate, logged allowance — which is what makes it a pivot *across* a
 boundary rather than a walk down a flat network.
+
+## The WAN port forward catches the firewall's own LAN address — OPEN
+
+Found 2026-09-25 while fixing `opnsense_dmz.yml`'s scheme probe. From the LAN,
+`https://10.0.0.1` does **not** reach OPNsense: it is DNAT'd to `app01:443` and
+answered by app01's nginx, with app01's certificate (`CN=app01.clayface`) and
+its portal. Verified three ways — cert subject, response body, and the
+`302 → /portal/` the probe was following.
+
+The rule is `opnsense.yml`'s (`LAB_WAN_EXPOSE_APP`, `deploy.env:12` = `443`): a
+`d_nat` port forward on `wan`, `destination.network: any`, `natreflection:
+purenat`. A destination of `any` with pure-NAT reflection is what lets it catch
+the firewall's own address on an internal leg, not just the WAN address. So the
+lab currently has no way to reach the edge's web GUI over https from inside —
+it works on `http://10.0.0.1:80`, which is why nothing noticed.
+
+Why it is not fixed here: it is a deliberate feature turned up too far, not a
+bug in the DMZ wave, and the correct shape needs a decision — pin the
+forward's destination to the WAN address, drop reflection (losing LAN access to
+the portal by WAN address, which `lan → 10.0.10.10:443` already provides), or
+accept it and document the https blindness. Anything that changes
+`opnsense.yml`'s NAT should be checked against `app_validate.yml`, which is
+what exercises that path.
+
+Interim: the DMZ playbook no longer depends on `/` answering on 443 — it probes
+`/api/core/firmware/status` on both schemes and refuses to follow redirects, so
+a service in front of the firewall cannot masquerade as the API again.

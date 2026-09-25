@@ -85,9 +85,12 @@ purely so that a future renumbering becomes a named assertion failure in
 `opnsense_dmz.yml` rather than a boundary that quietly stopped existing.
 
 The LAN and WAN assignments are baked. Their addresses are baked too: `10.0.0.1`
-appears in the repo as a mirrored constant (`opnsense_host` in `opnsense.yml`,
-`lab_dns_ip` in `start_vms.yml`, `lab_dns_forwarder` in `dc.yml`), and the
-DMZ's `10.0.10.1` was added to that class by this wave.
+appears in the repo as a mirrored constant (`opnsense_host` in `opnsense.yml`
+and `opnsense_dmz.yml`, `lab_dns_forwarder` in `dc.yml`, the `no_proxy` list in
+`deploy.sh`), and the DMZ's `10.0.10.1` was added to that class by this wave.
+`start_vms.yml` is deliberately *not* on that list: its `lab_dns_ip` reads
+`networks.lan.dns` from lab.yaml, so it follows a lab.yaml edit rather than
+having to be changed alongside one.
 
 ---
 

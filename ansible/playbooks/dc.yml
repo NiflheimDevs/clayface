@@ -31,7 +31,9 @@
   # it, so deriving it keeps the two from silently disagreeing: setting
   # LAB_DOMAIN moves the inventory addresses AND the forest name together.
   # lab_dns_forwarder is the OPNsense LAN IP — the same mirrored constant as
-  # opnsense.yml's opnsense_host and start_vms.yml's lab_dns_ip.
+  # opnsense.yml's opnsense_host and opnsense_dmz.yml's opnsense_host.
+  # start_vms.yml looks like a third copy and is not: its lab_dns_ip reads
+  # networks.lan.dns from lab.yaml.
   vars:
     lab_win_admin_pass: "{{ lookup('env', 'LAB_WIN_ADMIN_PASS') | default('Admin@123', true) }}"
     lab_domain: "{{ lookup('env', 'LAB_DOMAIN') | default('clayface', true) }}"

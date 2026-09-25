@@ -127,4 +127,4 @@ VALUES
     ('2024-09-16 11:41:03+00', 'bob.sing', 'login.success', 'portal session opened', '10.0.0.20'),
     ('2024-09-17 09:03:52+00', 'abed.nad', 'admin.users.view', 'user list rendered', '10.0.0.20'),
     ('2024-09-17 22:58:19+00', 'Administrator', 'login.failed', 'unknown user', '10.0.0.1'),
-    ('2024-09-18 07:31:26+00', 'svc-monitoring', 'api.keys.list', 'read-only scrape', '10.0.0.30');
+    ('2024-09-18 07:31:26+00', 'svc-monitoring', 'api.keys.list', 'read-only scrape', '10.0.10.10');

@@ -1,8 +1,19 @@
 # Network plan — DMZ, segment rename, VPN pool
 
 Plan for `docs/roadmap.md` Phase 2 plus two coupled refactors. Written
-2026-09-24. **Nothing here is implemented.** This document is the detail
-behind three `docs/TODO.md` items; it is not itself a work item.
+2026-09-24. This document is the detail behind three `docs/TODO.md` items; it
+is not itself a work item.
+
+**Status: all three commits are implemented and on `feat/network-segmentation`
+as of 2026-09-25.** Commit 1 (`fece74d`, `networks` map), commit 2 (`32a6d52`,
+`vm-br0` → `vm-lan0`), commit 3 (`2d5d127`, the DMZ). The DMZ is live: `opt1`
+up at `10.0.10.1/24`, seven rules, DHCP and DNS serving the leg, verified by a
+clean run of `opnsense_dmz.yml`. What the plan got wrong is recorded in the
+dated amendment blocks below rather than edited out of the original text — B2
+(the address is not API-settable on 26.7), B3 (an unassigned interface is
+fail-closed, not wide open), B4, and B7 (the ordering, which gained a step:
+the interface address is typed in by hand, so the deploy halts once on a fresh
+lab). Read those before trusting any paragraph above them.
 
 ## Why
 

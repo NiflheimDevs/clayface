@@ -11,7 +11,8 @@
 #      get a lease and resolve dc01.clayface
 #   4. verifies the DMZ interface is up and addressed as lab.yaml says,
 #      asserts that no pass-any rule exists on it, asserts every rule
-#      lab.yaml asks for is configured, and proves the leg answers DNS
+#      lab.yaml asks for is configured, asserts that nothing *else* is on it
+#      (ownership, not just shape), and proves the leg answers DNS
 #
 # The interface address is the one thing here this playbook cannot set, and it
 # fails with instructions rather than pretending. OPNsense 26.7 has no REST
@@ -101,6 +102,13 @@
     lan_ifname: "lan"
     wan_ifname: "wan"
 
+    # The interface's descriptive name on the Assignments page. It is not
+    # decoration: the firewall's own automatically generated rules report
+    # themselves under this name (`DMZ`) while the rules this playbook writes
+    # report under the identifier (`opt1`), so anything that wants to see
+    # *both* sets has to know both spellings.
+    dmz_iface_descr: "DMZ"
+
     # The two denies are the only rules whose text is not in lab.yaml, because
     # they are not policy anyone chose — they are what makes a *violation* of
     # the policy visible. Named once here so the build and the ownership index
@@ -164,33 +172,56 @@
           must never do is write firewall rules against a guessed device. Run
           `terraform apply`, then re-run with both inventories.
 
+    # Probing `/` cannot tell the firewall's API apart from a service sitting
+    # in front of the firewall's address. The lab's WAN port forward
+    # (opnsense.yml: destination `any`, `natreflection: purenat`) catches
+    # https on 10.0.0.1:443 from the LAN and answers with app01's portal,
+    # which 302s to /portal/ — and ansible.builtin.uri follows redirects by
+    # default, so a probe of `/` saw 200 and this playbook picked https, after
+    # which *every* /api/ call came back 404 from app01's nginx. So: probe an
+    # API path, and refuse to follow anything.
     - name: Probe the OPNsense API over HTTPS
       ansible.builtin.uri:
-        url: "https://{{ opnsense_host }}/"
-        status_code: [200, 302, 401]
-        timeout: 3
+        url: "https://{{ opnsense_host }}/api/core/firmware/status"
+        follow_redirects: none
+        timeout: 5
       register: https_probe
       failed_when: false
+      changed_when: false
 
     - name: Probe the OPNsense API over HTTP
       ansible.builtin.uri:
-        url: "http://{{ opnsense_host }}/"
-        status_code: [200, 302, 401]
-        timeout: 3
+        url: "http://{{ opnsense_host }}/api/core/firmware/status"
+        follow_redirects: none
+        timeout: 5
       register: http_probe
       failed_when: false
+      changed_when: false
 
-    - name: Pick the answering scheme
+    - name: Pick the scheme whose /api/ actually answered
       ansible.builtin.set_fact:
-        detected_scheme: "{{ 'https' if https_probe.status == 200 else 'http' }}"
+        detected_scheme: "{{ 'https' if https_probe.status | default(0) == 200 else 'http' }}"
 
-    - name: Verify OPNsense is reachable at all
+    - name: Verify the API answered on one of the two schemes
       ansible.builtin.assert:
-        that: https_probe.status == 200 or http_probe.status == 200
+        that: >-
+          https_probe.status | default(0) == 200
+          or http_probe.status | default(0) == 200
         fail_msg: >-
-          Neither https://{{ opnsense_host }} nor http://{{ opnsense_host }}
-          answered. Is the OPNsense VM running and reachable from this
-          machine? (Override with LAB_DNS_URL if it lives elsewhere.)
+          Neither https://{{ opnsense_host }}/api/... nor
+          http://{{ opnsense_host }}/api/... answered 200 as the OPNsense
+          API: https gave {{ https_probe.status | default('no answer') }},
+          http gave {{ http_probe.status | default('no answer') }}.
+
+          A 302 here means something in front of the firewall's address is
+          answering — for this lab that is the WAN port forward catching the
+          firewall's own https (see opnsense.yml), with app01's portal
+          behind it. The API is on http in that case; the playbook will use
+          the scheme that answered 200 above.
+
+          Otherwise: is the OPNsense VM running and reachable from this
+          machine? Override the whole base URL with LAB_DNS_URL if the API
+          lives somewhere else.
 
   tasks:
     # ------------------------------------------------------------
@@ -255,7 +286,7 @@
         body:
           interface:
             if: "{{ dmz_device }}"
-            descr: "DMZ"
+            descr: "{{ dmz_iface_descr }}"
       register: dmz_assign
       when: >-
         if_assign.json.rows | default([])
@@ -394,6 +425,22 @@
                                             'direction': 'in', 'quick': '1',
                                             'enabled': '1'}) | list }}
 
+    # What "owns" means, and what happens when lab.yaml shrinks.
+    #
+    # A rule is owned if its description is one `wanted_rules` computes, i.e. if
+    # lab.yaml (or the two deny descriptions) asks for it today. This playbook
+    # creates and updates owned rules; it never deletes anything. So removing an
+    # entry from `networks.dmz.allow` is *not* a change this playbook can make:
+    # the rule stays on the firewall and stops being owned.
+    #
+    # That is why the ownership assertion in step 5 exists. An unowned rule is
+    # exactly the shape a stale allowance takes, so instead of the removal being
+    # a silent no-op — lab.yaml says one thing, the firewall does another, and
+    # every check passes — the next run fails and names the rule and the two
+    # ways to resolve it. Deleting firewall rules automatically would be a worse
+    # answer: this playbook cannot distinguish "lab.yaml no longer asks for
+    # this" from "something else put this here", and guessing wrong removes a
+    # rule someone is relying on.
     - name: Index the rules this playbook already owns, by description
       ansible.builtin.set_fact:
         owned_descriptions: "{{ wanted_rules | map(attribute='description') | list }}"
@@ -503,6 +550,31 @@
     # image ships the list as `lan` alone, so without this the DMZ gets a
     # range that dnsmasq never serves — app01 would boot with no lease and
     # the failure would look like a broken guest.
+    #
+    # The wanted list is the *union* of what is already selected and the two
+    # this playbook needs, not the two alone. `dnsmasq/settings/set` replaces
+    # the whole selection, so writing `lan,opt1` as a literal would silently
+    # drop any third interface someone had enabled — this playbook's job is
+    # the DMZ leg, not ownership of the resolver's interface list.
+    #
+    # And the trigger is that union differing from what is selected, not a
+    # substring match on the joined string. The earlier form tested for the
+    # literal `'lan, opt1'`, which is order-dependent (a box answering
+    # `opt1, lan` was rewritten on every run) *and* could not repair the case
+    # that matters: a list that had lost `lan` failed the second clause of its
+    # `and`, so the task was skipped and nothing else noticed.
+    - name: Work out which interfaces dnsmasq should serve
+      ansible.builtin.set_fact:
+        dnsmasq_selected: >-
+          {{ dnsmasq_cfg.json.dnsmasq.interface | default({}) | dict2items
+             | selectattr('value.selected', 'equalto', 1)
+             | map(attribute='key') | list }}
+        dnsmasq_wanted: >-
+          {{ ((dnsmasq_cfg.json.dnsmasq.interface | default({}) | dict2items
+               | selectattr('value.selected', 'equalto', 1)
+               | map(attribute='key') | list)
+              + [lan_ifname, dmz_ifname]) | unique | sort }}
+
     - name: Make dnsmasq serve the DMZ leg
       ansible.builtin.uri:
         url: "{{ opnsense_url }}/api/dnsmasq/settings/set"
@@ -510,15 +582,12 @@
         body_format: json
         body:
           dnsmasq:
-            interface: "{{ ['lan', dmz_ifname] | join(',') }}"
+            # Parenthesised on purpose: `+` binds *looser* than `|` in Jinja, so
+            # an unparenthesised `A + [x, y] | unique` dedupes the literal alone
+            # and concatenates a list that already has every element twice.
+            interface: "{{ dnsmasq_wanted | join(',') }}"
       register: dnsmasq_if_set
-      when: >-
-        'lan, ' ~ dmz_ifname not in (dnsmasq_cfg.json.dnsmasq.interface | default({}) | dict2items
-                                     | selectattr('value.selected', 'equalto', 1)
-                                     | map(attribute='key') | list | join(', '))
-        and dmz_ifname not in (dnsmasq_cfg.json.dnsmasq.interface | default({}) | dict2items
-                               | selectattr('value.selected', 'equalto', 1)
-                               | map(attribute='key') | list)
+      when: dnsmasq_selected | sort != dnsmasq_wanted
       changed_when: dnsmasq_if_set.status == 200
 
     - name: Read the current DHCP ranges
@@ -564,6 +633,21 @@
     # answer at all. lab.yaml's DMZ policy allows DNS to the firewall's own
     # address on this leg, and this is the half that makes that allowance
     # mean something.
+    # Same union rule as dnsmasq above, and the same reason: `unbound/settings/set`
+    # replaces the whole active_interface map, so the wanted set is what is
+    # already there plus the DMZ leg — never a literal that could drop one.
+    - name: Work out which interfaces Unbound should answer on
+      ansible.builtin.set_fact:
+        unbound_selected: >-
+          {{ unbound_cfg.json.unbound.general.active_interface | default({}) | dict2items
+             | selectattr('value.selected', 'equalto', 1)
+             | map(attribute='key') | list }}
+        unbound_wanted: >-
+          {{ ((unbound_cfg.json.unbound.general.active_interface | default({}) | dict2items
+               | selectattr('value.selected', 'equalto', 1)
+               | map(attribute='key') | list)
+              + [lan_ifname, dmz_ifname]) | unique | sort }}
+
     - name: Make Unbound answer on the DMZ leg
       ansible.builtin.uri:
         url: "{{ opnsense_url }}/api/unbound/settings/set"
@@ -572,12 +656,9 @@
         body:
           unbound:
             general:
-              active_interface: "{{ ['lan', dmz_ifname] | join(',') }}"
+              active_interface: "{{ unbound_wanted | join(',') }}"
       register: unbound_if_set
-      when: >-
-        unbound_cfg.json.unbound.general.active_interface | default({}) | dict2items
-        | selectattr('key', 'equalto', dmz_ifname)
-        | selectattr('value.selected', 'equalto', 1) | list | length == 0
+      when: unbound_selected | sort != unbound_wanted
       changed_when: unbound_if_set.status == 200
 
     - name: Reconfigure Unbound
@@ -586,6 +667,43 @@
         method: POST
       register: unbound_reconf
       changed_when: unbound_if_set is changed
+
+    # Read back rather than trust either write. Both API calls above replace a
+    # whole selection and both answer 200 whether or not the value took, so
+    # "the call succeeded" is not evidence that the resolver is listening on
+    # the DMZ leg — and a resolver that is not is indistinguishable, from
+    # app01, from a boundary that is working correctly.
+    - name: Re-read the resolver configurations
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/{{ item }}/settings/get"
+        method: GET
+      register: resolver_reread
+      loop:
+        - dnsmasq
+        - unbound
+
+    - name: Both resolvers are listening on the DMZ leg, next to the LAN
+      ansible.builtin.assert:
+        that:
+          - dmz_ifname in resolver_ifaces.dnsmasq
+          - lan_ifname in resolver_ifaces.dnsmasq
+          - dmz_ifname in resolver_ifaces.unbound
+          - lan_ifname in resolver_ifaces.unbound
+        fail_msg: >-
+          After configuring them, the resolvers report these selected
+          interfaces: dnsmasq {{ resolver_ifaces.dnsmasq | join(', ') | default('(none)', true) }};
+          unbound {{ resolver_ifaces.unbound | join(', ') | default('(none)', true) }}.
+          Both need `{{ lan_ifname }}` and `{{ dmz_ifname }}`: without {{ dmz_ifname }}
+          the DMZ has no DNS and no leases, and without {{ lan_ifname }} the control
+          node loses its resolver — which is a lab-wide outage, not a DMZ one.
+      vars:
+        resolver_ifaces:
+          dnsmasq: >-
+            {{ resolver_reread.results[0].json.dnsmasq.interface | default({}) | dict2items
+               | selectattr('value.selected', 'equalto', 1) | map(attribute='key') | list }}
+          unbound: >-
+            {{ resolver_reread.results[1].json.unbound.general.active_interface | default({}) | dict2items
+               | selectattr('value.selected', 'equalto', 1) | map(attribute='key') | list }}
 
     # ------------------------------------------------------------
     # 5. Verify the things that decide whether the boundary is real, by
@@ -602,26 +720,51 @@
         method: GET
       register: rule_final
 
+    # Matching on the identifier alone (`opt1`) collects the boundary this
+    # playbook wrote and drops everything the firewall generated for itself,
+    # because the automatic rules report their interface by its *descriptive*
+    # name (`DMZ`, `LAN`, `WAN`). That is not cosmetic: the automatic set is
+    # the evidence for the fail-closed argument, and a filter that silently
+    # returns only our own rules would print an empty "automatic rules" list
+    # and let that emptiness read as proof that nothing else is there.
+    - name: Record the names the DMZ interface answers to
+      ansible.builtin.set_fact:
+        dmz_iface_names: >-
+          {{ [dmz_ifname, dmz_iface_descr, dmz_ifname | upper, dmz_iface_descr | upper]
+             | unique | list }}
+
     - name: Collect the rules that exist on the DMZ interface
       ansible.builtin.set_fact:
         dmz_iface_rows: >-
           {{ rule_final.json.rows | default([])
              | selectattr('interface', 'defined')
-             | selectattr('interface', 'in', [dmz_ifname, dmz_ifname | upper])
+             | selectattr('interface', 'in', dmz_iface_names)
              | list }}
 
+    # "Wide open" is defined narrowly and on the record, because a vague
+    # definition is how the first version of this check fired on a legitimate
+    # rule the moment it could finally see the automatic set: an unrestricted
+    # rule is one that *passes*, is IPv4 (an empty `ipprotocol` means "both"),
+    # and names no destination port. That is exactly a pass-any.
+    #
+    # IPv6 rows are excluded, and the exclusion is counted and reported rather
+    # than left silent. This lab's DMZ policy is IPv4 — lab.yaml's allow list
+    # has no v6 entries — and the firewall's own v6 helpers are self-scoped
+    # link-local traffic, not a path to the LAN. The report prints the count,
+    # so a future v6 rule cannot slip past by being invisible.
     - name: Check every rule on the DMZ interface for an unrestricted pass
       ansible.builtin.set_fact:
-        # An unrestricted rule is one that is not a block and names no
-        # destination port — i.e. pass-any. The automatic DHCP rules the
-        # firewall generates for a DHCP-serving interface all name a port, so
-        # they do not appear here; that is what makes this assertion specific
-        # to the hazard rather than to "there are rules".
         dmz_unrestricted: >-
           {{ dmz_unrestricted | default([])
              + ([item.description | default('(no description)')]
                 if ((item.action | default('pass', true) | string | lower) != 'block'
+                    and (item.ipprotocol | default('', true) | string) != 'inet6'
                     and (((item.destination_port | default('', true) | string) | length) == 0))
+                else []) }}
+        dmz_v6_rows: >-
+          {{ dmz_v6_rows | default([])
+             + ([item.description | default('(no description)')]
+                if (item.ipprotocol | default('', true) | string) == 'inet6'
                 else []) }}
       loop: "{{ dmz_iface_rows }}"
       loop_control:
@@ -631,12 +774,47 @@
       ansible.builtin.assert:
         that: dmz_unrestricted | length == 0
         fail_msg: >-
-          The DMZ interface carries {{ dmz_unrestricted | length }} rule(s)
-          that pass without naming a destination port, i.e. a pass-any:
+          The DMZ interface carries {{ dmz_unrestricted | length }} IPv4
+          rule(s) that pass without naming a destination port, i.e. a pass-any:
           {{ dmz_unrestricted | join('; ') }}. The boundary would be a diagram
           and not a filter. Nothing after this point is meaningful — find out
           where those rules came from (an OPNsense feature this playbook does
           not know about, or a hand edit in the UI) and fix it here.
+
+    # The pass-any check above is a check on *shape*, and shape is not enough.
+    # A hand-added rule that is port-scoped, or scoped to a source or a
+    # destination this lab never wrote down, passes it: `pass from any to
+    # 10.0.0.10 port 389` has a port, so the shape check shrugs. What catches
+    # that is ownership. Everything on the DMZ interface that the firewall did
+    # not generate for itself has to be a rule lab.yaml asked for — so the
+    # boundary is not merely "not obviously open", it is exactly the list.
+    - name: Find rules on the DMZ interface that lab.yaml did not ask for
+      ansible.builtin.set_fact:
+        # A loop rather than `rejectattr('is_automatic')`: the rules this
+        # playbook writes carry no `is_automatic` key at all, and attribute
+        # lookup on a missing key raises rather than yielding undefined, so
+        # the filter form fails on exactly the rows it is meant to keep.
+        dmz_unowned: >-
+          {{ dmz_unowned | default([])
+             + ([item.description | default('(no description)')]
+                if (not (item.is_automatic | default(false, true) | bool))
+                   and ((item.description | default('')) not in owned_descriptions)
+                else []) }}
+      loop: "{{ dmz_iface_rows }}"
+      loop_control:
+        label: "{{ item.description | default('?') }}"
+
+    - name: Every non-automatic rule on the DMZ interface is one lab.yaml asked for
+      ansible.builtin.assert:
+        that: dmz_unowned | length == 0
+        fail_msg: >-
+          The DMZ interface carries {{ dmz_unowned | length }} rule(s) that
+          `networks.{{ dmz_segment }}.allow` in lab.yaml does not declare and
+          this playbook did not write: {{ dmz_unowned | join('; ') }}. They may
+          be narrow, or harmless, or someone's debugging leftover — this
+          playbook cannot tell, and the boundary is supposed to be a list a
+          supervisor can read against lab.yaml. Add the rule to lab.yaml if it
+          belongs, or delete it in the UI: Firewall -> Rules -> {{ dmz_iface_descr }}.
 
     - name: Check every rule lab.yaml asks for is configured
       ansible.builtin.assert:
@@ -667,10 +845,68 @@
           gets a lease — app01 would come up unreachable with nothing in the
           firewall to explain it.
 
-    # The one check that can need a human, and so the last one: everything
-    # above is about what this playbook writes, this is about the one field
-    # it cannot.
-    - name: The DMZ interface is up and addressed as lab.yaml says
+    #    The one check that can need a human, and so the last one: everything
+    #    above is about what this playbook writes, this is about the one field
+    #    it cannot. It is checked TWICE, against two different sources, and
+    #    that is not redundancy.
+    #
+    #    config.xml is what the firewall has SAVED. The interface overview is
+    #    what it is actually RUNNING. They can disagree, and when they do the
+    #    difference is an interface that looks configured in every API call
+    #    that reads config and has no address in the kernel — so nothing on
+    #    the segment routes and nothing answers, while every assertion passes.
+    #    Observed live: opt1 carrying `<ipaddr>10.0.10.1</ipaddr>` and
+    #    `<enable>1</enable>` in config.xml with `status: down` and `addr4: ""`
+    #    in the overview. An assert on the config alone would have called that
+    #    a configured DMZ.
+    #
+    #    So the saved state and the running state are asserted separately, and
+    #    they fail with different messages because they need different things
+    #    from the operator: one is "you have not typed it in", the other is
+    #    "you typed it in and it did not take effect".
+    - name: Read what the firewall is actually running
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/interfaces/overview/export"
+        method: GET
+        # Required: the parse below reads `.content`, which uri only captures
+        # when this is set. Without it the body is discarded and the guard
+        # task stops the run — loudly, which is the point, but for a reason
+        # that has nothing to do with the firewall.
+        return_content: true
+      register: iface_overview
+
+    # `content | from_json`, never `.json`. This endpoint declares
+    # `Content-type: text/html` while sending a JSON array, so
+    # ansible.builtin.uri does not parse it and `.json` is undefined. Reading
+    # `.json | default([])` then yields an empty list — which is exactly what
+    # "the box does not have this interface" looks like, so a content-type
+    # mismatch produced a confident, wrong diagnosis the first time this ran.
+    # Parse it explicitly, then refuse to interpret an answer that did not
+    # parse, so that failure mode cannot come back wearing a different mask.
+    - name: Parse the running interface list
+      ansible.builtin.set_fact:
+        iface_live_rows: "{{ iface_overview.content | default('[]', true) | from_json }}"
+
+    - name: Refuse to judge the running state from an unparsed answer
+      ansible.builtin.assert:
+        that: iface_live_rows | length > 0
+        fail_msg: >-
+          The firewall's interface overview did not parse into a list of
+          interfaces (got {{ iface_overview.content | default('') | length }}
+          bytes, first 200: {{ iface_overview.content | default('') | truncate(200) }}).
+          This endpoint answers JSON under a text/html content type; if that
+          has changed, every check below it is meaningless, so this playbook
+          stops rather than guessing.
+
+    - name: Record the DMZ interface's live state
+      ansible.builtin.set_fact:
+        dmz_live: >-
+          {{ (iface_live_rows
+              | selectattr('identifier', 'defined')
+              | selectattr('identifier', 'equalto', dmz_ifname) | list | first)
+             | default({}, true) }}
+
+    - name: The DMZ interface is configured in the firewall's saved config
       ansible.builtin.assert:
         that:
           - "'<enable>1</enable>' in dmz_node"
@@ -698,6 +934,32 @@
           written, applied, and checked, so the DMZ is already closed — an
           interface with no pass-any rule is denied — and what is missing is
           only that the segment cannot yet route or answer.
+
+    - name: The DMZ interface is up and addressed on the RUNNING firewall
+      ansible.builtin.assert:
+        that:
+          - dmz_live.addr4 | default('', true) | string == dmz_cidr
+          - dmz_live.status | default('', true) | string == 'up'
+        fail_msg: |
+          {{ dmz_ifname }} is configured in config.xml but the running firewall
+          does not have it: status is
+          '{{ dmz_live.status | default('(no interface row at all)') }}' and
+          its address is '{{ dmz_live.addr4 | default('') }}', where
+          {{ dmz_cidr }} was expected. Full row:
+          {{ dmz_live }}
+
+          This is the "saved but not applied" state, and it is the one that
+          would otherwise pass every check in this playbook while the segment
+          stayed dark — the config the API reads says one thing and the kernel
+          does another. Fix it in the UI: open Interfaces -> {{ dmz_ifname }}
+          and press Apply (the change is saved but the running configuration
+          has not been rebuilt). If the page shows nothing pending, reboot the
+          edge VM — the interface configuration is rebuilt from config.xml at
+          boot, and `start_vms.yml --tags gateway` brings it back up.
+
+          Everything above this point passed without it: the rules are written,
+          applied, and checked, so the DMZ is already closed. What is missing
+          is that the segment cannot yet route or answer.
 
     - name: Check whether this machine holds an address on the DMZ leg
       ansible.builtin.command:
@@ -735,6 +997,13 @@
           {{ dmz_ifname }}. Name resolution is what makes the Chapter 5 pivot
           expressible as a hostname, so this is part of the boundary, not a
           convenience.
+
+          If the exit code shows as `?`, `dig` is not installed on this
+          machine — that is a control-node gap (bind-utils / dnsutils), not a
+          firewall verdict, and it is unguarded here on purpose: this playbook
+          is the only place that measures the leg from outside the DMZ, so
+          silently skipping the measurement when the tool is missing would
+          remove the check rather than report it.
       when:
         - dmz.monitor.split('/')[0] in (dmz_leg.stdout | default(''))
         - (groups['vms_dc'] | default([]) | length) > 0
@@ -761,3 +1030,11 @@
           Automatic rules on this interface:
           {% for r in dmz_iface_rows if r.description not in owned_descriptions %}  {{ r.description }} ({{ r.protocol }}/{{ r.destination_port | default('-') }})
           {% endfor %}
+          {% if dmz_v6_rows | default([]) | length %}
+          IPv6 rows on this interface, excluded from the IPv4 pass-any check
+          (counted, not hidden — see the comment above that check):
+          {% for d in dmz_v6_rows | unique %}  {{ d }}
+          {% endfor %}
+          {% else %}
+          IPv6 rows on this interface: none.
+          {% endif %}
