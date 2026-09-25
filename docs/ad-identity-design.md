@@ -970,9 +970,10 @@ offending option on the object the baseline already declares:
 
 ```yaml
 # The shape this design described, not a verbatim copy of the shipped task.
-# The shipped tasks are `ansible.windows.win_powershell` scripts, because the
-# flag-off branch must actively REMOVE the configuration rather than merely not
-# add it; the shipped W1 task reads the toggle as `lab_ad_weak.<key>`.
+# The shipped tasks that need an active removal are
+# `ansible.windows.win_powershell` scripts, because the flag-off branch must
+# actively REMOVE the configuration rather than merely not add it; the shipped
+# W1 task reads the toggle as `lab_ad_weak.<key>`.
 - name: Give the IDP bind account an SPN (weakness W1)
   microsoft.ad.user:
     identity: "{{ lab_ad.idp_bind_account }}"
