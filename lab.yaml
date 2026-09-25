@@ -251,9 +251,11 @@ ad:
     managed_account: lapsadmin
 
   # Deliberate weakness toggles (docs/ad-identity-design.md section 13).
-  # All off, and NOTHING READS THEM YET — no playbook references
-  # `lab_ad.weaknesses`. They are declared here so the weakness wave, which
-  # is a separate cycle, has a settled shape to build against.
+  # All off, and read by the playbooks as `lab_ad_weak.<key>`: ad.yml,
+  # client.yml and ad_gpo.yml each declare the toggles they implement and
+  # assert they are present here, and ad_validate.yml asserts all seven and
+  # warns about a key no play knows. A typo therefore fails loudly instead of
+  # reading as `false` and leaving the lab quietly at its baseline.
   weaknesses:
     kerberoastable_idp_bind: false
     excessive_local_admin: false

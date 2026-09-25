@@ -49,6 +49,44 @@
       - {key: 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\SpyNet',             name: SubmitSamplesConsent,     value: 2}
       - {key: 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender',                    name: PUAProtection,            value: 1}
 
+    # The AD weakness toggles, from lab.yaml `ad.weaknesses`. `default({})` is
+    # what makes a missing key read as "baseline"; the pre_task below is what
+    # stops a typo'd key from doing the same thing silently.
+    lab_ad_weak: "{{ (lab_ad | default({}, true)).weaknesses | default({}, true) }}"
+
+    # The toggles THIS play implements — deliberately not the full seven. A
+    # full list here would fail on, and warn about, toggles this play never
+    # reads, which is a statement about a different playbook: W1/W3/W5/W6/W7
+    # belong to ad.yml, W2's `excessive_local_admin` to client.yml.
+    # ad_validate.yml asserts the union, so it is the play that carries the
+    # union's list. This play owns W4 alone, because the GPO ACL is the whole
+    # of what W4 changes.
+    lab_ad_weak_keys:
+      - weak_gpo_permission
+
+  pre_tasks:
+    # ------------------------------------------------------------
+    # The contract with lab.yaml, before any GPO is created. `lab_ad_weak`
+    # reads an absent key as "off", which is right for a toggle and wrong for
+    # a typo, so a toggle this play implements that lab.yaml has dropped fails
+    # here instead of being a silently disabled weakness. A key lab.yaml has
+    # that no play knows is reported by ad_validate.yml, whose list is the
+    # union.
+    # ------------------------------------------------------------
+    - name: Fail if lab.yaml's `ad.weaknesses` is unusable
+      ansible.builtin.assert:
+        that:
+          - lab_ad_weak | length > 0
+          - lab_ad_weak_keys | reject('in', lab_ad_weak) | list | length == 0
+        fail_msg: >-
+          lab.yaml has no `ad.weaknesses` map (or it is empty), or it does not
+          declare {{ lab_ad_weak_keys | reject('in', lab_ad_weak) | join(', ') }},
+          which this play implements. The seven toggles are static lab facts
+          and belong in lab.yaml under `ad.weaknesses`, next to the users and
+          groups they govern, not in this playbook — an absent toggle reads as
+          `false`, so a dropped line is a silently disabled weakness. See
+          docs/ad-identity-design.md section 13 for the list.
+
   tasks:
     # microsoft.ad.gpo manages LINKS ONLY — its own documentation says it
     # does not create or delete GPOs. So creation is New-GPO and linking is

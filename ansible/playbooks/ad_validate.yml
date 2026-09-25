@@ -50,6 +50,60 @@
          | selectattr('value.tier0')
          | map(attribute='key') | list }}
 
+    # The AD weakness toggles, from lab.yaml `ad.weaknesses`. `default({})` is
+    # what makes a missing key read as "baseline"; the pre_task below is what
+    # stops a typo'd key from doing the same thing silently.
+    #
+    # Both additions obey the note above: `lab_ad_weak` is a single `{{ }}`
+    # expression, and `lab_ad_weak_keys` is a plain YAML list — neither is a
+    # for-tag literal, so neither can arrive as a string.
+    lab_ad_weak: "{{ (lab_ad | default({}, true)).weaknesses | default({}, true) }}"
+
+    # All seven toggles, because this is the play that asserts all seven: it
+    # owns the union that the other three plays partition (ad.yml five,
+    # client.yml W2, ad_gpo.yml W4). That is also what makes this the right
+    # home for the unknown-key warning below — a key outside THIS list is
+    # unknown to the whole playbook family, not merely to one play.
+    lab_ad_weak_keys:
+      - kerberoastable_idp_bind
+      - excessive_local_admin
+      - excessive_laps_read
+      - weak_gpo_permission
+      - unconstrained_delegation
+      - excessive_idp_directory_permissions
+      - excessive_group_membership
+
+  pre_tasks:
+    - name: Fail if lab.yaml's `ad.weaknesses` is unusable
+      ansible.builtin.assert:
+        that:
+          - lab_ad_weak | length > 0
+          - lab_ad_weak_keys | reject('in', lab_ad_weak) | list | length == 0
+        fail_msg: >-
+          lab.yaml has no `ad.weaknesses` map (or it is empty), or it does not
+          declare {{ lab_ad_weak_keys | reject('in', lab_ad_weak) | join(', ') }},
+          which is every toggle this playbook asserts. The seven toggles are
+          static lab facts and belong in lab.yaml under `ad.weaknesses`, next to
+          the users and groups they govern, not in this playbook — an absent
+          toggle reads as `false`, so a dropped line is a silently disabled
+          weakness. See docs/ad-identity-design.md section 13 for the list.
+
+    - name: Note any AD toggle in lab.yaml the playbooks do not know
+      ansible.builtin.set_fact:
+        lab_ad_weak_unknown: "{{ lab_ad_weak.keys() | reject('in', lab_ad_weak_keys) | list }}"
+
+    - name: Warn about unknown AD toggles
+      ansible.builtin.debug:
+        msg: >-
+          lab.yaml `ad.weaknesses` declares
+          {{ lab_ad_weak_unknown | join(', ') }}. This playbook asserts all
+          seven toggles, so a key outside that list is unknown to the whole
+          playbook family: either the toggle lists in the playbooks are stale,
+          or the key is a typo — and a typo'd key reads as `false` everywhere,
+          so the lab would quietly be its baseline while lab.yaml claims
+          otherwise.
+      when: lab_ad_weak_unknown | length > 0
+
   tasks:
     - name: Assert every OU in lab.yaml exists
       ansible.windows.win_powershell:
