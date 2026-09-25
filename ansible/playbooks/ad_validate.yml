@@ -481,6 +481,50 @@
           "OK: $who TRUSTED_FOR_DELEGATION=$has, no other delegated user accounts"
       changed_when: false
 
+    # --- DELIBERATE WEAKNESS: W4, weak_gpo_permission ---
+    #
+    # GpoEditDeleteModifySecurity is the permission that matters: it lets the
+    # holder change the GPO's settings AND its security filtering, so the
+    # holder can grant themselves anything the GPO applies and can edit the
+    # ACL that decides who the policy reaches. GpoEdit (settings only, no ACL)
+    # would be the softer shape and is deliberately not the one planted.
+    #
+    # ad_gpo.yml runs before this playbook in deploy.sh, so the GPO exists by
+    # the time this asserts. If the order ever changes, this task fails on a
+    # missing GPO rather than on a permission — a distinct message.
+    - name: Assert the GPO editing permission matches the declared weakness
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module GroupPolicy
+
+          $gpo  = 'WS - Security Baseline'
+          $who  = '{{ lab_ad.workstation.logon_group }}'
+          $want = [bool]${{ lab_ad_weak.weak_gpo_permission | bool | ternary('true', 'false') }}
+
+          if (-not (Get-GPO -Name $gpo -ErrorAction SilentlyContinue)) {
+              throw "the GPO '$gpo' does not exist — run playbooks/ad_gpo.yml first"
+          }
+
+          $cur = Get-GPPermission -Name $gpo -TargetName $who -TargetType Group `
+                   -ErrorAction SilentlyContinue
+          $has = $false
+          if ($null -ne $cur -and "$($cur.Permission)" -eq 'GpoEditDeleteModifySecurity') { $has = $true }
+          if ($has -ne $want) {
+              throw "$who holds $(if ($null -eq $cur) { 'no' } else { $cur.Permission }) on '$gpo'; the declared weakness W4 says $want"
+          }
+
+          # Domain Admins must retain the edit permission in both postures —
+          # the weakness is the SECOND holder, not a replacement.
+          $da = Get-GPPermission -Name $gpo -TargetName 'Domain Admins' -TargetType Group `
+                  -ErrorAction SilentlyContinue
+          if ($null -eq $da -or "$($da.Permission)" -notmatch 'GpoEdit') {
+              throw "'Domain Admins' lost its edit permission on '$gpo' — the baseline was removed"
+          }
+
+          "OK: $who on '$gpo' is $has, Domain Admins baseline intact"
+      changed_when: false
+
 - name: Validate the workstation side
   hosts: vms_client
   gather_facts: false

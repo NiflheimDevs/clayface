@@ -276,3 +276,49 @@
           else { "CHANGED: $($changed -join ', ')" }
       register: gpo_laps_policy
       changed_when: "'CHANGED' in (gpo_laps_policy.output | join(' '))"
+
+    # --- DELIBERATE WEAKNESS: W4, weak_gpo_permission ---
+    #
+    # The all-employees group may edit the workstation security baseline — its
+    # settings AND its security filtering. Because the GPO is linked to
+    # OU=Workstations and applies to every workstation in the lab, the holder
+    # can push an arbitrary startup script or a registry change to every
+    # workstation at once, and can edit the ACL that decides who the policy
+    # reaches. That is why this is a Domain-Admin-equivalent step rather than a
+    # workstation-scoped one.
+    #
+    # Why a real organization has this: delegated GPO administration is a
+    # documented practice, and the delegation is normally made to a role group
+    # that has since grown to include everyone.
+    #
+    # PermissionLevel None removes the trustee's entry outright, which is what
+    # makes the flag-off branch an active removal: the entry an earlier run
+    # created is gone afterwards. The read guard means the None path is only
+    # ever reached when an entry exists, so this cannot create a None entry on
+    # a group that never had one.
+    #
+    # Domain Admins and the default SYSTEM/Enterprise Domain Controllers
+    # entries are never touched: Set-GPPermission is called for one target,
+    # the logon group, and for nothing else.
+    - name: Set the GPO editing permission the logon group holds
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module GroupPolicy
+
+          $gpo   = '{{ gpo_baseline }}'
+          $who   = '{{ lab_ad.workstation.logon_group }}'
+          $want  = [bool]${{ lab_ad_weak.weak_gpo_permission | bool | ternary('true', 'false') }}
+          $level = if ($want) { 'GpoEditDeleteModifySecurity' } else { 'None' }
+
+          $cur = Get-GPPermission -Name $gpo -TargetName $who -TargetType Group `
+                   -ErrorAction SilentlyContinue
+          $has = $false
+          if ($null -ne $cur -and "$($cur.Permission)" -eq 'GpoEditDeleteModifySecurity') { $has = $true }
+          if ($has -eq $want) { 'OK'; return }
+
+          Set-GPPermission -Name $gpo -TargetName $who -TargetType Group `
+              -PermissionLevel $level
+          "CHANGED: $who on '$gpo' -> $level"
+      register: gpo_perm_weak
+      changed_when: "'CHANGED' in (gpo_perm_weak.output | join(' '))"
