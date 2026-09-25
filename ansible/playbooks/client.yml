@@ -267,6 +267,31 @@
           - "{{ lab_ad_netbios }}\\{{ lab_ad.workstation.admin_group }}"
         state: present
 
+    # --- DELIBERATE WEAKNESS: W2, excessive_local_admin ---
+    #
+    # With the flag on, every employee is a local administrator on this
+    # workstation — the whole logon group, which nests both role groups. That
+    # is the ordinary shape of this finding in the field: someone needed to
+    # install something once, and adding the group was easier than adding the
+    # person.
+    #
+    # The flag-off branch is `state: absent`, NOT a skipped task.
+    # win_group_membership is additive, so a `when:` guard would leave the
+    # group in local Administrators forever and the baseline would never come
+    # back. The task above carries the designed set unconditionally, so
+    # GG-IT-Admins and the built-in Administrator survive in both postures;
+    # this task only ever touches the logon group.
+    #
+    # This is the local-privilege branch of the chain rather than its
+    # escalation: local admin is what makes an LSASS dump and the planted
+    # shares on this host reachable. Domain Admin comes from W1 and W6.
+    - name: Grant the logon group local Administrator rights
+      ansible.windows.win_group_membership:
+        name: Administrators
+        members:
+          - "{{ lab_ad_netbios }}\\{{ lab_ad.workstation.logon_group }}"
+        state: "{{ 'present' if lab_ad_weak.excessive_local_admin | bool else 'absent' }}"
+
     # ------------------------------------------------------------
     # User rights. These are per-machine LOCAL security settings, not Group
     # Policy — deliberately, because GptTmpl.inf is the only GPO home for

@@ -152,10 +152,10 @@ vm_placements:
     module: dc
     host: host_a
     ip: 10.0.0.10
-  # client01:
-  #   module: client
-  #   host: host_a
-  #   ip: 10.0.0.20
+  client01:
+    module: client
+    host: host_a
+    ip: 10.0.0.20
   app01:
     module: app
     host: host_a
@@ -278,7 +278,7 @@ ad:
   # reading as `false` and leaving the lab quietly at its baseline.
   weaknesses:
     kerberoastable_idp_bind: false
-    excessive_local_admin: false
+    excessive_local_admin: true
     excessive_laps_read: false
     weak_gpo_permission: false
     unconstrained_delegation: false

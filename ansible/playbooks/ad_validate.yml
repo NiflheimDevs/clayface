@@ -401,6 +401,34 @@
          | selectattr('value.tier0')
          | map(attribute='key') | list }}
 
+    # The AD weakness toggles, from lab.yaml `ad.weaknesses`. `default({})` is
+    # what makes a missing key read as "baseline"; the pre_task below is what
+    # stops a typo'd key from doing the same thing silently.
+    lab_ad_weak: "{{ (lab_ad | default({}, true)).weaknesses | default({}, true) }}"
+
+    # The single toggle THIS play asserts, not the union. W2 is the only
+    # weakness that lives on a workstation — it is a local group membership,
+    # so there is no domain-side assertion for it and the DC play does not own
+    # it. The union list and the unknown-key warning stay in Play 1, which is
+    # the play that asserts all seven.
+    lab_ad_weak_keys:
+      - excessive_local_admin
+
+  pre_tasks:
+    - name: Fail if lab.yaml's `ad.weaknesses` is unusable
+      ansible.builtin.assert:
+        that:
+          - lab_ad_weak | length > 0
+          - lab_ad_weak_keys | reject('in', lab_ad_weak) | list | length == 0
+        fail_msg: >-
+          lab.yaml has no `ad.weaknesses` map (or it is empty), or it does not
+          declare {{ lab_ad_weak_keys | reject('in', lab_ad_weak) | join(', ') }},
+          which this play implements. The seven toggles are static lab facts
+          and belong in lab.yaml under `ad.weaknesses`, next to the users and
+          groups they govern, not in this playbook — an absent toggle reads as
+          `false`, so a dropped line is a silently disabled weakness. See
+          docs/ad-identity-design.md section 13 for the list.
+
   tasks:
     # The machine's own DN comes from the Group Policy engine's state, NOT
     # from Win32_ComputerSystem.OrganizationalUnit: that property is empty on
@@ -448,6 +476,20 @@
           if (-not ($members | Where-Object { $_ -like '*\Administrator' })) {
               throw 'the built-in Administrator is no longer a local administrator — remote access is at risk'
           }
+
+          # --- DELIBERATE WEAKNESS: W2, excessive_local_admin ---
+          #
+          # The logon group's presence here IS the weakness, so the assertion is
+          # symmetric: present while the flag is on, absent while it is off.
+          # Asserting only the on-direction would let a half-restored baseline
+          # pass, which is the failure this whole phase has to avoid.
+          $weak     = '{{ lab_ad_netbios }}\{{ lab_ad.workstation.logon_group }}'
+          $wantWeak = [bool]${{ lab_ad_weak.excessive_local_admin | bool | ternary('true', 'false') }}
+          $hasWeak  = $members -contains $weak
+          if ($hasWeak -ne $wantWeak) {
+              throw "$weak local administrator = $hasWeak, the declared weakness W2 says $wantWeak"
+          }
+
           $members -join ', '
       changed_when: false
 
