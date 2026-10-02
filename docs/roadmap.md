@@ -2,13 +2,15 @@
 
 Ordered list of the phases still to come, from the current state to a
 defended thesis. Written 2026-09-24 after reviewing the uncommitted
-application-tier changes.
+application-tier changes. Scope updated 2026-10-01 to defer IDP01 / SSO.
 
-## Scope decisions locked (2026-09-24)
+## Current scope decisions (updated 2026-10-01)
 
-The maximal path was chosen on all four open forks:
+The 2026-09-24 scope is revised below: IDP01 / SSO is deferred; the external
+attacker model, DMZ boundary, and Domain Admin objective remain in scope.
 
-- **IDP01 / SSO:** build it (not deferred to future work).
+- **IDP01 / SSO:** deferred to future work, out of scope for the current
+  project and thesis evaluation. Phase 5 is not a prerequisite for Phase 6.
 - **Attacker model:** external, entering through the OPNsense WAN via the
   APP01 port-forward.
 - **Network segmentation:** build the DMZ (a real boundary between APP01 and
@@ -19,15 +21,16 @@ The maximal path was chosen on all four open forks:
 
 ## Two tracks that interleave
 
-- **Build / lab track (Phases 0–7)** — bring the lab up, finish building it,
-  run the engagement.
+- **Build / lab track (Phases 0–4, 6–7; Phase 5 deferred)** — bring the lab up,
+  finish building it, run the engagement. Phase numbers stay fixed so existing
+  references remain usable.
 - **Thesis track (Phases A–G)** — the writing.
 
 They overlap deliberately. Chapters 2 and 3 (Phases B and C) have no lab
 dependency and should be written while the build proceeds. Chapter 5 (Phase
 F) is the exception: it cannot be written until the engagement in Phase 6
-has produced evidence, so Phases 1→6 sit on the critical path to the
-heaviest results chapter.
+has produced evidence, so the required work in Phases 1–4 and 6 sits on the
+critical path to the heaviest results chapter. IDP01 / SSO is outside that path.
 
 **Standing rule: capture evidence from Phase 1 onward and never stop.**
 Terminal output, screenshots, timings, and packet captures are not
@@ -117,8 +120,8 @@ Outstanding in this phase:
   both hosts, **and per zone**, since the DMZ makes "reachable" a two-part
   answer. This is a Chapter 5 metric; capture it as you verify it.
 - Split the internal zone itself (`10.0.20.0/24` / `10.0.30.0/24`, the
-  user/server split). DC01, CLIENT01 and IDP01 currently share one flat
-  segment, which is honest but is not the topology the proposal draws.
+  user/server split). DC01 and CLIENT01 currently share one flat segment,
+  which is honest but is not the topology the proposal draws.
 
 ### Phase 3 — External attacker entry (WAN)
 
@@ -174,18 +177,25 @@ Outstanding in this phase:
   that survives W2 being turned off. Wording only — the code and the ACLs are
   what they should be.
 
-### Phase 5 — IDP01 / SSO build
+### Phase 5 — IDP01 / SSO (deferred; out of scope for now)
 
-- Decide the IdP product (Keycloak vs Authentik) at the start of the phase.
-  The AD-side contract already exists in `docs/ad-identity-design.md`: AD is
-  the upstream user store via `svc-idp-ldap`, with no protocol-level
-  federation.
-- Provision IDP01: a Terraform module + a `lab.yaml` placement with an `ip:`;
-  a playbook to deploy the IdP; the LDAP bind to AD.
-- Integrate the portal → OIDC/SAML → IDP01 → AD. The portal today
-  authenticates against its own `users` table (out of scope in
-  `app01-design.md`); this adds the federated path.
-- Update the `Identity.md` figure to show federation as built, not planned.
+**Deferred by scope decision on 2026-10-01.** The current deliverable does not
+include an IDP01 VM, Authentik deployment, or portal OIDC/SAML integration.
+APP01 continues to authenticate against its own `users` table. Proceed from
+the required work in Phases 1–4 to Phase 6 without an SSO build gate.
+
+The AD integration contract in `docs/ad-identity-design.md` and the Authentik
+plan in `docs/superpowers/plans/2026-09-25-phase-5-idp-authentik-sso.md` remain
+design references for future work. This decision supersedes the earlier
+IDP01 build commitment and the `IDP01_is_core` scope decision in
+`docs/redclay.yaml`.
+
+The existing `svc-idp-ldap` AD account, its planted credential in APP01, and
+the W1/W5/W6 weakness configuration remain part of the AD scenarios. Their
+configuration does not depend on a running IdP. Document the account as a
+planted service identity for the deferred integration; do not describe it as
+evidence of deployed SSO. Keep IDP01 and the SSO path marked deferred in the
+thesis figures and cover the integration in Chapter 6 future work.
 
 ### Phase 6 — Run the engagement and capture all evidence
 
@@ -193,14 +203,17 @@ Outstanding in this phase:
   toggle) → dump the database → recover the bind credential from `api_keys`
   and bind LDAP on `dc01` → **a LAN foothold** → enumerate AD → escalate via
   the Phase 4 weaknesses → Domain Admin → exfiltrate the planted data.
-- Plan and document the LAN foothold the escalation runs from. The DMZ
-  boundary permits DMZ → `dc01` tcp 389/636, DNS and DHCP, and nothing else, so
-  no rule carries the attack out of the DMZ into the LAN; `app01` has one NIC
-  and no second path. Phase 4 stated this gap and deliberately did not close
-  it, because closing it means widening the boundary — a design change, not a
-  fix. The intended route is a compromised employee workstation, which is what
-  W2 and W3 supply, and it needs to be a planned, evidenced step like any
-  other rather than an implied one.
+- Plan and demonstrate how the attacker obtains execution on a LAN host
+  such as CLIENT01. A recovered credential and an LDAP bind do not provide
+  that foothold. The DMZ rules permit APP01 → DC01 on tcp 389/636, plus DNS
+  and DHCP to the firewall; they do not permit direct access to CLIENT01's
+  remote-management services or DC01's Kerberos/RPC services. W2 grants
+  local admin rights and W3 grants a LAPS read right (subject to its separate
+  decryption gate); neither supplies network reachability or initial code
+  execution. Record the entry mechanism and its evidence before claiming an
+  end-to-end external-to-Domain-Admin chain. Any firewall change must be an
+  explicit design decision. Building IDP01 would not by itself supply this
+  missing step.
 - Map every step to a MITRE ATT&CK technique ID.
 - Capture the four infrastructure metrics:
   1. reproducibility — N clean `deploy.sh` runs all converge, and a second
@@ -283,7 +296,7 @@ file — never edit the original.
 - 4-3 overall design — the finalized, supervisor-approved topology, now
   actually built with a real DMZ.
 - 4-4 details — the `lab.yaml` schema; the Terraform root module and the
-  `alpine`/`opnsense`/`domaincontroller`/`client`/`app`/`idp` modules; the
+  `alpine`/`opnsense`/`domaincontroller`/`client`/`app` modules; the
   `edge.host` guard; the two dynamic inventories; the pinned-MAC → DHCP → DNS
   chain; the WinRM/NTLM Windows connection; `dc.yml`, `client.yml`, `ad.yml`,
   `app.yml`, and `deploy.sh`; APP01's container topology, weakness-toggle
@@ -291,7 +304,8 @@ file — never edit the original.
   section produced in Phase 4.
 - Figures — fix the three inaccurate mermaid diagrams
   (`Infrastructure.md:14`, `Overview.md:22`, `Attack Paths.md:8`, which
-  overstate the built state), export mermaid → SVG
+  overstate the built state); mark IDP01 / SSO as deferred in the topology
+  and `Identity.md` figures; export mermaid → SVG
   (`npx @mermaid-js/mermaid-cli`), and add Persian captions with English node
   labels.
 
@@ -308,9 +322,9 @@ file — never edit the original.
 
 ### Phase G — Chapter 6, front and back matter, defense
 
-- 6-1 conclusion (after Chapter 5); 6-2 future work (IDP extensions if only
-  partially built, the deferred scenario engine, `docs/TODO.md`, and
-  `redclay.yaml` `next_major_work`).
+- 6-1 conclusion (after Chapter 5); 6-2 future work (the deferred IDP01 / SSO
+  deployment and portal integration, the deferred scenario engine,
+  `docs/TODO.md`, and `redclay.yaml` `next_major_work`).
 - The glossary (واژه‌نامه); finalize the references; place the figures; a full
   RTL/Latin pass.
 - Assemble, proofread, and export the final PDF. Keep the weekly supervisor

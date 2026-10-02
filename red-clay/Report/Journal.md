@@ -78,4 +78,17 @@ Current phase: [[Attacker/Active Directory]] — DC01, CLIENT01, users/groups/pe
 
 ### Actions:
 1. [[AD]]
-2. 
+2. [[Windows WorkStation]]
+3. [[Domain Users]]
+4. [[App VM]]
+5. [[AD Weaknesses]]
+
+At this point, I realized that APP VM should not be in the same subnet/network/LAN as other VMs. A shell access on APP will compromise the whole lab. exactly like a vpn and there is no difference between them.
+So in order to fix that, I planned to move the APP VM to another LAN/network/subnet called DMZ. the routing happens between these networks by OPNSENSE.
+
+This may not have sounded like a big change, but it dug out many hidden issues of the current lab.
+One of which was OPNSense handilation. 
+OPNsense was not created out of a base image. So changing this cause many manual changes.
+I now have a decision to make to make the OPNSense like AD and windows workstations to actually use a based image.
+This way it will always be clean. right now, playbooks work as *Best Effort*. they don't verify the exact status and config of opnsense. they just add their own rules to it.
+This work scares me so im going to ignore it for now. But this is definitely a known issue of this lab. call it a technical debt under time pressure. 
