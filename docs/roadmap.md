@@ -131,11 +131,70 @@ Outstanding in this phase:
   OPNsense itself writes); confirm the rule is idempotent (it is matched by
   its `descr` marker); confirm it does nothing when `LAB_WAN_EXPOSE_APP` is
   unset.
-- Build the Kali attacker VM on the WAN side. Prefer a Terraform module over
+- ~~Build the Kali attacker VM on the WAN side. Prefer a Terraform module over
   a hand-made VM, for consistency and to keep the reproducibility metric
-  honest. Place it on the OPNsense WAN leg, outside `vm-lan0`.
+  honest. Place it on the OPNsense WAN leg, outside `vm-lan0`.~~ **Done** —
+  `terraform/modules/kali`, VM `crusader` in `lab.yaml`, on the OPNsense WAN
+  leg as this bullet asked. The leg is addressed now (`10.1.0.0/24`, gateway
+  `10.1.0.1`) and the guest takes `10.1.0.100` from a cloud-init seed the
+  module attaches rather than from DHCP: nothing on that leg serves DHCP or
+  DNS, so there is no address for Ansible to reach the box at in order to
+  configure it. `crusader` is accordingly the one VM in the lab Ansible does
+  not own, and the leg declares no `monitor`. Design, and the two
+  silent-failure caveats: `docs/network-design.md` §8.1.
+
+  Outstanding, and both are prerequisites for the bullet below rather than
+  nice-to-haves: the WAN interface's own `10.1.0.1/24` is a UI step (26.7 has
+  no API for an interface's address) asserted by `opnsense.yml` §4e, and that
+  assert still has not been run as a task — the guest proves the leg is
+  addressed and routed, but a fresh deploy would still find out by booting it.
+  And `KALI-base.qcow2` carries cloud-init and NetworkManager, so a rebuilt base
+  is fine on that count — but the seed has to keep cloud-init's own network
+  handling out of the way, and the obvious way to do that does not work.
+  `network: {config: disabled}` in user-data is invisible on the first boot
+  (cloud-init resolves the network config before it has read user-data), so
+  cloud-init renders its fallback: DHCP, by `eni`, on a leg with no DHCP server,
+  which leaves eth0 link-local and NetworkManager treating the device as
+  unmanaged. The disable lives in the seed's `network-config` file instead, and
+  the address is a NetworkManager keyfile with `autoconnect-priority=100`. The
+  seed also rides a virtio disk rather than a SATA cdrom; as a cdrom,
+  cloud-init's systemd generator was cut off mid-probe on roughly every other
+  fresh-overlay boot and the guest booted unconfigured and silent. See
+  `docs/network-design.md` §8.1 for the full set.
 - Prove the entry: Kali reaches APP01 through the WAN port-forward, and
   nothing else internal is reachable from the WAN.
+- **Give the attacker leg a route off the lab — done, posture decided.** The
+  lab had no internet at all (`vm-wan0` was a bridge with no ports). OPNsense
+  now has a fourth NIC, pointed at `virbr0` — the bridge libvirt's stock
+  `default` NAT network creates, named by `edge.uplink_bridge` in `lab.yaml` —
+  and **only** `10.1.0.0/24` egresses; `dc01`, `client01` and `app01` stay
+  sealed. This answers the Phase D question below, which now only has to be
+  written up rather than decided. `docs/network-design.md` §8.2 has the design,
+  the rejected alternatives, the dependency this accepts and the NAT gotcha.
+
+  All six UI steps (assign, address, gateway, NAT rule, filter rule, resolver)
+  are done, none of them automatable on 26.7. `ping 8.8.8.8` from `crusader`
+  returns 0% loss, which needs the interface, its address, the default route,
+  the Hybrid NAT rule and the WAN pass rule all present; `dig` through
+  `10.1.0.1` returns an answer, which needs Unbound listening on the attacker
+  leg (`active_interface` now selects `wan` alongside `lan` and the DMZ).
+  §4f of `opnsense.yml` asserts the first of the six only, and §4e's address
+  assert still has not been run as a task. The NIC itself plans clean
+  — `3 to add, 1 to change, 0 to destroy`, the edge domain updated in place with
+  a pure interface addition, so its existing MACs and interface assignment are
+  untouched. Still copy `opnsense.qcow2` aside before applying: it has no
+  overlay and no snapshot.
+
+  The uplink points at libvirt's stock `default` network (`virbr0`), which makes
+  it the one leg here that is host state rather than lab state: nothing in this
+  repo defines, autostarts or repairs it, and a host without it fails at
+  `virsh start` with "Network bridge virbr0 not found" — prechecked by
+  `start_vms.yml` either way, because the gateway's `bridges` output carries
+  this bridge alongside the three segment bridges. A lab-owned network was
+  built, reviewed and dropped: it worked, but it added a network definition, a
+  playbook section and a template to `hosts.yml` in order to own a device the
+  libvirt package already provides. The dependency is accepted and recorded
+  rather than designed around.
 
 ### Phase 4 — Plant and wire the remaining weaknesses (AD privesc to DA)
 

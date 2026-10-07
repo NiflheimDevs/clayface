@@ -173,13 +173,16 @@
           `terraform apply`, then re-run with both inventories.
 
     # Probing `/` cannot tell the firewall's API apart from a service sitting
-    # in front of the firewall's address. The lab's WAN port forward
-    # (opnsense.yml: destination `any`, `natreflection: purenat`) catches
-    # https on 10.0.0.1:443 from the LAN and answers with app01's portal,
+    # in front of the firewall's address. The lab's WAN port forward caught
+    # https on 10.0.0.1:443 from the LAN and answered with app01's portal,
     # which 302s to /portal/ — and ansible.builtin.uri follows redirects by
     # default, so a probe of `/` saw 200 and this playbook picked https, after
-    # which *every* /api/ call came back 404 from app01's nginx. So: probe an
-    # API path, and refuse to follow anything.
+    # which *every* /api/ call came back 404 from app01's nginx. The forward's
+    # destination is now pinned to the WAN address in opnsense.yml section 4d,
+    # which is what stops it matching the firewall's LAN address. The probe
+    # stays as it is regardless: the question worth asking is "does the API
+    # answer on this scheme", and "/ answered" is a different question. So:
+    # probe an API path, and refuse to follow anything.
     - name: Probe the OPNsense API over HTTPS
       ansible.builtin.uri:
         url: "https://{{ opnsense_host }}/api/core/firmware/status"

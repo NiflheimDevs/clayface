@@ -22,9 +22,10 @@ module "opnsense_host_a" {
 
   # The edge VM is not in `vm_placements` — `edge.host` names its hypervisor
   # instead — so its segments are named explicitly rather than derived.
-  bridge     = local.network_bridges["lan"]
-  wan_bridge = local.network_bridges["wan"]
-  dmz_bridge = local.network_bridges["dmz"]
+  bridge        = local.network_bridges["lan"]
+  wan_bridge    = local.network_bridges["wan"]
+  dmz_bridge    = local.network_bridges["dmz"]
+  uplink_bridge = local.edge_uplink_bridge
 }
 
 module "opnsense_host_b" {
@@ -38,9 +39,10 @@ module "opnsense_host_b" {
 
   name = each.key
 
-  bridge     = local.network_bridges["lan"]
-  wan_bridge = local.network_bridges["wan"]
-  dmz_bridge = local.network_bridges["dmz"]
+  bridge        = local.network_bridges["lan"]
+  wan_bridge    = local.network_bridges["wan"]
+  dmz_bridge    = local.network_bridges["dmz"]
+  uplink_bridge = local.edge_uplink_bridge
 }
 
 module "alpine_host_a" {
@@ -167,4 +169,38 @@ module "app_host_b" {
 
   name   = each.key
   bridge = local.network_bridges[local.placement_network[each.key]]
+}
+
+module "crusader_host_a" {
+  source = "./modules/kali"
+
+  providers = {
+    libvirt = libvirt.host_a
+  }
+
+  for_each = {
+    for name, p in local.vm_placements :
+    name => p if p["host"] == "host_a" && p["module"] == "crusader"
+  }
+
+  name   = each.key
+  bridge = local.network_bridges[local.placement_network[each.key]]
+
+}
+
+module "crusader_host_b" {
+  source = "./modules/kali"
+
+  providers = {
+    libvirt = libvirt.host_b
+  }
+
+  for_each = {
+    for name, p in local.vm_placements :
+    name => p if p["host"] == "host_b" && p["module"] == "crusader"
+  }
+
+  name   = each.key
+  bridge = local.network_bridges[local.placement_network[each.key]]
+
 }

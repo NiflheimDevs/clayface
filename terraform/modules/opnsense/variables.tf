@@ -24,3 +24,8 @@ variable "dmz_bridge" {
   description = "Name of the Linux bridge on the hypervisor for the edge VM's DMZ NIC. Appended third, so the guest sees it as vtnet2."
   type        = string
 }
+
+variable "uplink_bridge" {
+  description = "Name of the Linux bridge carrying the edge VM's uplink off the lab — `edge.uplink_bridge` in lab.yaml, which is the device libvirt's stock `default` NAT network creates. Appended fourth, so the guest sees it as vtnet3."
+  type        = string
+}

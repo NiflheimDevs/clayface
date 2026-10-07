@@ -51,6 +51,9 @@
           'ansible-playbook -i inventory/lab_inventory.py playbooks/edge.yml'
           (it creates the WAN bridge), or use ./deploy.sh which runs
           everything in the right order.
+          If the missing bridge is the edge's uplink, that one is not built by
+          any playbook: it is the device libvirt's stock `default` network
+          creates, so check `virsh -c qemu:///system net-list` on the host.
       loop: "{{ bridge_check.results }}"
       loop_control:
         label: "{{ item.item }}"
@@ -126,6 +129,9 @@
           'ansible-playbook -i inventory/lab_inventory.py playbooks/edge.yml'
           (it creates the WAN bridge), or use ./deploy.sh which runs
           everything in the right order.
+          If the missing bridge is the edge's uplink, that one is not built by
+          any playbook: it is the device libvirt's stock `default` network
+          creates, so check `virsh -c qemu:///system net-list` on the host.
       loop: "{{ bridge_check.results }}"
       loop_control:
         label: "{{ item.item }}"

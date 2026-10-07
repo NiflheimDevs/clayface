@@ -16,6 +16,25 @@ locals {
     substr(local.dmz_mac_seed, 2, 2),
     substr(local.dmz_mac_seed, 4, 2),
   )
+
+  # The uplink NIC's MAC, pinned for the DMZ's reason and one more of its own.
+  #
+  # The DMZ's is pinned so a renumbering becomes a named assertion failure
+  # rather than a firewall ruleset pointing at the wrong interface. The same
+  # applies here. The extra reason is that OPNsense remembers which interface
+  # an assignment belongs to partly by MAC: this NIC must be *assigned* by hand
+  # in the UI before it does anything, and a MAC that changed on every apply
+  # would make that assignment go stale without saying so.
+  #
+  # LAN and WAN are unpinned, and that asymmetry is deliberate rather than an
+  # oversight — but it is also why redefining this domain deserves care. See
+  # the note on this resource in docs/network-design.md section 8.2.
+  uplink_mac_seed = sha256("${var.name}-uplink")
+  uplink_mac = format("52:54:00:%s:%s:%s",
+    substr(local.uplink_mac_seed, 0, 2),
+    substr(local.uplink_mac_seed, 2, 2),
+    substr(local.uplink_mac_seed, 4, 2),
+  )
 }
 
 resource "libvirt_domain" "opnsense" {
@@ -63,6 +82,11 @@ resource "libvirt_domain" "opnsense" {
     # existing NIC. Inserting one renumbers the WAN and quietly points the
     # firewall rules at the wrong interface. The DMZ NIC is third for exactly
     # that reason: appending gives it vtnet2 and leaves LAN/WAN alone.
+    #
+    # The uplink is fourth for the same reason again — vtnet3, LAN/WAN/DMZ
+    # untouched. It must stay last: it is the NIC OPNsense has to be told about
+    # by hand, and a hand-made assignment is the thing a renumbering breaks
+    # most quietly.
     interfaces = [
       {
         type = "bridge"
@@ -104,6 +128,23 @@ resource "libvirt_domain" "opnsense" {
         source = {
           bridge = {
             bridge = var.dmz_bridge
+          }
+        }
+      },
+      {
+        type = "bridge"
+
+        model = {
+          type = "virtio"
+        }
+
+        mac = {
+          address = local.uplink_mac
+        }
+
+        source = {
+          bridge = {
+            bridge = var.uplink_bridge
           }
         }
       },

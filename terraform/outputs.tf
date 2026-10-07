@@ -1,5 +1,5 @@
 output "vms" {
-  description = "Map of VM name to { hypervisor, role, os_family, network, bridge, mac, ip }. hypervisor is the libvirt host alias from lab.yaml; role is the terraform module that built the VM ('gateway' for the OPNsense edge VM, otherwise the `module:` value from lab.yaml - 'dc', 'client', 'alpine', 'app') and names the Ansible playbook that owns it; os_family is 'windows' or 'linux' and decides how Ansible connects; network is the lab.yaml segment the VM sits on; bridge is that segment's bridge device, and the gateway additionally carries `bridges`, the list of every leg it is attached to, and `dmz_mac`, the pinned MAC of its DMZ NIC; mac is the pinned NIC MAC for modules that derive one; ip is the optional static address declared in lab.yaml. Consumed by the Ansible dynamic inventory."
+  description = "Map of VM name to { hypervisor, role, os_family, network, bridge, mac, ip }. hypervisor is the libvirt host alias from lab.yaml; role is the terraform module that built the VM ('gateway' for the OPNsense edge VM, otherwise the `module:` value from lab.yaml - 'dc', 'client', 'alpine', 'app') and names the Ansible playbook that owns it; os_family is 'windows' or 'linux' and decides how Ansible connects; network is the lab.yaml segment the VM sits on; bridge is that segment's bridge device, and the gateway additionally carries `bridges`, the list of every leg it is attached to, and `dmz_mac`, the pinned MAC of its DMZ NIC, and `uplink_mac`, the pinned MAC of the NIC that carries it off the lab; mac is the pinned NIC MAC for modules that derive one; ip is the optional static address declared in lab.yaml. Consumed by the Ansible dynamic inventory."
 
   value = merge(
     {
@@ -13,9 +13,18 @@ output "vms" {
         # all of them.
         network = "lan"
         bridge  = local.network_bridges["lan"]
-        bridges = [for k in local.gateway_networks : local.network_bridges[k]]
-        mac     = null
-        ip      = null
+        # Every leg this VM attaches to, in NIC order, which is what lets
+        # start_vms.yml precheck all of them before `virsh start` fails with
+        # "Network bridge <name> not found". The three segment legs come from
+        # `gateway_networks`; the fourth entry is the uplink, which is not a
+        # `networks` entry but IS a bridge the domain needs — and the one the
+        # lab does not build, so it is the one most worth checking for.
+        bridges = concat(
+          [for k in local.gateway_networks : local.network_bridges[k]],
+          [local.edge_uplink_bridge],
+        )
+        mac = null
+        ip  = null
         # The DMZ NIC's pinned MAC, so the DMZ playbook can assert that the
         # interface it is configuring is the device terraform attached.
         # See modules/opnsense/outputs.tf.
@@ -23,6 +32,15 @@ output "vms" {
           module.opnsense_host_a[local.edge_vm_name].dmz_mac, null
           ) : try(
           module.opnsense_host_b[local.edge_vm_name].dmz_mac, null
+        )
+        # The uplink NIC's pinned MAC (the fourth, vtnet3), for the same
+        # reason and one more: the firewall allocates this interface's name by
+        # assignment order, so the MAC is the only stable handle opnsense.yml
+        # has on it. See modules/opnsense/outputs.tf.
+        uplink_mac = local.edge_host == "host_a" ? try(
+          module.opnsense_host_a[local.edge_vm_name].uplink_mac, null
+          ) : try(
+          module.opnsense_host_b[local.edge_vm_name].uplink_mac, null
         )
       }
     },

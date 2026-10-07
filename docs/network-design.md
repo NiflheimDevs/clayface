@@ -8,7 +8,8 @@ Status: **built.** `lab.yaml`'s `networks:` map is the source of truth for the
 segments; terraform attaches VMs to them; `ansible/playbooks/hosts.yml` builds
 the bridges and the VXLAN overlays on the hypervisors; and
 `ansible/playbooks/opnsense_dmz.yml` builds the boundary itself on the edge VM.
-The internal user/server split is **not** built — section 11.
+The attacker leg is addressed and carries a VM (section 8.1). The internal
+user/server split is **not** built — section 11.
 
 Companion documents: `docs/network-plan.md` (the plan this was executed from,
 and the record of what was discovered while executing it),
@@ -27,10 +28,15 @@ zones; the DHCP and DNS the DMZ needs to function at all; and the VPN pool as a
 declared fact.
 
 **Out of scope.** The application tier's own design (`docs/app01-design.md`).
-The AD identity layer (`docs/ad-identity-design.md`). IDP01. The attacker
-machine and the WAN port forward (roadmap Phase 3). The internal user/server
-split (section 11). Packer-based image automation, which is what would make the
-one manual step in section 8 disappear (roadmap Phase 7).
+The AD identity layer (`docs/ad-identity-design.md`). IDP01. The internal
+user/server split (section 11). Packer-based image automation, which is what
+would make the manual steps in section 8 disappear (roadmap Phase 7).
+
+The attacker machine is in scope only as far as its segment goes: the `wan`
+leg's addressing, the firewall's own address on it, and the fact that the VM is
+configured without Ansible. What runs *on* the box — the tooling, the
+engagement workflow — is not, and neither is the WAN port forward, which is
+written but still unverified (section 11).
 
 **Explicitly rejected.**
 
@@ -63,22 +69,36 @@ is a rendering of that map, not a second copy of it.
 |---|---|---|---|---|---|---|---|
 | Internal LAN | `lan` | `vm-lan0` | `10.0.0.0/24` | `10.0.0.1` | `10.0.0.2/24` | 100 | built |
 | DMZ | `dmz` | `vm-dmz0` | `10.0.10.0/24` | `10.0.10.1` | `10.0.10.2/24` | 101 | built |
-| WAN | `wan` | `vm-wan0` | — (NAT leg) | — | — | — | built |
+| Attacker (WAN) | `wan` | `vm-wan0` | `10.1.0.0/24` | `10.1.0.1` | — | — | built |
 | VPN pool | `vpn` | — | `10.0.100.0/24` | `server: none` | — | — | **declared, not implemented** |
 
 Guests, by zone:
 
 | VM | Zone | Address | Module / role |
 |---|---|---|---|
-| `opnsense01` | all three | `10.0.0.1`, `10.0.10.1`, WAN via NAT | `opnsense` / `gateway` |
+| `opnsense01` | all three | `10.0.0.1`, `10.1.0.1`, `10.0.10.1` | `opnsense` / `gateway` |
 | `dc01` | `lan` | `10.0.0.10` | `dc` / `dc` |
 | `app01` | `dmz` | `10.0.10.10` | `app` / `app` |
 | `client01` | `lan` (commented out) | `10.0.0.20` | `client` / `client` |
+| `crusader` | `wan` | Dynamic OPNsense DHCP lease, registered as `crusader.clayface` | `crusader` / `crusader` |
+| *uplink* | *(none — the bridge libvirt's `default` network creates)* | `192.168.122.0/24` (that network's own DHCP) | `opnsense` / `gateway`, 4th NIC |
 
-`wan` is in the map although it has no subnet, because "this leg has no subnet,
-no gateway and no overlay" is itself a fact worth declaring rather than
-implying. The WAN is a NAT leg: OPNsense does the NAT, and nothing inside the
-lab may be reached from it unless a port forward says so.
+`wan` carries only `bridge`, `subnet` and `gateway`. The keys it omits are
+statements rather than gaps:
+
+- **no `vxlan_id`** — no overlay, so the leg is host-local by definition. That
+  is what pins the attacker VM to the host holding OPNsense.
+- **no `monitor`** — nothing on the control node manages that VM. It is
+  configured by cloud-init at first boot, so Ansible never dials in, and the
+  control node stays off this leg.
+- **no `dns`** — OPNsense's WAN interface is not a resolver. A `dns:` here
+  would point the bridge at an address that never answers.
+
+The leg was addressed in this wave because a guest now lives on it (section
+8.1). Before that it declared nothing but a bridge, and that was the standing
+proof that `bridge` is the only key a segment must carry. The WAN is still the
+NAT leg in the sense that matters: nothing inside the lab may be reached from
+it unless a port forward says so.
 
 ### 2.1 Why the map is a map
 
@@ -299,7 +319,7 @@ from the interface address, and a second copy could only ever disagree with
 
 ---
 
-## 8. Automation, and the one manual step
+## 8. Automation, and the manual steps
 
 `ansible/playbooks/opnsense_dmz.yml` is one play, `hosts: localhost`, against
 the OPNsense REST API. It is idempotent: a second run reports `changed=0`. It
@@ -364,6 +384,229 @@ time out at `wait_for_connection` fifteen minutes later.
 `start_vms.yml --tags members`, and it must not be `|| true`-swallowed: on a
 fresh lab it stops the deploy once, deliberately, at the address assert. Fix
 the address, re-run the playbook, carry on from the next step.
+
+### 8.1 The attacker leg, and the second address
+
+`crusader` sits on `wan` at `10.1.0.100`, and the firewall's own address on that
+leg is `10.1.0.1`. Three things about it are worth recording, because each one
+is a place the design could have gone the other way.
+
+**The address is a manual step, and the second one.** OPNsense 26.7 has no REST
+path to an interface's IPv4 configuration — the same wall section 8 describes —
+so `10.1.0.1/24` is typed into the UI once and asserted thereafter, by section
+4e of `ansible/playbooks/opnsense.yml`. That assert reads the **running**
+interface list, not `config.xml`, for the reason recorded in `opnsense_dmz.yml`:
+an interface can carry its address in saved config and have none in the kernel,
+and every API read that says "configured" then describes a leg with no route on
+it. It is skipped when the leg declares no subnet, so a lab with no attacker VM
+is not asked to address a segment nothing uses.
+
+The UI step, complete because the defaults are wrong for this subnet:
+
+```
+Interfaces -> Assignments -> WAN
+  IPv4 Configuration Type : Static IPv4
+  IPv4 address            : 10.1.0.1/24
+  Block private networks  : OFF   <-- ON by default on WAN, and 10.1.0.0/24
+                                      is RFC1918, so leaving it on drops the
+                                      whole attacker leg
+  Block bogon networks    : OFF
+  Enabled                 : ON
+Save, then Apply.
+```
+
+**The guest configures itself, because nothing else can reach it.** This is the
+one VM in the lab that Ansible does not own. It sits on the far side of the
+filter on a leg with no DHCP and no DNS, so there is no address for Ansible to
+dial in to in order to set one — a circularity the DMZ hosts do not have, since
+they at least get a lease and a resolver on their own leg. `crusader` breaks it
+from inside: the terraform module attaches a NoCloud seed
+(`libvirt_cloudinit_disk`), and cloud-init writes the address, the route and the
+hostname at first boot with nothing reaching in.
+
+That choice is why this leg declares no `monitor`. Giving the control node an
+address here would have made the leg Ansible-manageable and would have added a
+third leg to the multi-homing that section 6 already calls the largest gap in
+the model — a real cost, paid for a VM that needs nothing from Ansible.
+
+**Config changes reach the guest the same way: a second NoCloud seed.**
+`ansible/playbooks/crusader.yml` is the one playbook allowed to touch the VM,
+and it still never dials in. It renders `base-image/clayface.ovpn` (appending
+the CA from `LAB_VPN_CA_FILE` when it is set — without it the client drops
+`remote-cert-tls server` and does not verify the server's identity, an
+accepted risk the playbook warns about at run time — and writing an auth
+file from `LAB_VPN_USER` / `LAB_VPN_PASS`, the latter defaulting to the
+former, so `openvpn-client@clayface` never blocks on an interactive
+prompt), builds a second `cidata`-labelled ISO on the hypervisor, attaches it
+to the running domain as a virtio disk — the terraform seed holds `vdb`, the
+push seed takes `vdc` — and reboots the guest. The seed's instance-id is
+hashed from the rendered user-data (the kali module's own idiom), so an
+unchanged config is a no-op and a changed one re-runs the per-instance
+modules on the next boot. The user-data deliberately carries no `network:` key:
+the NIC belongs to the keyfile the first seed wrote, and a second seed
+reaching the network stage would reopen a question that cost the day once
+already. Terraform's next apply drops the attached device from the domain XML;
+re-running the playbook re-attaches it. The tunnel itself is only verifiable
+from the guest console — `systemctl status openvpn-client@clayface` and
+`ip addr show tun0` — which the playbook says rather than pretends otherwise.
+
+Two consequences follow from the module pinning no MAC, and they are one
+decision rather than two. `vms_pinned` in `terraform_vms.py` requires **both** a
+MAC and an `ip:`, so `opnsense.yml` never writes a DHCP reservation for this VM
+— correct, since a reservation on a leg with no pool points at nothing. And
+`ip:` in `lab.yaml` keeps one meaning (this VM's static address) while the
+mechanism that realizes it differs per module: reservation for a MAC-pinning
+module, cloud-init for this one.
+
+**What the seed may not do is let cloud-init configure the NIC.** With no
+network config from any source cloud-init renders a *fallback* config — DHCP for
+the first candidate NIC — and on this base that is rendered by `eni` (ifupdown)
+into `/etc/network/interfaces.d/50-cloud-init` and handed to dhcpcd. This leg
+serves no DHCP, dhcpcd falls back to an IPv4 link-local address, and
+NetworkManager finds eth0 already carrying an address it did not put there and
+reports the device `unmanaged` from then on. So the seed's `network-config` file
+carries `config: disabled`, and the address is written as a NetworkManager
+keyfile from user-data instead. The disable cannot live in user-data: cloud-init
+resolves the network config from a merged config object it assembles before it
+has read user-data, so `network: {config: disabled}` is missing on exactly the
+first boot and present on every boot after.
+
+The renderer is also why the keyfile is a keyfile. The seed's `network-config`
+channel is rendered by the first renderer cloud-init finds in a priority list
+compiled into it, and on this base that is `eni`, which has no `match:` concept —
+it names its stanza after the config *key*, so an `ethernets: primary:` entry
+became `iface primary`, an interface that does not exist. Steering that list
+means `system_info`, which cloud-init 24.2 deprecated in user-data and ignores
+there. A second `autoconnect-priority=100` on the keyfile is what beats the
+generic DHCP profile NM auto-creates for any ethernet device (`Wired connection
+1`, from the hand-built install, which binds no interface name).
+
+**It depends on cloud-init being in the base image, and fails silently if it is
+not.** `KALI-base.qcow2` carries cloud-init and NetworkManager; a base built
+from Kali's installer carries neither, and the `kali-cloud` images do. If
+cloud-init is absent the seed is attached, nothing reads it, and the guest comes
+up on a link-local address with no error logged anywhere — so the check is
+`ip -br addr` on the guest (or the GDM banner's hostname), never the exit code of
+a plan or a playbook. The interface is matched in the keyfile by name (`eth0`);
+a base that names its NIC `enp1s0`/`ens3` would not match, which is the same
+class of silent failure and is why the guest is what gets checked.
+
+**Nothing about this touches the hypervisor.** The `hosts.yml` loop reads every
+segment, but a segment declaring no `monitor`, no `dns` and no `vxlan_id` gives
+it nothing to do — no new bridge (`vm-wan0` already existed), no address, no
+overlay. The attacker leg is a data edit plus one UI field, which is the
+property section 2.1 claims for the map and this is the first segment to test it
+from the other direction.
+
+---
+
+### 8.2 The uplink, and who gets a network
+
+The lab had no route off it at all. `vm-wan0` was a bridge with no ports — the
+attacker leg and OPNsense's own WAN interface talking to each other and to
+nothing else — and a guest on it could not resolve a package mirror, let alone
+reach one. This section adds the route and fixes the posture that comes with it.
+
+**A fourth NIC, on libvirt's stock NAT network.** The module appends the NIC
+last so the guest sees it as `vtnet3`; LAN, WAN and DMZ keep their numbering.
+Its bridge is named by `edge.uplink_bridge` in `lab.yaml`, and it points at
+`virbr0` — the device libvirt's `default` network creates. `default` ships with
+the libvirt package: a NAT network on `192.168.122.0/24` with its own DHCP,
+whose forwarding libvirt masquerades to the host's uplink. That is the route.
+It is deliberately **not** a `networks:` entry — those are bridges `hosts.yml`
+creates with `ip link add` and owns, whereas this device is created by libvirt
+and libvirt owns it; `ip link add` on it would fight libvirt for the device, and
+the gateway and VM inventories would treat a host-NAT leg as a lab segment. It
+is a property of the edge, like `edge.host`.
+
+**What it costs: the route off the lab is host state, not lab state.** Nothing
+in this repo creates `default`. It comes with the package, and a host where it
+has been undefined or never started has no `virbr0` — which surfaces as
+`virsh start` failing with "Network bridge virbr0 not found", the same error
+`start_vms.yml` prechecks the segment bridges for. It checks this one too: the
+gateway's `bridges` output carries the uplink bridge alongside the three
+segment bridges. `virsh -c qemu:///system net-list` on the edge host is the
+check. A lab-owned network was the alternative and was rejected as more
+machinery than the dependency is worth: it would mean a network definition, a
+playbook section and a template in this repo, all to own a device the package
+already provides.
+
+One consequence is a trap rather than a detail: because that subnet is RFC1918,
+the address OPNsense's uplink interface receives is private, so that
+interface's **Block private networks must be OFF** or the leg is dropped
+silently — the same trap the attacker leg's WAN interface carries, and two of
+the six UI steps below.
+
+The lab now holds two masquerades on the egress path, which is worth knowing
+when reading a packet capture: OPNsense translates `10.1.0.0/24` to
+`192.168.122.x` (the manual Hybrid rule below), and libvirt translates that to
+the host's LAN address.
+
+**It is a separate leg rather than a re-purposing of the WAN.** OPNsense's
+interface *named* `wan` is `vtnet1` at `10.1.0.1/24`, and the port-forward rule,
+the section 4e assert and crusader's `gateway:` all point at it. Naming the
+uplink `wan` instead would have made OPNsense's WAN the real uplink and moved
+the attacker leg to an OPT name — conceptually tidier, and invasive in exactly
+three places. The fourth NIC costs one interface assignment and breaks nothing.
+
+**The posture: the attacker has a network, the corporate side does not.** Only
+`10.1.0.0/24` egresses. `dc01`, `client01` and `app01` stay sealed. This was a
+decision rather than a default, and the alternatives were real:
+
+- *All egress* is the more faithful corporate network — real enterprises have
+  internet — and the argument for it is that it closes an open problem. Phase 6
+  of the roadmap has to show how an attacker on a LAN host obtains tooling, and
+  egress would make that step a download. It was rejected because Phase 6 also
+  measures reproducibility — clean `deploy.sh` runs converging and a second
+  Ansible run reporting zero changes — and a domain controller that reaches
+  Windows Update changes its own patch level under the measurement. The blast
+  radius is the second reason: deliberately unpatched, intentionally
+  misconfigured Windows VMs with a route out is what GOAD's own README warns
+  against.
+- *Filtered egress for everything* — allow updates and tooling, deny the rest,
+  log it — is what a corporate network actually looks like and would be the
+  better answer if the internal tier needed anything. Nothing in the Chapter 5
+  chain needs it. `app.yml`'s only internet dependency is a `docker pull` for
+  the database and proxy images, and that runs in play 1 **on the control
+  node**; `app01` only ever `docker load`s a tarball.
+
+The decision is one line of prose here and, in the running lab, the *absence*
+of three rules. Section 11 records it as a deviation, and the roadmap's Phase D
+entry that asked for this decision can now be answered.
+
+**The non-obvious part: nothing is translated automatically.** OPNsense's
+automatic outbound NAT creates rules for each interface *except the WAN*, and
+the attacker leg **is** the interface OPNsense calls WAN. So under automatic
+mode the leg that needs translating is the one excluded by definition, and the
+interfaces that are included are translated towards `10.1.0.1` — the attacker
+leg's own address, which routes nowhere. The mode has to move to **Hybrid** with
+one manual rule. This is the single most likely way to end up with a configured
+uplink that carries no traffic, which is why the assert below exists.
+
+**Six manual steps, and only the first outcome is asserted.** The interface is
+assigned, given DHCP, given a gateway and a default route, NAT'd, filtered, and
+given a resolver — all in the UI, because 26.7 has no REST path to an
+interface's IPv4 configuration, which is the same wall sections 8 and 8.1 hit.
+`opnsense.yml` section 4f asserts the *first* outcome that is visible through
+the API — the interface is assigned, `up` and addressed — and prints the whole
+list when it is not. It deliberately does not try to assert the NAT rule, the
+route or the filter rule: those are not readable from the control node in any
+way that would distinguish "configured" from "configured and not working", and
+a check that guessed would be worse than none. The only real test is from the
+guest: `ip -br addr`, then `ping 192.168.122.1`, then a name lookup.
+
+**Redefining this domain deserved care, and the plan is clean.** `opnsense01`
+has no overlay and no base image — `opnsense.qcow2` is the live artifact,
+written in place — and its LAN and WAN NICs carry libvirt-assigned MACs that
+the module does not pin, while OPNsense binds an interface assignment partly by
+MAC. A domain *replace* could therefore have churned those MACs and silently
+broken the assignment. Terraform does not do that: the plan for this change is
+`3 to add, 1 to change, 0 to destroy`, and the interface diff is a **pure
+addition** — the existing three keep their MACs, so the assignment is untouched.
+Copy the image aside anyway before applying; it has no snapshot behind it and
+the copy costs a minute. The seeded `kali-base` domain is one `virsh start` from
+corrupting a read-only backing file — the same class of hazard with the opposite
+shape: a writable image with nothing behind it to roll back to.
 
 ---
 
@@ -478,8 +721,53 @@ assertion, and it is the fastest read of "what is actually there".
 
 ## 11. Documented deviations and known limitations
 
-- **One manual step.** The DMZ interface address (section 8). Not automatable
-  on this OPNsense release.
+- **Manual steps, all of them interface configuration.** The DMZ interface
+  address (section 8) and the WAN's (section 8.1) are one field each. The
+  uplink is six steps, because an interface that has to route needs an
+  assignment, an address, a gateway, a NAT rule, a filter rule and a resolver —
+  and none of them is automatable on this OPNsense release, for the same
+  reason: 26.7 has no REST path to an interface's IPv4 configuration
+  (section 8.2).
+- **Only the attacker leg has internet, by decision** (section 8.2). The
+  corporate VMs are sealed. This is a posture the thesis has to defend rather
+  than a limitation, and the roadmap's Phase D entry owes it a paragraph.
+- **The uplink is asserted only as far as the API can see, and is measured from
+  the guest as far as routing.** Section 4f proves the interface is assigned, up
+  and addressed; it cannot prove the NAT rule, the default route or the filter
+  rule work. `ping 8.8.8.8` from `crusader` does — 0% loss, which exercises all
+  three at once — so "OPNsense has an uplink" and "crusader can reach the
+  internet" are no longer two separate claims. The deployment playbook now
+  adds the attacker leg to Unbound DNS → General → Listen Interfaces and the
+  guest resolves through `10.1.0.1` (`dig google.com` returns an address, no
+  timeout). The same playbook installs quick blocks for OPNsense management
+  ports, so the attacker can route out without reaching the router login.
+- **The uplink depends on host state that this repo does not create.**
+  `virbr0` belongs to libvirt's stock `default` network, which comes with the
+  libvirt package. Nothing here defines it, autostarts it or repairs it, so a
+  host where it has been undefined shows up as `virsh start` failing with
+  "Network bridge virbr0 not found" — prechecked by `start_vms.yml`, which is
+  told the bridge name through the gateway's `bridges` output. Section 8.2 has
+  the reasoning for depending on it rather than building a network of our own.
+- **The attacker VM's address depends on cloud-init in its base image, and on a
+  seed that stops cloud-init from touching the NIC.** `KALI-base.qcow2` has
+  cloud-init and NetworkManager; a base built from Kali's installer has neither.
+  When cloud-init is missing the NoCloud seed is attached and nothing reads it,
+  so the guest comes up link-local with no error logged anywhere — the check is
+  `ip -br addr` on the guest, not the exit code of anything (section 8.1). The
+  seed's `network-config` file carries `config: disabled` because the fallback
+  config cloud-init would otherwise generate is DHCP rendered by `eni`, which on
+  a leg with no DHCP server leaves eth0 link-local and `unmanaged`. The address
+  itself is a NetworkManager keyfile in user-data with
+  `autoconnect-priority=100`, which is what beats the generic DHCP profile NM
+  auto-creates. The seed rides a virtio disk, not a SATA cdrom: as a cdrom,
+  cloud-init's systemd generator was cut off partway through the datasource
+  probe on roughly every other fresh-overlay boot, and the guest booted with no
+  hostname and no address and nothing logged.
+- **The attacker leg is verified from the guest, not from the control node.**
+  `crusader` holds `10.1.0.100`, pings `10.1.0.1`, reaches `8.8.8.8` and
+  resolves names through `10.1.0.1`. What has *not* run is
+  section 4e's assert as a task, so a fresh deploy still learns the leg's state
+  by booting the guest rather than by failing the playbook.
 - **The internal split is unbuilt.** `10.0.20.0/24` (users) and `10.0.30.0/24`
   (servers) exist in the target topology and nowhere else. `dc01`, `client01`
   and IDP01 share one flat internal segment, so a foothold on the DC reaches
@@ -499,7 +787,9 @@ assertion, and it is the fastest read of "what is actually there".
   is single-host.
 - **The WAN port forward is unverified.** It was written from documentation,
   not against a live system, and it may need a linked filter pass rule. Not
-  touched by this wave.
+  touched by this wave. The attacker VM now exists, so it is finally the thing
+  that could verify it: `LAB_WAN_EXPOSE_APP=443` plus a probe from `crusader`
+  is the test, and until that runs the port forward is still a claim.
 
 ---
 

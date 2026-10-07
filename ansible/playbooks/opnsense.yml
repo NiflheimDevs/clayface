@@ -72,6 +72,26 @@
     # default. See section 4d below before setting it.
     lab_wan_expose_app: "{{ lookup('env', 'LAB_WAN_EXPOSE_APP') | default('', true) }}"
 
+    # The attacker leg's address, from lab.yaml like every other segment fact.
+    # `wan_cidr` is lab.yaml's `gateway` for the segment with the prefix taken
+    # off `subnet` — the same construction opnsense_dmz.yml uses for the DMZ,
+    # and not a second fact: 10.1.0.1 is the firewall's own address on that
+    # leg, exactly as `gateway` means 10.0.0.1 on the LAN leg.
+    #
+    # Only referenced where `lab_networks['wan'].subnet is defined`; Ansible
+    # templates vars lazily, so a WAN leg declaring no subnet (which is what
+    # lab.yaml said before an attacker VM existed) never evaluates it.
+    wan_cidr: "{{ lab_networks['wan'].gateway ~ '/' ~ lab_networks['wan'].subnet.split('/')[1] }}"
+
+    # The WAN address on its own — the firewall's own address on the attacker
+    # leg. It is the only destination the port forward in section 4d should
+    # ever match: the rule used to say `any`, and with `natreflection: purenat`
+    # that also caught traffic to the firewall's LAN address, so
+    # https://10.0.0.1:443 from the control node was answered by app01's portal
+    # instead of by the firewall's own GUI. Same fact as `wan_cidr` above,
+    # without the prefix.
+    wan_address: "{{ lab_networks['wan'].gateway }}"
+
   module_defaults:
     ansible.builtin.uri:
       url_username: "{{ opnsense_api_key }}"
@@ -118,33 +138,51 @@
           the connection for. The pinned MAC breaks that loop.
       when: unpinned_windows | default([]) | length > 0
 
+    # Probed at an API path, not at the root URL, and without following
+    # redirects. A probe of `/` answers the wrong question — "is anything
+    # serving / on this scheme?" — and the answer here was yes from something
+    # that is not the firewall: the WAN port forward in section 4d reflected
+    # https on 10.0.0.1:443 to app01's portal, which 302s to /portal/, and
+    # ansible.builtin.uri follows redirects by default. The probe saw 200,
+    # picked https, and every /api/ call after it came back 404 from app01's
+    # nginx. Section 4d now pins that rule to the WAN address, which is what
+    # removes the collision; the probe still names an API route, because "the
+    # API is here" is the fact this playbook needs and "/ answered" is not it.
+    # Same probe as opnsense_dmz.yml's.
     - name: Probe the OPNsense API over HTTPS
       ansible.builtin.uri:
-        url: "https://{{ opnsense_host }}/"
-        status_code: [200, 302, 401]
-        timeout: 3
+        url: "https://{{ opnsense_host }}/api/core/firmware/status"
+        follow_redirects: none
+        timeout: 5
       register: https_probe
       failed_when: false
+      changed_when: false
 
     - name: Probe the OPNsense API over HTTP
       ansible.builtin.uri:
-        url: "http://{{ opnsense_host }}/"
-        status_code: [200, 302, 401]
-        timeout: 3
+        url: "http://{{ opnsense_host }}/api/core/firmware/status"
+        follow_redirects: none
+        timeout: 5
       register: http_probe
       failed_when: false
+      changed_when: false
 
-    - name: Pick the answering scheme
+    - name: Pick the scheme whose /api/ actually answered
       ansible.builtin.set_fact:
-        detected_scheme: "{{ 'https' if https_probe.status == 200 else 'http' }}"
+        detected_scheme: "{{ 'https' if https_probe.status | default(0) == 200 else 'http' }}"
 
-    - name: Verify OPNsense is reachable at all
+    - name: Verify the API answered on one of the two schemes
       ansible.builtin.assert:
-        that: https_probe.status == 200 or http_probe.status == 200
+        that: >-
+          https_probe.status | default(0) == 200
+          or http_probe.status | default(0) == 200
         fail_msg: >-
-          Neither https://{{ opnsense_host }} nor http://{{ opnsense_host }}
-          answered. Is the OPNsense VM running and reachable from this
-          machine? (Override with LAB_DNS_URL if it lives elsewhere.)
+          Neither https://{{ opnsense_host }}/api/... nor
+          http://{{ opnsense_host }}/api/... answered 200 as the OPNsense
+          API: https gave {{ https_probe.status | default('no answer') }},
+          http gave {{ http_probe.status | default('no answer') }}. Is the
+          OPNsense VM running and reachable from this machine? (Override with
+          LAB_DNS_URL if it lives elsewhere.)
 
   tasks:
     # ------------------------------------------------------------
@@ -259,6 +297,19 @@
           (existing_by_name[item.name].ip | default('', true) | string) != item.ip
           or (existing_by_name[item.name].hwaddr | default('', true) | string | lower) != (item.mac | lower))
       changed_when: binding_update.status == 200
+
+    - name: Remove obsolete Terraform-managed static bindings
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/dnsmasq/settings/delHost/{{ item.value.uuid }}"
+        method: POST
+      loop: "{{ existing_by_name | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when:
+        - item.key not in (wanted_bindings | map(attribute='name') | list)
+        - item.value.descr | default('') == 'clayface lab (terraform/ansible managed)'
+      register: binding_delete
+      changed_when: binding_delete.status == 200
 
     # ------------------------------------------------------------
     # 4. Apply + verify
@@ -443,11 +494,14 @@
     #         tell you a duplicate exists — it identifies its own rule by the
     #         descr marker below and only ever adds or updates that one. If
     #         you also made one in the GUI, delete one of them by hand.
-    #       - it exposes the portal on the WAN address. In a home LAN that is
-    #         the host's own network, which is the point of the exercise
-    #         (the Ch5 engagement starts from outside), but it is a real
-    #         change to the edge firewall and not something to leave on
-    #         unattended.
+    #       - it exposes the portal on the WAN address, and the rule matches
+    #         that address only. In a home LAN that is the host's own network,
+    #         which is the point of the exercise (the Ch5 engagement starts
+    #         from outside), but it is a real change to the edge firewall and
+    #         not something to leave on unattended. Pinning the destination is
+    #         also what keeps the rule from catching traffic to the firewall's
+    #         other addresses: with `any` and `natreflection: purenat`, the
+    #         forward reflected back inside and answered for 10.0.0.1:443 too.
     # ------------------------------------------------------------
     - name: Assert there is exactly one app VM to forward to
       ansible.builtin.assert:
@@ -501,7 +555,7 @@
             source:
               any: "1"
             destination:
-              network: "any"
+              network: "{{ wan_address }}"
               port: "{{ lab_wan_expose_app }}"
             target: "{{ lab_app_ip }}"
             local-port: "{{ lab_wan_expose_app }}"
@@ -512,7 +566,7 @@
       changed_when: dnat_add.status == 200
       when: lab_wan_expose_app | length > 0 and existing_dnat | length == 0
 
-    - name: Update the port forward when the port or target changed
+    - name: Update the port forward when the destination, port or target changed
       ansible.builtin.uri:
         url: "{{ opnsense_url }}/api/firewall/d_nat/setRule/{{ existing_dnat[0].uuid }}"
         method: POST
@@ -527,7 +581,7 @@
             source:
               any: "1"
             destination:
-              network: "any"
+              network: "{{ wan_address }}"
               port: "{{ lab_wan_expose_app }}"
             target: "{{ lab_app_ip }}"
             local-port: "{{ lab_wan_expose_app }}"
@@ -536,10 +590,28 @@
             descr: "clayface lab portal (terraform/ansible managed)"
       register: dnat_update
       changed_when: dnat_update.status == 200
+      # The destination is part of "did this rule change": the rule this
+      # replaced said `any`, which OPNsense stores as an empty
+      # destination.network, so the first run after this change rewrites it
+      # instead of leaving it alone.
+      #
+      # `destination.network` — not `destination.address`. The rule model
+      # exports both keys, but `address` is a derived field that the API
+      # DISCARDS on write: a rule POSTed with `address: "10.1.0.1"` and an
+      # empty network comes back stored as `network: ''`, `address: ''`, i.e.
+      # still any (verified against this firewall with throwaway disabled
+      # rules; the same shape in `network` stores correctly). Comparing
+      # `address` would therefore be comparing a value that is always empty,
+      # which reads as "changed" on every run and rewrites the rule forever.
+      #
+      # searchRule returns FLAT rows — `destination.network` as one dotted
+      # key, not a nested `destination` map — so the key is bracketed rather
+      # than traversed.
       when: >-
         lab_wan_expose_app | length > 0 and existing_dnat | length > 0
         and ((existing_dnat[0].target | default('', true) | string) != lab_app_ip
-             or (existing_dnat[0]['local-port'] | default('', true) | string) != lab_wan_expose_app)
+             or (existing_dnat[0]['local-port'] | default('', true) | string) != lab_wan_expose_app
+             or (existing_dnat[0]['destination.network'] | default('', true) | string) != wan_address)
 
     - name: Apply the firewall rules
       ansible.builtin.uri:
@@ -556,6 +628,425 @@
              'Portal published on the OPNsense WAN address, port ' ~ lab_wan_expose_app
              ~ ' -> ' ~ lab_app_ip ~ ':' ~ lab_wan_expose_app ~ '. UNVERIFIED rule: '
              ~ 'check it in the OPNsense UI under Firewall -> NAT -> Destination NAT.' }}
+
+    # ------------------------------------------------------------
+    # 4e. Keep the attacker leg from managing the firewall.
+    #
+    # The outbound WAN pass rule is intentionally broad so Crusader can reach
+    # the uplink. These quick blocks take precedence when the destination is
+    # OPNsense itself, preventing access to its HTTP(S)/SSH management ports.
+    # ------------------------------------------------------------
+    - name: Read the WAN filter rules
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/firewall/filter/searchRule"
+        method: GET
+      register: wan_rule_search
+
+    - name: Build the WAN management blocks
+      ansible.builtin.set_fact:
+        # WAN policy is deliberately ordered: VPN/public-service/DNS
+        # exceptions first, private-network blocks next, and internet access
+        # last. The old broad "FOR INTERNET ACCESS" rule must not survive this
+        # policy because it allowed WAN traffic to the router and internal VMs.
+        wan_policy_rules: >-
+          {{ [
+            {'sequence': 1, 'description': 'clayface WAN allow OpenVPN', 'destination_net': '10.1.0.1', 'destination_port': '1194', 'protocol': 'udp', 'action': 'pass'},
+            {'sequence': 2, 'description': 'clayface WAN allow public app redirect', 'destination_net': '10.0.10.10', 'destination_port': '80', 'protocol': 'tcp', 'action': 'pass'},
+            {'sequence': 3, 'description': 'clayface WAN allow public app HTTPS', 'destination_net': '10.0.10.10', 'destination_port': '443', 'protocol': 'tcp', 'action': 'pass'},
+            {'sequence': 4, 'description': 'clayface WAN allow public app DNAT', 'destination_net': '10.1.0.1', 'destination_port': '443', 'protocol': 'tcp', 'action': 'pass'},
+            {'sequence': 5, 'description': 'clayface WAN allow DNS', 'destination_net': '10.1.0.1', 'destination_port': '53', 'protocol': 'tcp/udp', 'action': 'pass'},
+            {'sequence': 10, 'description': 'clayface WAN block RFC1918 10/8', 'destination_net': '10.0.0.0/8', 'destination_port': '', 'protocol': 'any', 'action': 'block'},
+            {'sequence': 11, 'description': 'clayface WAN block RFC1918 172.16/12', 'destination_net': '172.16.0.0/12', 'destination_port': '', 'protocol': 'any', 'action': 'block'},
+            {'sequence': 12, 'description': 'clayface WAN block RFC1918 192.168/16', 'destination_net': '192.168.0.0/16', 'destination_port': '', 'protocol': 'any', 'action': 'block'},
+            {'sequence': 100, 'description': 'clayface WAN allow internet', 'destination_net': 'any', 'destination_port': '', 'protocol': 'any', 'action': 'pass'}
+          ] | map('combine', {
+            'interface': 'wan', 'source_net': lab_networks['wan'].subnet,
+            'log': '1', 'ipprotocol': 'inet', 'direction': 'in',
+            'quick': '1', 'enabled': '1'
+          }) | list }}
+
+    - name: Find obsolete WAN policy rules
+      ansible.builtin.set_fact:
+        obsolete_wan_rules: >-
+          {{ wan_rule_search.json.rows | default([])
+             | selectattr('description', 'defined')
+             | selectattr('description', 'in', [
+                 'FOR INTERNET ACCESS',
+                 'clayface WAN allow public app',
+                 'clayface WAN block OPNsense HTTP management',
+                 'clayface WAN block OPNsense HTTPS management',
+                 'clayface WAN block OPNsense SSH management'
+               ]) | list }}
+
+    - name: Delete obsolete WAN policy rules
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/firewall/filter/delRule/{{ item.uuid }}"
+        method: POST
+      loop: "{{ obsolete_wan_rules }}"
+      loop_control:
+        label: "{{ item.description }}"
+      register: obsolete_wan_delete
+      failed_when: obsolete_wan_delete.json.result is defined and obsolete_wan_delete.json.result not in ['deleted', 'saved']
+      changed_when: obsolete_wan_delete.status == 200
+
+    - name: Re-read WAN rules after obsolete-rule cleanup
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/firewall/filter/searchRule"
+        method: GET
+      register: wan_rule_search_after_cleanup
+
+    - name: Index existing WAN management blocks
+      ansible.builtin.set_fact:
+        wan_rules_by_descr: {}
+
+    - name: Store existing WAN management blocks by description
+      ansible.builtin.set_fact:
+        wan_rules_by_descr: >-
+          {{ wan_rules_by_descr | combine({item.description: item}) }}
+      loop: >-
+        {{ wan_rule_search_after_cleanup.json.rows | default([])
+          | selectattr('description', 'defined')
+          | selectattr('description', 'in', wan_policy_rules | map(attribute='description') | list)
+          | list }}
+      loop_control:
+        label: "{{ item.description }}"
+
+    - name: Create missing WAN management blocks
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/firewall/filter/addRule"
+        method: POST
+        body_format: json
+        body:
+          rule: "{{ item }}"
+      loop: "{{ wan_policy_rules }}"
+      loop_control:
+        label: "{{ item.description }}"
+      register: wan_rule_create
+      when: item.description not in wan_rules_by_descr
+      failed_when: wan_rule_create.json.result is defined and wan_rule_create.json.result != 'saved'
+      changed_when: wan_rule_create.json.result == 'saved'
+
+    - name: Update changed WAN management blocks
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/firewall/filter/setRule/{{ wan_rules_by_descr[item.description].uuid }}"
+        method: POST
+        body_format: json
+        body:
+          rule: "{{ item }}"
+      loop: "{{ wan_policy_rules }}"
+      loop_control:
+        label: "{{ item.description }}"
+      register: wan_rule_update
+      when: >-
+        item.description in wan_rules_by_descr and (
+          (wan_rules_by_descr[item.description].destination_port | default('', true) | string) != (item.destination_port | string)
+          or (wan_rules_by_descr[item.description].source_net | default('', true) | string | lower) != (item.source_net | lower)
+          or (wan_rules_by_descr[item.description].destination_net | default('', true) | string | lower) != (item.destination_net | lower)
+          or (wan_rules_by_descr[item.description].action | default('', true) | string | lower) != (item.action | lower)
+          or (wan_rules_by_descr[item.description].protocol | default('', true) | string | lower) != (item.protocol | lower)
+          or (wan_rules_by_descr[item.description].sequence | default('', true) | string) != (item.sequence | string))
+      failed_when: wan_rule_update.json.result is defined and wan_rule_update.json.result != 'saved'
+      changed_when: wan_rule_update.json.result == 'saved'
+
+    - name: Apply the WAN management blocks
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/firewall/filter/apply"
+        method: POST
+      register: wan_filter_apply
+      changed_when: wan_rule_create is changed or wan_rule_update is changed
+
+    # ------------------------------------------------------------
+    # 4f. Make the lab DNS zone reachable from Crusader.
+    # ------------------------------------------------------------
+    - name: Read Unbound interface selection
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/unbound/settings/get"
+        method: GET
+      register: unbound_cfg
+
+    - name: Add the WAN interface to Unbound listeners
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/unbound/settings/set"
+        method: POST
+        body_format: json
+        body:
+          unbound:
+            general:
+              active_interface: "{{ ((unbound_cfg.json.unbound.general.active_interface | default({}) | dict2items
+                | selectattr('value.selected', 'equalto', 1) | map(attribute='key') | list) + ['wan']) | unique | join(',') }}"
+      register: unbound_wan_set
+      when: >-
+        'wan' not in (unbound_cfg.json.unbound.general.active_interface | default({}) | dict2items
+        | selectattr('value.selected', 'equalto', 1) | map(attribute='key') | list)
+      changed_when: unbound_wan_set.status == 200
+
+    - name: Reconfigure Unbound for the attacker leg
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/unbound/service/reconfigure"
+        method: POST
+      register: unbound_wan_reconf
+      when: unbound_wan_set is changed
+      changed_when: true
+
+    # ------------------------------------------------------------
+    # 4g. The attacker leg's own address
+    # ------------------------------------------------------------
+    # The WAN leg carries an address now, because a guest lives on it. It is
+    # set the same way the DMZ's is, and for the same reason: OPNsense 26.7 has
+    # no API for an interface's IPv4 configuration, so the address is typed
+    # into the UI once and this play ASSERTS it rather than setting it
+    # (docs/network-design.md section 8).
+    #
+    # Asserted against the RUNNING firewall rather than against config.xml, and
+    # that is the whole value of the check: an interface can hold its address
+    # in saved config and have none in the kernel, and every API read that then
+    # says "configured" is describing a leg with no route on it.
+    # opnsense_dmz.yml records the observed case and the long version of this.
+    #
+    # Skipped when the leg declares no subnet — which is exactly what lab.yaml
+    # said about the WAN until an attacker VM was placed on it. A lab with no
+    # guest there is not asked to address a segment nothing uses.
+
+    - name: Read the firewall's running interface list
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/interfaces/overview/export"
+        method: GET
+        # Required: the parse below reads `.content`, which uri only captures
+        # when this is set. Without it the guard task stops the run loudly, but
+        # for a reason that has nothing to do with the firewall.
+        return_content: true
+      register: wan_iface_overview
+      when: lab_networks['wan'].subnet is defined
+
+    # `content | from_json`, never `.json`: this endpoint sends JSON under a
+    # `text/html` content type, so uri does not parse it and `.json` is
+    # undefined. Reading `.json | default([])` would yield an empty list —
+    # indistinguishable from "the box has no such interface" — and that
+    # mismatch already produced one confident, wrong diagnosis. See the longer
+    # note in opnsense_dmz.yml.
+    - name: Record the WAN interface's live state
+      ansible.builtin.set_fact:
+        wan_live: >-
+          {{ (wan_iface_overview.content | default('[]', true) | from_json)
+             | selectattr('identifier', 'defined')
+             | selectattr('identifier', 'equalto', 'wan') | list | first
+             | default({}, true) }}
+      when: lab_networks['wan'].subnet is defined
+
+    - name: Refuse to judge the WAN leg from an unparsed answer
+      ansible.builtin.assert:
+        that: wan_live | length > 0
+        fail_msg: >-
+          The firewall's interface overview did not yield a 'wan' interface
+          (got {{ wan_iface_overview.content | default('') | length }} bytes).
+          This endpoint answers JSON under a text/html content type; if that
+          has changed, every check below it is meaningless, so this stops
+          rather than guessing.
+      when: lab_networks['wan'].subnet is defined
+
+    - name: The WAN interface is up and addressed on the RUNNING firewall
+      ansible.builtin.assert:
+        that:
+          - wan_live.addr4 | default('', true) | string == wan_cidr
+          - wan_live.status | default('', true) | string == 'up'
+        fail_msg: |
+          The WAN interface is not addressed as lab.yaml says. Running state:
+          status '{{ wan_live.status | default('(no interface row at all)') }}',
+          address '{{ wan_live.addr4 | default('') }}', expected {{ wan_cidr }}.
+
+          This is a one-time step in the OPNsense UI, because 26.7 has no API
+          for an interface's IPv4 configuration:
+
+            Interfaces -> Assignments -> WAN
+              IPv4 Configuration Type : Static IPv4
+              IPv4 address            : {{ wan_cidr }}
+              Block private networks  : OFF   (10.1.0.0/24 is RFC1918 —
+                                               ticking this drops the whole
+                                               attacker leg)
+              Block bogon networks    : OFF
+              Enabled                 : ON
+            Save, then Apply.
+
+          Then re-run this playbook; it is idempotent. Everything else in the
+          run passed without it — the pinned bindings, the resolver and the
+          port forward do not depend on this leg's own address. What is
+          missing is only that the attacker VM cannot reach its gateway, so
+          the segment exists but routes nowhere.
+      when: lab_networks['wan'].subnet is defined
+
+    # ------------------------------------------------------------
+    # 4f. The uplink leg
+    # ------------------------------------------------------------
+    # The edge VM's fourth NIC, on the bridge `edge.uplink_bridge` in lab.yaml
+    # names — the lab's only route to the internet. That bridge is the device
+    # libvirt's stock `default` NAT network creates, which is the one leg here
+    # the lab does not build itself; the module appends the NIC last so the
+    # guest sees it as vtnet3.
+    #
+    # Everything that makes it WORK is a UI step, and there is no honest way to
+    # do it from here: the interface has to be assigned, given DHCP and a
+    # gateway, and NAT'd and filtered by hand. Unlike the DMZ and WAN addresses
+    # this is not one address field — it is five screens (the fail_msg lists
+    # them). What this section does is refuse to let a half-done one pass
+    # silently, because the failure mode is quiet: OPNsense ends up with an
+    # address and no route, every VM in the lab still boots, and the only
+    # symptom is a guest that cannot reach the internet.
+    #
+    # The device is found by matching terraform's pinned uplink MAC, never by
+    # position and never by the name the firewall allocates it. Both of those
+    # would be guesses: `opt1` is not free — it is the DMZ — and `opt2` is only
+    # `opt2` until something else is assigned first. opnsense_dmz.yml settled
+    # this and the reasoning is identical, so the idiom is copied rather than
+    # re-derived: guest device names are positional, so a NIC edit would
+    # otherwise point this check at the wrong leg and still pass.
+    #
+    # This runs before opnsense_dmz.yml in deploy.sh, so on a fresh lab it is
+    # now the FIRST step that stops on purpose. Both stops are one-time.
+
+    - name: Find the edge VM in the inventory
+      ansible.builtin.set_fact:
+        uplink_gateway_vms: "{{ groups['vms_gateway'] | default([]) }}"
+
+    - name: Refuse to look for the uplink without exactly one edge VM
+      ansible.builtin.assert:
+        that: uplink_gateway_vms | length == 1
+        fail_msg: >-
+          Expected exactly one VM in `vms_gateway`, found
+          {{ uplink_gateway_vms | length }}. terraform's `vms` output is what
+          carries the uplink MAC this check matches on, so without exactly one
+          edge VM there is nothing to match against.
+
+    - name: Read the interface device list
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/interfaces/assignment/getItem/lan"
+        method: GET
+      register: uplink_if_devices
+
+    - name: Find the device carrying terraform's pinned uplink MAC
+      ansible.builtin.set_fact:
+        # `(?i)` because the box may report the MAC in either case. A missing
+        # MAC degrades to an empty pattern, which matches every device and so
+        # fails the "exactly one" assert below rather than raising here.
+        uplink_device_candidates: >-
+          {{ uplink_if_devices.json.interface.if | default({}) | dict2items
+             | selectattr('value.value', 'defined')
+             | selectattr('value.value', 'search',
+                         '(?i)' ~ hostvars[uplink_gateway_vms[0]].libvirt_uplink_mac | default('', true))
+             | list }}
+
+    - name: Refuse to continue unless exactly one device matches
+      ansible.builtin.assert:
+        that: uplink_device_candidates | length == 1
+        fail_msg: >-
+          Expected exactly one device carrying terraform's pinned uplink MAC
+          ({{ hostvars[uplink_gateway_vms[0]].libvirt_uplink_mac | default('(none in the vms output)', true) }}),
+          found {{ uplink_device_candidates | length }}. Zero means the fourth
+          NIC does not exist yet — run `terraform apply` first, because a device
+          only reaches the guest once libvirt has given it one.
+
+    - name: Record the uplink device
+      ansible.builtin.set_fact:
+        uplink_device: "{{ uplink_device_candidates[0].key }}"
+
+    - name: Re-read the interface assignments
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/interfaces/assignment/searchItem"
+        method: GET
+      register: uplink_if_assign
+
+    # Re-read rather than assume: the name (opt1, opt2, ...) is allocated by
+    # the box, which is why nothing above hardcodes one.
+    - name: Record the name the firewall gave the uplink interface
+      ansible.builtin.set_fact:
+        uplink_ifname: >-
+          {{ (uplink_if_assign.json.rows | default([])
+              | selectattr('identifier', 'defined')
+              | selectattr('if', 'defined')
+              | selectattr('if', 'equalto', uplink_device)
+              | map(attribute='identifier') | list) | first | default('') }}
+
+    - name: Read the firewall's running interface list
+      ansible.builtin.uri:
+        url: "{{ opnsense_url }}/api/interfaces/overview/export"
+        method: GET
+        return_content: true
+      register: uplink_iface_overview
+
+    - name: Record the uplink interface's live state
+      ansible.builtin.set_fact:
+        uplink_live: >-
+          {{ (uplink_iface_overview.content | default('[]', true) | from_json)
+             | selectattr('identifier', 'defined')
+             | selectattr('identifier', 'equalto', uplink_ifname) | list | first
+             | default({}, true) }}
+
+    - name: The uplink interface is assigned, up and addressed
+      ansible.builtin.assert:
+        that:
+          - uplink_ifname | length > 0
+          - uplink_live | length > 0
+          - uplink_live.status | default('', true) | string == 'up'
+          - uplink_live.addr4 | default('', true) | string | length > 0
+        fail_msg: |
+          OPNsense has no working uplink. {{ uplink_device }} carries the edge
+          VM's pinned uplink MAC; the firewall has that device assigned as
+          '{{ uplink_ifname | default("(nothing)", true) }}' and reports
+          status '{{ uplink_live.status | default('-') }}', address
+          '{{ uplink_live.addr4 | default('') }}'.
+
+          Nothing assigned means step 1 below is not done; assigned but not up
+          and addressed means step 2 is not. Run `terraform apply` first if the
+          VM predates the fourth NIC — a device only appears under Assignments
+          once libvirt has given it to the guest.
+
+          One-time steps, in this order. OPNsense 26.7 has no API for any of
+          them, so none of this can be automated:
+
+            1. Interfaces -> Assignments
+                 Add the device named above as an interface, with the
+                 description UPLINK. Whatever name the firewall allocates is
+                 fine — nothing here assumes one.
+
+            2. Interfaces -> [UPLINK]
+                 Enable                  : ON
+                 IPv4 Configuration Type : DHCP
+                 Block private networks  : OFF   (libvirt's `default` network is
+                                                  192.168.122.0/24, RFC1918.
+                                                  Ticking this drops the whole
+                                                  leg.)
+                 Block bogon networks    : OFF
+               Save, then Apply. This is what gets it an address.
+
+            3. System -> Gateways -> Configuration
+                 Add a gateway on the UPLINK interface (name it UPLINK_GW).
+                 Then System -> Settings -> General and make it the Default
+                 gateway. Without this OPNsense has an address and no route,
+                 which is the quiet failure this check exists for.
+
+            4. Firewall -> NAT -> Outbound
+                 Switch the mode to HYBRID. Automatic mode only translates
+                 non-WAN interfaces, and the attacker leg IS the interface
+                 OPNsense calls WAN — so nothing on it is translated
+                 automatically, under any mode.
+                 Add ONE rule: Interface UPLINK, Source 10.1.0.0/24,
+                 Translation target = Interface address.
+
+            5. Firewall -> Rules -> WAN   (the attacker leg, in OPNsense's
+                                           naming — it is the interface at
+                                           10.1.0.1)
+                 Add a pass rule: IPv4, source 10.1.0.0/24, destination any,
+                 with a description. WAN carries no pass rules by default, so
+                 without this the NAT rule above never sees a packet. The
+                 playbook adds quick blocks for ports 80, 443 and 22 before
+                 this broad rule, so Crusader cannot log in to OPNsense.
+
+            6. Unbound DNS is configured by this playbook. It adds the WAN
+                 interface to Listen Interfaces, allowing Crusader to resolve
+                 the static `app01.clayface` record created above.
+
+          Do NOT do the equivalent of 4-6 for LAN or DMZ. The asymmetry is the
+          decision: the attacker has a network, the corporate side does not.
+          docs/network-design.md section 8.2.
 
     - name: Verify every pinned name resolves via OPNsense
       ansible.builtin.command:

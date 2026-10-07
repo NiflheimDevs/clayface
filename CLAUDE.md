@@ -44,9 +44,11 @@ base-image/                 # Windows base image build files (unattend-dc.xml, u
 terraform/                  # Terraform root module (libvirt provider, multi-host)
   locals.tf                 #   Loads lab.yaml via yamldecode()
   modules/alpine/           #   Alpine Linux VM module
+  modules/app/              #   Ubuntu app VM module (containerised portal, DMZ)
   modules/opnsense/         #   OPNsense edge/gateway VM module
   modules/domaincontroller/ #   Windows Server VM module (qcow2 backing on base_image_path)
   modules/client/           #   Windows 11 workstation VM module (UEFI + TPM; see below)
+  modules/kali/             #   Kali attacker VM module (cloud-init seed; WAN leg)
 ansible/
   ansible.cfg               # Default inventory: lab_inventory.py
   requirements.yml          # Collections: ansible.windows, microsoft.ad
@@ -88,6 +90,13 @@ Exceptions to the rule — values owned elsewhere, mirrored here:
   the DMZ interface address (the UI step), the `no_proxy` list in
   `deploy.sh`, and — via lab.yaml — as `networks.dmz.gateway`/`dns`, which is
   where terraform and the rule sources read it. `docs/opnsense-image.md` §4.
+- **OPNsense WAN IP** (`10.1.0.1`): the same class and the same reason — not
+  API-settable, so set once by hand and asserted by `opnsense.yml` §4e.
+  Appears as the WAN interface address (the UI step) and, via lab.yaml, as
+  `networks.wan.gateway`, where the assert and the crusader module read it.
+  Two traps: WAN's "Block private networks" defaults **ON** and would drop the
+  whole `10.1.0.0/24` leg, and the assert may not have been run yet. See the
+  pain points below and `docs/network-design.md` §8.1.
 - **Gateway VM host**: the top-level `edge.host` scalar in lab.yaml, not
   listed as a placement. Exactly one edge host holds BY CONSTRUCTION (single
   scalar) — no count check. A guard local in `terraform/locals.tf` fails the
@@ -108,12 +117,37 @@ Exceptions to the rule — values owned elsewhere, mirrored here:
 - **OPNsense** VM acts as the edge (DHCP/DNS/filter) — DNS resolves VM names so
   Ansible reaches VMs as `<name>.clayface` (domain owned by the OPNsense
   image, mirrored in `terraform_vms.py`).
-- **Two segments, one boundary.** `lan` (`vm-lan0`, `10.0.0.0/24`, VXLAN 100)
-  and `dmz` (`vm-dmz0`, `10.0.10.0/24`, VXLAN 101) are separate L2 domains;
-  `wan` (`vm-wan0`) is a NAT leg with no subnet and no overlay. OPNsense holds
-  one NIC per leg (LAN, WAN, then DMZ **appended third**, because NIC order is
-  device order — inserting one renumbers the rest and repoints the firewall
-  rules at the wrong interface). Design: `docs/network-design.md`.
+- **Three segments, one boundary, and an uplink.** `lan` (`vm-lan0`,
+  `10.0.0.0/24`, VXLAN 100) and `dmz` (`vm-dmz0`, `10.0.10.0/24`, VXLAN 101)
+  are separate L2 domains; `wan` (`vm-wan0`, `10.1.0.0/24`) is the attacker
+  leg — host-local, no overlay, and no DHCP or DNS of its own. OPNsense holds
+  one NIC per leg, **appended in order** (LAN, WAN, DMZ third, uplink fourth),
+  because NIC order is device order — inserting one renumbers the rest and
+  repoints the firewall rules at the wrong interface. The fourth NIC is on
+  `virbr0` — the bridge libvirt's stock `default` NAT network creates, named by
+  `edge.uplink_bridge` in lab.yaml — and is the lab's only route off it. Design:
+  `docs/network-design.md`.
+- **The uplink is libvirt's stock `default` network, and that is a deliberate
+  dependency on host state.** `virbr0` is created by libvirt from the `default`
+  network that ships with the libvirt package — a NAT network on
+  `192.168.122.0/24` with its own DHCP. Nothing in this repo defines, autostarts
+  or repairs it, so `virsh -c qemu:///system net-list` on the edge host is the
+  check, and a host without it fails at `virsh start` with "Network bridge
+  virbr0 not found" (prechecked by `start_vms.yml` via the gateway's `bridges`
+  output). A lab-owned network was considered and rejected as more machinery
+  than the dependency is worth. It is not a `networks:` entry either way: those
+  are bridges `hosts.yml` creates with `ip link add` and owns, while this device
+  belongs to libvirt. Its subnet is RFC1918, so OPNsense's uplink interface must
+  have **Block private networks OFF** — the same trap as the attacker leg's WAN
+  interface.
+- **Only the attacker leg has internet.** A manual outbound NAT rule and one
+  pass rule on the attacker-leg interface are what let `10.1.0.0/24` out;
+  nothing equivalent exists for `lan` or `dmz`, and that asymmetry is the
+  decision, not an omission (`docs/network-design.md` §8.2). The trap worth
+  knowing: OPNsense's automatic outbound NAT translates only *non-WAN*
+  interfaces, and the attacker leg IS the interface OPNsense calls WAN — so no
+  NAT mode translates it automatically, and the mode has to be Hybrid with one
+  manual rule.
 - **The DMZ boundary** is default-deny filter rules on OPNsense, built by
   `playbooks/opnsense_dmz.yml` from `networks.dmz.allow` in lab.yaml, plus two
   logged denies. The one deliberate allowance is DMZ → `dc01` on tcp 389/636:
@@ -340,13 +374,16 @@ Manual ansible runs follow the same pattern as deploy.sh: combine the
 lab.yaml host inventory with the terraform VM one (`-i
 inventory/lab_inventory.py -i inventory/terraform_vms.py`).
 
-**One step of a fresh deploy stops on purpose.** `opnsense_dmz.yml` asserts
-the DMZ interface's IPv4 address and cannot set it (OPNsense 26.7 has no API
-for it — see `docs/opnsense-image.md` §4 and `docs/network-design.md` §8). On
-a fresh lab the deploy halts there once, with the UI steps printed; set the
-address, re-run that playbook, carry on from the next step. Do **not** add
-`|| true` to it in `deploy.sh` — that turns one honest failure into a
-fifteen-minute `wait_for_connection` timeout inside `app.yml`.
+**Two steps of a fresh deploy stop on purpose, and the uplink is the first of
+them.** `opnsense.yml` §4f asserts the uplink interface is assigned, up and
+addressed; `opnsense_dmz.yml` asserts the DMZ interface's IPv4 address. Neither
+can be set — OPNsense 26.7 has no API for an interface's IPv4 configuration
+(see `docs/opnsense-image.md` §4 and `docs/network-design.md` §8). On a fresh
+lab the deploy halts at §4f with six UI steps printed, then at
+`opnsense_dmz.yml` with one; do them, re-run the playbook, carry on from the
+next step. Both are one-time. Do **not** add `|| true` to either in
+`deploy.sh` — that turns honest failures into fifteen-minute
+`wait_for_connection` timeouts inside `app.yml`.
 
 ## Known pain points / open issues
 
@@ -368,6 +405,92 @@ fifteen-minute `wait_for_connection` timeout inside `app.yml`.
   `client-base.qcow2` — it is the live builder, and must be undefined after
   sysprep and before any `client01` VM is booted. Keep a pre-sysprep copy as
   the escape hatch (`client-base-bck.qcow2`).
+- **The Kali builder domain is still defined.** `kali-base` points straight at
+  `KALI-base.qcow2`. Shut off today, so nothing is corrupt yet — but it is one
+  `virsh start` away from the failure above, and the base is now in production
+  use by `crusader`. Undefine it:
+  `virsh -c qemu:///system undefine kali-base --nvram`.
+- **`crusader` gets its address from cloud-init, and every failure mode it has
+  is silent.** `KALI-base.qcow2` carries cloud-init and NetworkManager (a fresh
+  overlay runs the seed, so the base is not the hazard); what is fragile is the
+  path the seed takes to reach the NIC. Three traps, in the order they were hit:
+  - **The seed must not let cloud-init touch the network at all.** With no
+    network config from any source cloud-init does not do nothing — it renders a
+    FALLBACK config (DHCP for the first NIC), which on this base is written by
+    `eni` (ifupdown) into `/etc/network/interfaces.d/50-cloud-init` and handed to
+    dhcpcd; DHCP on that leg has no server, dhcpcd falls back to 169.254.x, and
+    NetworkManager then reports eth0 `unmanaged` forever. The disable has to be
+    in the **seed's `network-config`** file (`config: disabled` in
+    `modules/kali/main.tf`). Writing `network: {config: disabled}` in user-data
+    does **not** work, and that is the trap: cloud-init resolves the network
+    config from a merged config object assembled before it reads user-data
+    (`get_config_obj()` returns `{}`, and `/var/lib/cloud/instance/cloud-config.txt`
+    does not exist until the boot has already configured the network), so the
+    directive is absent on exactly the boot that needs it. It looks like a race
+    and is not one.
+  - **The address is a NetworkManager keyfile, not a rendered network config.**
+    `user-data` writes `/etc/NetworkManager/system-connections/50-lab.nmconnection`
+    with `autoconnect-priority=100`. The priority is load-bearing: NM
+    auto-creates and persists a generic DHCP profile (`Wired connection 1`,
+    which binds no `interface-name`) for any ethernet device, before cloud-init
+    writes the keyfile, and priority is the tiebreak that makes the static
+    profile win. A `[main] no-auto-default=*` drop-in is the wrong fix — a
+    device NM may not invent a connection for is a device NM leaves `unmanaged`.
+  - **The seed attaches as a virtio disk (`vdb`), not a SATA cdrom.** As a
+    cdrom, cloud-init's systemd generator was cut off partway through the
+    datasource probe on roughly every other **fresh-overlay** boot: no
+    `cloud-init.target` in `/run/systemd/generator.early/`, so no hostname, no
+    address, nothing logged. `ds-identify` itself succeeds (`returning 0` in its
+    own log) — the generator is what dies, and reading `/dev/sr0` (ATAPI media
+    detection) is what it dies on. The datasource finds the seed by filesystem
+    LABEL, so the bus is invisible downstream.
+  The check is `ip -br addr` on the guest, or the GDM banner's hostname
+  (`mrrobot` = cloud-init did not run, `crusader` = it did), never the exit
+  code of a plan or a playbook. The NIC is matched by name (`eth0`, which is
+  what this base calls it); a `kali-cloud` rebuild renames it
+  `enp1s0`/`ens3`, and a profile whose interface never appears is not an error
+  either.
+- **The seed ISO lives under `/tmp`, which is tmpfs here.** The provider writes
+  `cloudinit-<hash>.iso` to `os.TempDir()`; the domain XML keeps that path, so a
+  host reboot empties the file and `virsh start` fails with a missing seed.
+  Recovery is just a re-run: terraform reads the file, sees it gone and plans
+  `1 to add, 1 to change` (the seed regenerated, the domain repointed) — verified
+  by deleting the ISO and planning. The apply stops the VM to change its disk, so
+  it has to be started again afterwards. `TMPDIR` relocation would avoid the
+  round trip but needs a directory the terraform user can write and
+  `libvirt-qemu` can traverse — `$HOME` is mode 710 and
+  `/var/lib/libvirt/images` is root-owned, so neither works as-is.
+- **The WAN address assert (`opnsense.yml` §4e) still has not been run as a
+  task.** It reuses the verified `interfaces/overview/export` idiom from
+  `opnsense_dmz.yml`. What the guest proves is the other half of it: `crusader`
+  holds `10.1.0.100` and pings `10.1.0.1`, so the leg is addressed, routed and
+  filtered. The assert is what would catch that on a *fresh* deploy, before
+  anyone boots the guest to find out.
+- **The uplink is done, resolver included, and all six steps were manual.**
+  `ping 8.8.8.8` from `crusader` succeeds at 0% loss, which is more than the API
+  can see — it exercises the NAT rule, the default route and the WAN pass rule
+  together, and retires "OPNsense has an uplink" as a claim distinct from
+  "crusader can reach the internet". Resolution was the last of §4f's six UI
+  steps (the attacker leg added to Unbound DNS → General → Listen Interfaces)
+  and is now in place: `active_interface` from `curl -u
+  "$OPNSENSE_API_KEY:$OPNSENSE_API_SECRET"
+  http://10.0.0.1/api/unbound/settings/get` selects `lan`, `opt1` (DMZ) and
+  `wan`, and `dig` from the guest through `10.1.0.1` returns an answer.
+- **Redefining the `opnsense01` domain is the part to check before applying the
+  uplink.** `opnsense.qcow2` is the live artifact — no overlay, no base image,
+  written in place — and its LAN and WAN NICs carry libvirt-assigned MACs the
+  module does not pin, while OPNsense binds an interface assignment partly by
+  MAC. A domain *replace* could churn them and break the assignment. It does
+  not: the observed plan is `3 to add, 1 to change, 0 to destroy`, updating the
+  domain in place with a pure interface **addition**. Copy the image aside
+  anyway — it has no snapshot behind it. Same class of hazard as the
+  `kali-base` builder domain above, opposite shape: a writable image with
+  nothing to roll back to rather than a read-only one that must not be booted.
+- **A second builder-shaped domain exists.** `opnsense` (distinct from
+  `opnsense01`) is defined, shut off, and boots the install ISO with
+  `opnsense-cp.qcow2` attached. It is not the live VM's disk, so it is not the
+  `kali-base` hazard — but confirm what `opnsense-cp.qcow2` is before starting
+  it, and undefine it if it is a spent builder.
 - **EFI domains need `--nvram` to undefine.** `terraform destroy` on a client
   VM can fail with `cannot undefine domain with nvram`; recovery is
   `virsh -c qemu:///system undefine client01 --nvram`.

@@ -181,6 +181,13 @@ def build_inventory():
         # pointing quietly at the wrong device.
         if attrs.get("dmz_mac"):
             hostvars["libvirt_dmz_mac"] = attrs["dmz_mac"]
+        # The edge VM's uplink NIC MAC (vtnet3). opnsense.yml matches on it to
+        # find which device the fourth NIC landed on, because the interface
+        # name the firewall allocates it (opt1, opt2, ...) depends on
+        # assignment order and `opt1` is already the DMZ. Matching on the MAC
+        # is what makes this a check rather than a guess.
+        if attrs.get("uplink_mac"):
+            hostvars["libvirt_uplink_mac"] = attrs["uplink_mac"]
         # Pinned MAC — lets playbooks/opnsense.yml tie name -> MAC -> DHCP
         # lease without hardcoding IPs.
         if attrs.get("mac"):
@@ -209,8 +216,6 @@ def build_inventory():
                 "ansible_connection": "ssh",
                 "ansible_user": "clayface",
                 "ansible_password": LAB_APP_SSH_PASS,
-                # "ansible_become": True,
-                # "ansible_become_password": LAB_APP_SSH_PASS,
                 # The VM is created by terraform moments before this runs, so
                 # its host key cannot be known yet. accept-new trusts it on
                 # first use but still fails loudly if it ever changes, which

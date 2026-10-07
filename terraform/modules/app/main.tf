@@ -40,7 +40,7 @@ resource "libvirt_volume" "app" {
 
 resource "libvirt_domain" "app" {
   name        = var.name
-  memory      = 4096
+  memory      = 2048
   memory_unit = "MiB"
   vcpu        = 2
   type        = "kvm"

@@ -39,6 +39,7 @@ usage() {
     echo "  --destroy     Teardown infrastructure instead of deploying"
     echo "  --plan        Show what terraform will do without applying"
     echo "  --skip-ansible Only run terraform"
+    echo "  --hosts-only  Only run the hosts playbook (hosts.yml), nothing else"
     echo "  -h, --help    Show this help"
     exit 0
 }
@@ -46,12 +47,14 @@ usage() {
 DESTROY=false
 PLAN_ONLY=false
 SKIP_ANSIBLE=false
+HOSTS_ONLY=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --destroy)    DESTROY=true; shift ;;
         --plan)       PLAN_ONLY=true; shift ;;
         --skip-ansible) SKIP_ANSIBLE=true; shift ;;
+        --hosts-only) HOSTS_ONLY=true; shift ;;
         -h|--help)    usage ;;
         *) echo "Unknown option: $1"; usage ;;
     esac
@@ -98,6 +101,11 @@ fi
 if [ "$SKIP_ANSIBLE" = false ]; then
     step "Ansible: configure hypervisors (hosts.yml)"
     ansible-playbook -i "$ANSIBLE_DIR/inventory/lab_inventory.py" "$ANSIBLE_DIR/playbooks/hosts.yml" --ask-become-pass
+
+    if [ "$HOSTS_ONLY" = true ]; then
+        step "Done. Hosts playbook complete."
+        exit 0
+    fi
 
     step "Ansible: configure edge (edge.yml)"
     ansible-playbook -i "$ANSIBLE_DIR/inventory/lab_inventory.py" "$ANSIBLE_DIR/playbooks/edge.yml" --ask-become-pass
@@ -241,3 +249,4 @@ ansible-playbook \
     "$ANSIBLE_DIR/playbooks/ad_validate.yml"
 
 step "Done. Infrastructure provisioned."
+notify-send "Clayface deployed"

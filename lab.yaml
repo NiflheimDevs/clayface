@@ -21,15 +21,28 @@ hosts:
 edge:
   host: host_a
 
+  # The bridge carrying the edge VM's fourth NIC off the lab. It is the device
+  # libvirt's stock `default` network creates: a NAT network on
+  # 192.168.122.0/24 with its own DHCP and a route out through the host's own
+  # uplink. That network ships with the libvirt package, which is the caveat
+  # worth knowing — this bridge is host state rather than lab state, and
+  # nothing in this repo creates it. `virsh net-list` on the edge host is what
+  # shows whether it is defined and running.
+  uplink_bridge: virbr0
+
 # Network segments, one entry per L2 domain. Read by terraform
 # (locals.tf -> each module's `bridge` variable) and by Ansible
 # (inventory/lab_inventory.py -> `lab_networks` on every host).
 #
-# `bridge` is the only required key: the WAN leg is a NAT leg with no subnet,
-# no gateway and no overlay. The rest earn their place by displacing a literal
-# that used to live in a playbook — `subnet` the 10.0.0.0/24 written in prose
-# across four documents, `monitor` the control node's address in hosts.yml,
-# `dns` four copies of OPNsense's address.
+# `bridge` is still the only key every segment must carry: `wan` was for a
+# long time the proof of that, declaring nothing else at all. It carries an
+# address now because a guest lives on it (see the entry at the end of this
+# map), but the shape is unchanged — a segment declares the keys it has, and
+# the keys it omits are statements in their own right. The rest earn their
+# place by displacing a literal that used to live in a playbook — `subnet`
+# the 10.0.0.0/24 written in prose across four documents, `monitor` the
+# control node's address in hosts.yml, `dns` four copies of OPNsense's
+# address.
 #
 # `vxlan_id` is what makes a segment an overlay: declaring one is the
 # statement that this leg is carried between hosts. A segment without one is
@@ -39,8 +52,8 @@ networks:
     bridge: vm-lan0
     subnet: 10.0.0.0/24
     gateway: 10.0.0.1
-    dns: 10.0.0.1                 # OPNsense Unbound, on this leg
-    monitor: 10.0.0.2/24          # the control node's address on this leg
+    dns: 10.0.0.1 # OPNsense Unbound, on this leg
+    monitor: 10.0.0.2/24 # the control node's address on this leg
     vxlan_id: 100
   dmz:
     bridge: vm-dmz0
@@ -105,8 +118,36 @@ networks:
         ports: [443]
         from: lan
         to: 10.0.10.10
+
+  # The attacker leg. crusader's segment, on the outside of the boundary.
+  #
+  # OPNsense serves DHCP on this leg. The subnet and gateway remain declared
+  # here because Terraform, firewall rules and OpenVPN need the segment facts;
+  # Crusader itself no longer carries a static `ip:`.
+  #
+  # Three keys this segment deliberately does NOT carry, each for the same
+  # reason: adding one would make hosts.yml touch the hypervisor, and nothing
+  # about an attacker VM requires that.
+  #
+  #   vxlan_id — no overlay. The leg is host-local by definition, and that is
+  #              what pins crusader to the host that holds OPNsense.
+  #   monitor  — nothing on the control node manages crusader directly; the
+  #              playbook reaches it through its DHCP/DNS binding.
+  #   dns      — the control node never uses this leg for its own resolver.
+  #              Crusader receives the gateway resolver from DHCP.
+  #              instead point the control node's vm-wan0 link at it, which is
+  #              not what that key means.
   wan:
-    bridge: vm-wan0               # NAT leg: no subnet, no gateway, no overlay
+    bridge: vm-wan0
+    subnet: 10.1.0.0/24
+    gateway: 10.1.0.1
+
+    # This leg is the only one with a route off the lab. OPNsense's uplink
+    # (`edge.uplink_bridge`) is what carries it, and the outbound NAT rule that
+    # makes it work is typed into the UI by hand — see
+    # docs/network-design.md section 8.2. Nothing here grants the LAN or the
+    # DMZ the same, and that asymmetry is the decision: the attacker has a
+    # network, the corporate side does not.
 
 # Shared by every overlay, declared once. Both are properties of the host NIC
 # and of the standard rather than of any one segment, which is why they stay
@@ -147,20 +188,33 @@ edge_vm:
 # built from a sysprepped base boots as WIN-XXXXXXXXXXX. Without a
 # reservation <name>.clayface never resolves, and the playbook that renames
 # the guest cannot reach it to do the renaming.
+#
+# One key, one meaning: `ip:` is this VM's static address. How it is realized
+# depends on the module, and the module decides it by pinning a MAC or not.
+# A MAC-pinning module (dc, client, app) becomes a DHCP reservation as above.
+# The crusader module pins none, so `vms_pinned` — which requires BOTH a MAC
+# and an `ip:` — never claims it, opnsense.yml skips it, and the address is
+# written by the OPNsense DHCP reservation instead. That is not a second
+# meaning for the key; it is the same fact with a different mechanism, chosen
+# because Crusader is managed after its WAN DHCP/DNS binding exists.
 vm_placements:
-  dc01:
-    module: dc
-    host: host_a
-    ip: 10.0.0.10
-  client01:
-    module: client
-    host: host_a
-    ip: 10.0.0.20
+  # dc01:
+  #   module: dc
+  #   host: host_a
+  #   ip: 10.0.0.10
+  # client01:
+  #   module: client
+  #   host: host_a
+  #   ip: 10.0.0.20
   app01:
     module: app
     host: host_a
     network: dmz
     ip: 10.0.10.10
+  crusader:
+    module: crusader
+    host: host_a
+    network: wan
   # alpine01:
   #   module: alpine
   #   host: host_a
