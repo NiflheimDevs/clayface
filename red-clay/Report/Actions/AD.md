@@ -9,7 +9,7 @@ In order for the vm to boot everywhere and correctly, i needed to run *sysprep.e
 So when you boot, it will be like you are booting for the first time (random hostname, some sid and etc) BUT the domain controller/service is still present.
 
 I did that and i ran into a problem.
-I wanted to do the promotion to ad, user creation and etc with ansible. but if the newly booted vm is in the state of *just booting for the first time*, i can reach it!. ansible needs WinRM process to be running on the vm in order to connect and run scripts.
+I wanted to do the promotion to ad, user creation and etc with ansible. but if the newly booted vm is in the state of *just booting for the first time*, i can't reach it!. ansible needs WinRM process to be running on the vm in order to connect and run scripts.
 
 so we tricked the vm into thinking this is not the first time you are getting booted so that other processes start normally. with an xml file doing some things. unattend.xml was the file's name.
 

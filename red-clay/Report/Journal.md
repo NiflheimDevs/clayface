@@ -92,3 +92,9 @@ OPNsense was not created out of a base image. So changing this cause many manual
 I now have a decision to make to make the OPNSense like AD and windows workstations to actually use a based image.
 This way it will always be clean. right now, playbooks work as *Best Effort*. they don't verify the exact status and config of opnsense. they just add their own rules to it.
 This work scares me so im going to ignore it for now. But this is definitely a known issue of this lab. call it a technical debt under time pressure. 
+
+Now we are going for the kill! The kali linux, WAN network and vpn. with this, everything will be set for actually attacking the lab.
+One little fact: i named the kali VM crusader for shits and giggles. Also the Lanterns show had just came out so the username is `jordan` and the password `indarkestnight`
+### Actions:
+1. [[Crusader]]
+2. [[OpenVPN]]
